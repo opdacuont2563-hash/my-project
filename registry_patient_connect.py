@@ -640,8 +640,9 @@ class Main(QtWidgets.QWidget):
         self.tabs.setStyleSheet("QTabWidget::pane{border:0;} QTabBar::tab{padding:10px 16px;border-radius:12px;margin:4px;background:#e9eef8;} QTabBar::tab:selected{background:#2563eb;color:#fff;}")
         outer.addWidget(self.tabs)
 
-        # TAB 1 — ลงทะเบียน
-        tab1 = QtWidgets.QWidget(); t1 = QtWidgets.QVBoxLayout(tab1); t1.setSpacing(12)
+        # TAB 1 — ลงทะเบียน (ห่อด้วย ScrollArea เพื่อป้องกันคอนโทรลหด)
+        tab1_inner = QtWidgets.QWidget()
+        t1 = QtWidgets.QVBoxLayout(tab1_inner); t1.setSpacing(12); t1.setContentsMargins(0,0,0,0)
         form = Card("ลงทะเบียนผู้ป่วย (Schedule — Private)", "ข้อมูลเก็บในเครื่อง และแชร์ให้โปรแกรมหลักแบบเรียลไทม์")
         g=form.grid; r=0
         g.setColumnStretch(0, 0); g.setColumnStretch(1, 2); g.setColumnStretch(2, 0); g.setColumnStretch(3, 1)
@@ -762,7 +763,13 @@ class Main(QtWidgets.QWidget):
         g.addLayout(rowb, r,0,1,6)
         r+=1
 
-        t1.addWidget(form); self.tabs.addTab(tab1, "ลงทะเบียนผู้ป่วย")
+        t1.addWidget(form); t1.addStretch(1)
+        tab1_scroll = QtWidgets.QScrollArea()
+        tab1_scroll.setWidgetResizable(True)
+        tab1_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        tab1_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        tab1_scroll.setWidget(tab1_inner)
+        self.tabs.addTab(tab1_scroll, "ลงทะเบียนผู้ป่วย")
 
         # TAB 2 — Result Schedule
         tab2 = QtWidgets.QWidget(); t2 = QtWidgets.QVBoxLayout(tab2); t2.setSpacing(12)
