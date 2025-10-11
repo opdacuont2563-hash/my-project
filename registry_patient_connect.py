@@ -190,6 +190,8 @@ APP_SETTINGS="RegistryPatientConnect"
 PDPA_ACK_KEY="pdpa/ack"
 SECRET_SALT_KEY="sec/hn_salt"
 FERNET_KEY="sec/fernet_key"  # เผื่อจะต่อยอดเข้ารหัสข้อความในอนาคต
+SEED_OP_KEY="seed/ops"          # map: specialty_key -> list[str]
+SEED_DX_KEY="seed/diags"        # map: specialty_key -> list[str]
 
 DEPT_DOCTORS = {
     "Surgery | ศัลยกรรมทั่วไป": ["นพ.สุริยา คุณาชน","นพ.ธนวัฒน์ พันธุ์พรหม","พญ.สุภาภรณ์ พิณพาทย์","พญ.รัฐพร ตั้งเพียร","พญ.พิชัย สุวัฒนพูนลาภ"],
@@ -295,6 +297,7 @@ class ScheduleEntry(QtCore.QObject):
         diags=None,
         ops=None,
         ward="",
+        case_size="",
         queue=0,
         period="in",
         assist1="",
@@ -316,6 +319,7 @@ class ScheduleEntry(QtCore.QObject):
         self.diags = diags or []
         self.ops = ops or []
         self.ward = (ward or "").strip()
+        self.case_size = (case_size or "").strip()  # Minor/Major
         self.queue = int(queue) if str(queue).isdigit() else 0
         self.period = period  # "in" | "off"
         self.assist1 = assist1
@@ -338,6 +342,7 @@ class ScheduleEntry(QtCore.QObject):
             "diags": self.diags,
             "ops": self.ops,
             "ward": self.ward,
+            "case_size": self.case_size,
             "queue": self.queue,
             "period": self.period,
             "assist1": self.assist1,
@@ -366,6 +371,7 @@ class ScheduleEntry(QtCore.QObject):
             d.get("diags",[]) or [],
             d.get("ops",[]) or [],
             d.get("ward",""),
+            d.get("case_size",""),
             d.get("queue",0),
             d.get("period","in"),
             d.get("assist1",""),
@@ -681,11 +687,16 @@ class Main(QtWidgets.QWidget):
         self.cb_ward.setCurrentIndex(0)
         self.cb_ward.setEditText(WARD_PLACEHOLDER)
         g.addWidget(self.cb_ward, r,3)
-        g.addWidget(QtWidgets.QLabel("ช่วงเวลา"), r,4)
+        g.addWidget(QtWidgets.QLabel("ขนาดเคส"), r,4)
+        self.cb_case = NoWheelComboBox(); self.cb_case.addItems(["","Minor","Major"])
+        self.cb_case.setMinimumWidth(120)
+        g.addWidget(self.cb_case, r,5)
+        r+=1
+        g.addWidget(QtWidgets.QLabel("ช่วงเวลา"), r,0)
         self.rb_in  = QtWidgets.QRadioButton("ในเวลาราชการ (08:30-16:30)")
         self.rb_off = QtWidgets.QRadioButton("นอกเวลาราชการ (16:30-08:30)")
         pr = QtWidgets.QHBoxLayout(); pr.setSpacing(10); pr.addWidget(self.rb_in); pr.addWidget(self.rb_off); pr.addStretch(1)
-        g.addLayout(pr, r,5)
+        g.addLayout(pr, r,1,1,5)
         r+=1
         g.addWidget(QtWidgets.QLabel("วันที่"), r,0)
         self.date=QtWidgets.QDateEdit(QtCore.QDate.currentDate()); self.date.setCalendarPopup(True); self.date.setDisplayFormat("dd/MM/yyyy"); self.date.setLocale(QLocale("en_US"))
@@ -707,6 +718,7 @@ class Main(QtWidgets.QWidget):
         g.addWidget(section_header("Diagnosis"), r,0,1,6)
         r+=1
         self.diag_adder = SearchSelectAdder("ค้นหา ICD-10 / ICD-10-TM...", suggestions=[])
+        self.diag_adder.itemAdded.connect(lambda txt: _append_seed_item(SEED_DX_KEY, self._current_specialty_key, txt))
         g.addWidget(self.diag_adder, r,0,1,6)
         r+=1
 
@@ -714,6 +726,7 @@ class Main(QtWidgets.QWidget):
         r+=1
         self.op_adder = SearchSelectAdder("ค้นหา/เลือก Operation...", suggestions=[])
         self.op_adder.itemsChanged.connect(self._on_operations_changed)
+        self.op_adder.itemAdded.connect(lambda txt: _append_seed_item(SEED_OP_KEY, self._current_specialty_key, txt))
         g.addWidget(self.op_adder, r,0,1,6)
         r+=1
 
@@ -779,14 +792,14 @@ class Main(QtWidgets.QWidget):
 
         # TAB 2 — Result Schedule
         tab2 = QtWidgets.QWidget(); t2 = QtWidgets.QVBoxLayout(tab2); t2.setSpacing(12)
-        self.card_result = Card("Result Schedule Operating Room (Private)", "อัปเดตเรียลไทม์ (QSettings) — คลิกขวาเพื่อแก้ไข/ลบ, ดับเบิลคลิกเพื่อแก้ไขทันที")
+        self.card_result = Card("ตารางการผ่าตัด ประจำวัน", "ห้องผ่าตัดโรงพยาบาลหนองบัวลำภู")
         gr2 = self.card_result.grid
         self.tree2 = QtWidgets.QTreeWidget()
         # เพิ่มคอลัมน์ให้ครอบคลุมข้อมูลจากแท็บ 1 และเปิดสกรอลล์แนวนอน
-        self.tree2.setColumnCount(17)
+        self.tree2.setColumnCount(18)
         self.tree2.setHeaderLabels([
             "ช่วงเวลา","OR/เวลา","HN","ชื่อ-สกุล","อายุ","Diagnosis","Operation","แพทย์",
-            "Ward","แผนก","Assist1","Assist2","Scrub","Circulate","เริ่ม","จบ","คิว"
+            "Ward","ขนาดเคส","แผนก","Assist1","Assist2","Scrub","Circulate","เริ่ม","จบ","คิว"
         ])
         self.tree2.setTextElideMode(QtCore.Qt.ElideNone); self.tree2.setWordWrap(True); self.tree2.setUniformRowHeights(False)
         self.tree2.setAlternatingRowColors(True)
@@ -807,11 +820,11 @@ class Main(QtWidgets.QWidget):
         hdr.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         hdr.setFixedHeight(40)
         # ให้คอลัมน์ยืดบางส่วน และเลื่อนแนวนอนได้เมื่อกว้างเกิน
-        for i in (0,1,2,3,4,7,8,9,10,11,12,13,14,15,16):
+        for i in (0,1,2,3,4,7,8,9,10,11,12,13,14,15,16,17):
             hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(5, QtWidgets.QHeaderView.Stretch)   # Diagnosis
         hdr.setSectionResizeMode(6, QtWidgets.QHeaderView.Stretch)   # Operation
-        self.tree2.setColumnWidth(16, 160)
+        self.tree2.setColumnWidth(17, 160)
         self.wrap_delegate = WrapItemDelegate(self.tree2)
         for col in (5,6,7):
             self.tree2.setItemDelegateForColumn(col, self.wrap_delegate)
@@ -1030,7 +1043,8 @@ class Main(QtWidgets.QWidget):
         self._current_specialty_key = key
         primary_ops = operation_suggestions(key)
         fallback_ops = [op for op in ALL_OPERATIONS if op not in primary_ops]
-        self.op_adder.set_suggestions(primary_ops + fallback_ops)
+        custom_ops = _get_seed_list(SEED_OP_KEY, key)
+        self.op_adder.set_suggestions(custom_ops + primary_ops + fallback_ops)
         self._refresh_diag_suggestions()
 
     def _refresh_diag_suggestions(self):
@@ -1038,7 +1052,8 @@ class Main(QtWidgets.QWidget):
             return
         ops = self.op_adder.items() if hasattr(self.op_adder, "items") else []
         suggestions = diagnosis_suggestions(self._current_specialty_key, ops)
-        self.diag_adder.set_suggestions(suggestions)
+        custom_dx = _get_seed_list(SEED_DX_KEY, self._current_specialty_key)
+        self.diag_adder.set_suggestions(custom_dx + suggestions)
 
     def _on_operations_changed(self, _items: List[str]):
         self._refresh_diag_suggestions()
@@ -1059,6 +1074,7 @@ class Main(QtWidgets.QWidget):
             doctor=self.cb_doctor.currentText().strip() if self.cb_doctor.isVisible() else "",
             diags=self.diag_adder.items(), ops=self.op_adder.items(),
             ward=ward_text,
+            case_size=self.cb_case.currentText().strip(),
             queue=0,
             period=self._get_selected_period(),
             assist1=self.cb_assist1.currentText().strip(),
@@ -1075,6 +1091,8 @@ class Main(QtWidgets.QWidget):
         self.cb_dept.setCurrentIndex(0); self.cb_doctor.clear(); self._set_doctor_visibility(False)
         self.diag_adder.clear(); self.op_adder.clear()
         self.cb_ward.setCurrentIndex(0); self.cb_ward.setEditText(WARD_PLACEHOLDER)
+        if hasattr(self, "cb_case"):
+            self.cb_case.setCurrentIndex(0)
         for cb in (self.cb_assist1, self.cb_assist2, self.cb_scrub, self.cb_circulate):
             cb.setCurrentIndex(0)
             cb.setEditText("")
@@ -1137,6 +1155,14 @@ class Main(QtWidgets.QWidget):
             else:
                 self.cb_ward.setCurrentIndex(0)
                 self.cb_ward.setEditText(WARD_PLACEHOLDER)
+
+        # Case size
+        if hasattr(self, "cb_case"):
+            k = self.cb_case.findText(e.case_size) if e.case_size else -1
+            if k >= 0:
+                self.cb_case.setCurrentIndex(k)
+            else:
+                self.cb_case.setCurrentIndex(0)
 
         # Nurse roles
         for combo, value in (
@@ -1209,7 +1235,10 @@ class Main(QtWidgets.QWidget):
             self.toast.show_toast("อัปเดตรายการสำเร็จ")
             self._set_add_mode()
 
-        self.card_result.title_lbl.setText(f"Result Schedule Operating Room (Private)  —  อัปเดต {datetime.now():%H:%M:%S}")
+        now = datetime.now()
+        self.card_result.title_lbl.setText(
+            f"ตารางการผ่าตัด ประจำวัน ({now:%d/%m/%Y}) เวลา {now:%H:%M} น. ห้องผ่าตัดโรงพยาบาลหนองบัวลำภู"
+        )
         self._render_tree2()
 
         # เด้งไปแท็บ Result และโฟกัส/ไฮไลต์ชื่อผู้ป่วย
@@ -1255,15 +1284,17 @@ class Main(QtWidgets.QWidget):
             (idx, entry) for idx, entry in enumerate(self.sched.entries) if should_show(entry)
         ]
 
-        # ปรับ subtitle บอกโหมดตัวกรอง
-        mode_txt = "ทั้งหมด (ในเวลาราชการ)" if now_code=="in" else "เฉพาะนอกเวลาฯ + ในเวลาที่ยังไม่เสร็จ"
-        self.card_result.title_lbl.setText(f"Result Schedule Operating Room (Private) — โหมดแสดงผล: {mode_txt}")
+        # อัปเดตหัวการ์ดเป็นรูปแบบที่ขอทุกครั้งที่เรนเดอร์
+        now = datetime.now()
+        self.card_result.title_lbl.setText(
+            f"ตารางการผ่าตัด ประจำวัน ({now:%d/%m/%Y}) เวลา {now:%H:%M} น. ห้องผ่าตัดโรงพยาบาลหนองบัวลำภู"
+        )
 
         # เคสไม่มีข้อมูลให้คืนค่าอย่างนุ่มนวล
         if not entries_to_show:
             self.tree2.expandAll()
-            self.tree2.header().setSectionResizeMode(9, QtWidgets.QHeaderView.ResizeToContents)
-            self.tree2.setColumnWidth(9, 150)
+            self.tree2.header().setSectionResizeMode(17, QtWidgets.QHeaderView.ResizeToContents)
+            self.tree2.setColumnWidth(17, 160)
             return
 
         # จัดกลุ่มตาม OR
@@ -1307,14 +1338,15 @@ class Main(QtWidgets.QWidget):
                     op_txt,                                     # 6
                     entry.doctor or "-",                        # 7
                     entry.ward or "-",                          # 8
-                    entry.dept or "-",                          # 9
-                    entry.assist1 or "-",                       # 10
-                    entry.assist2 or "-",                       # 11
-                    entry.scrub or "-",                         # 12
-                    entry.circulate or "-",                     # 13
-                    entry.time_start or "-",                    # 14
-                    entry.time_end or "-",                      # 15
-                    ""                                          # 16 (คิว: widget)
+                    entry.case_size or "-",                     # 9
+                    entry.dept or "-",                          # 10
+                    entry.assist1 or "-",                       # 11
+                    entry.assist2 or "-",                       # 12
+                    entry.scrub or "-",                         # 13
+                    entry.circulate or "-",                     # 14
+                    entry.time_start or "-",                    # 15
+                    entry.time_end or "-",                      # 16
+                    ""                                          # 17 (คิว: widget)
                 ])
                 row.setData(0, QtCore.Qt.UserRole, entry.uid())
                 row.setData(0, QtCore.Qt.UserRole+1, idx)
@@ -1323,7 +1355,7 @@ class Main(QtWidgets.QWidget):
                 qs = QueueSelectWidget(int(entry.queue or 0))
                 uid = entry.uid()
                 qs.changed.connect(lambda new_q, u=uid: self._apply_queue_select(u, int(new_q)))
-                self.tree2.setItemWidget(row, 16, qs)
+                self.tree2.setItemWidget(row, 17, qs)
 
                 # ขีดฆ่าเมื่อ "เสร็จแล้ว"
                 # ปรับ: จะขีดเฉพาะเมื่อ HN เคยถูกเห็นใน Monitor แต่ขณะนี้ไม่อยู่ใน Monitor อีกต่อไป
@@ -1336,8 +1368,8 @@ class Main(QtWidgets.QWidget):
                     _apply_done_style(row, row.columnCount())
 
         self.tree2.expandAll()
-        self.tree2.header().setSectionResizeMode(16, QtWidgets.QHeaderView.ResizeToContents)
-        self.tree2.setColumnWidth(16, 160)
+        self.tree2.header().setSectionResizeMode(17, QtWidgets.QHeaderView.ResizeToContents)
+        self.tree2.setColumnWidth(17, 160)
 
     def _apply_queue_select(self, uid: str, new_q: int):
         target=None; target_idx=None
@@ -1352,11 +1384,14 @@ class Main(QtWidgets.QWidget):
         try: QtWidgets.QApplication.beep()
         except Exception: pass
         self._notify("อัปเดตคิวสำเร็จ", f"OR {target.or_room} • HN {target.hn} → คิว {new_q or 'ตามเวลา'}")
-        self.card_result.title_lbl.setText(f"Result Schedule Operating Room (Private)  —  อัปเดตคิว {datetime.now():%H:%M:%S}")
+        now = datetime.now()
+        self.card_result.title_lbl.setText(
+            f"ตารางการผ่าตัด ประจำวัน ({now:%d/%m/%Y}) เวลา {now:%H:%M} น. ห้องผ่าตัดโรงพยาบาลหนองบัวลำภู"
+        )
         self._render_tree2()
         self._flash_row_by_uid(uid)
-        self.tree2.header().setSectionResizeMode(16, QtWidgets.QHeaderView.ResizeToContents)
-        self.tree2.setColumnWidth(16, 160)
+        self.tree2.header().setSectionResizeMode(17, QtWidgets.QHeaderView.ResizeToContents)
+        self.tree2.setColumnWidth(17, 160)
 
     def _find_item_by_uid(self, uid:str):
         root = self.tree2.invisibleRootItem()
@@ -1512,11 +1547,12 @@ class Main(QtWidgets.QWidget):
                     "diag": " | ".join(e.diags or []),
                     "op": " | ".join(e.ops or []),
                     "ward": e.ward or "",
+                    "case_size": e.case_size or "",
                     "doctor": e.doctor or "",
                     # หมายเหตุ: ไม่ส่งออก HN/ชื่อ
                 })
             with open(path,"w",newline="",encoding="utf-8-sig") as f:
-                cols=["hn_hash","dept","or","queue","period","scheduled_date","scheduled_time","time_start","time_end","diag","op","ward","doctor"]
+                cols=["hn_hash","dept","or","queue","period","scheduled_date","scheduled_time","time_start","time_end","diag","op","ward","case_size","doctor"]
                 w=csv.DictWriter(f, fieldnames=cols)
                 w.writeheader(); w.writerows(rows)
             QtWidgets.QMessageBox.information(self,"ส่งออกแล้ว",path)
@@ -1560,6 +1596,7 @@ class SearchSelectAdder(QtWidgets.QWidget):
     """Searchable selector with a multi-select list and change signal."""
 
     itemsChanged = QtCore.Signal(list)
+    itemAdded = QtCore.Signal(str)   # ส่งข้อความที่ถูกเพิ่ม (สำหรับ seed)
 
     def __init__(self, placeholder="ค้นหา ICD-10...", suggestions=None, parent=None):
         super().__init__(parent)
@@ -1612,6 +1649,8 @@ class SearchSelectAdder(QtWidgets.QWidget):
         text = self.combo.currentText().strip()
         if text and text.lower() not in [self.list.item(i).text().lower() for i in range(self.list.count())]:
             self.list.addItem(text)
+            # แจ้งว่าเป็นรายการใหม่ เพื่อให้ฝั่ง Main บันทึก seed
+            self.itemAdded.emit(text)
         self.combo.setCurrentIndex(0)
         self.combo.setEditText("")
         self._emit_items_changed()
@@ -1644,6 +1683,33 @@ class SearchSelectAdder(QtWidgets.QWidget):
 
     def _emit_items_changed(self):
         self.itemsChanged.emit(self.items())
+
+
+def _get_seed_list(key: str, spec_key: str) -> list[str]:
+    s = QSettings(ORG_NAME, APP_SETTINGS)
+    m = s.value(key, {}) or {}
+    if not isinstance(m, dict):
+        m = {}
+    arr = m.get(spec_key, []) or []
+    if not isinstance(arr, list):
+        arr = []
+    return [str(x) for x in arr if str(x).strip()]
+
+
+def _append_seed_item(key: str, spec_key: str, item: str):
+    item = (item or "").strip()
+    if not item:
+        return
+    s = QSettings(ORG_NAME, APP_SETTINGS)
+    m = s.value(key, {}) or {}
+    if not isinstance(m, dict):
+        m = {}
+    arr = m.get(spec_key, []) or []
+    if item not in arr:
+        arr.append(item)
+        m[spec_key] = arr
+        s.setValue(key, m)
+        s.sync()
 
 
 def main():
