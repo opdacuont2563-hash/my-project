@@ -85,9 +85,15 @@ def add_shadow(widget: QtWidgets.QWidget, blur=28, x=0, y=8, color="#24000000"):
     eff.setBlurRadius(blur); eff.setOffset(x, y); eff.setColor(QtGui.QColor(color))
     widget.setGraphicsEffect(eff)
 
+class NoWheelComboBox(QtWidgets.QComboBox):
+    """คอมโบที่ไม่ยอมให้เมาส์สกรอลล์เปลี่ยนค่า (กันเผลอเลื่อน)"""
+    def wheelEvent(self, e: QtGui.QWheelEvent) -> None:
+        e.ignore()  # ให้ scroll ที่ parent แทน
+        return
+
 
 def make_search_combo(options: list[str]) -> QtWidgets.QComboBox:
-    cb = QtWidgets.QComboBox()
+    cb = NoWheelComboBox()
     cb.setEditable(True)
     cb.addItems([""] + options)
     cb.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
@@ -776,14 +782,19 @@ class Main(QtWidgets.QWidget):
         self.card_result = Card("Result Schedule Operating Room (Private)", "อัปเดตเรียลไทม์ (QSettings) — คลิกขวาเพื่อแก้ไข/ลบ, ดับเบิลคลิกเพื่อแก้ไขทันที")
         gr2 = self.card_result.grid
         self.tree2 = QtWidgets.QTreeWidget()
-        self.tree2.setColumnCount(10)
-        # หัวตารางชัดเจน (Diagnosis / Operation เต็ม)
-        self.tree2.setHeaderLabels(["ช่วงเวลา","OR/เวลา","HN","ชื่อ-สกุล","อายุ","Diagnosis","Operation","แพทย์","Ward","คิว"])
+        # เพิ่มคอลัมน์ให้ครอบคลุมข้อมูลจากแท็บ 1 และเปิดสกรอลล์แนวนอน
+        self.tree2.setColumnCount(17)
+        self.tree2.setHeaderLabels([
+            "ช่วงเวลา","OR/เวลา","HN","ชื่อ-สกุล","อายุ","Diagnosis","Operation","แพทย์",
+            "Ward","แผนก","Assist1","Assist2","Scrub","Circulate","เริ่ม","จบ","คิว"
+        ])
         self.tree2.setTextElideMode(QtCore.Qt.ElideNone); self.tree2.setWordWrap(True); self.tree2.setUniformRowHeights(False)
         self.tree2.setAlternatingRowColors(True)
         self.tree2.setRootIsDecorated(False)
         self.tree2.setIndentation(12)
         self.tree2.setMouseTracking(True)
+        self.tree2.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.tree2.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
         self.tree2.setStyleSheet("""
             QTreeWidget{ background:#ffffff; border-radius:16px; gridline-color:#eef2ff; }
             QTreeWidget::item{ margin:2px 4px; }
@@ -795,12 +806,12 @@ class Main(QtWidgets.QWidget):
         hdr=self.tree2.header(); hdr.setStretchLastSection(False)
         hdr.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         hdr.setFixedHeight(40)
-        for i in (0,1,2,3,4,7,8):
+        # ให้คอลัมน์ยืดบางส่วน และเลื่อนแนวนอนได้เมื่อกว้างเกิน
+        for i in (0,1,2,3,4,7,8,9,10,11,12,13,14,15,16):
             hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(5, QtWidgets.QHeaderView.Stretch)
-        hdr.setSectionResizeMode(6, QtWidgets.QHeaderView.Stretch)
-        hdr.setSectionResizeMode(9, QtWidgets.QHeaderView.ResizeToContents)
-        self.tree2.setColumnWidth(9, 150)
+        hdr.setSectionResizeMode(5, QtWidgets.QHeaderView.Stretch)   # Diagnosis
+        hdr.setSectionResizeMode(6, QtWidgets.QHeaderView.Stretch)   # Operation
+        self.tree2.setColumnWidth(16, 160)
         self.wrap_delegate = WrapItemDelegate(self.tree2)
         for col in (5,6,7):
             self.tree2.setItemDelegateForColumn(col, self.wrap_delegate)
@@ -1287,8 +1298,23 @@ class Main(QtWidgets.QWidget):
                 diag_txt = " with ".join(entry.diags) if entry.diags else "-"
                 op_txt   = " with ".join(entry.ops)   if entry.ops   else "-"
                 row=QtWidgets.QTreeWidgetItem([
-                    _period_label(entry.period), entry.time or "-", entry.hn, entry.name or "-",
-                    str(entry.age or 0), diag_txt, op_txt, entry.doctor or "-", entry.ward or "-", ""
+                    _period_label(entry.period),                # 0
+                    entry.time or "-",                          # 1
+                    entry.hn,                                   # 2
+                    entry.name or "-",                          # 3
+                    str(entry.age or 0),                        # 4
+                    diag_txt,                                   # 5
+                    op_txt,                                     # 6
+                    entry.doctor or "-",                        # 7
+                    entry.ward or "-",                          # 8
+                    entry.dept or "-",                          # 9
+                    entry.assist1 or "-",                       # 10
+                    entry.assist2 or "-",                       # 11
+                    entry.scrub or "-",                         # 12
+                    entry.circulate or "-",                     # 13
+                    entry.time_start or "-",                    # 14
+                    entry.time_end or "-",                      # 15
+                    ""                                          # 16 (คิว: widget)
                 ])
                 row.setData(0, QtCore.Qt.UserRole, entry.uid())
                 row.setData(0, QtCore.Qt.UserRole+1, idx)
@@ -1297,7 +1323,7 @@ class Main(QtWidgets.QWidget):
                 qs = QueueSelectWidget(int(entry.queue or 0))
                 uid = entry.uid()
                 qs.changed.connect(lambda new_q, u=uid: self._apply_queue_select(u, int(new_q)))
-                self.tree2.setItemWidget(row, 9, qs)
+                self.tree2.setItemWidget(row, 16, qs)
 
                 # ขีดฆ่าเมื่อ "เสร็จแล้ว"
                 # ปรับ: จะขีดเฉพาะเมื่อ HN เคยถูกเห็นใน Monitor แต่ขณะนี้ไม่อยู่ใน Monitor อีกต่อไป
@@ -1310,8 +1336,8 @@ class Main(QtWidgets.QWidget):
                     _apply_done_style(row, row.columnCount())
 
         self.tree2.expandAll()
-        self.tree2.header().setSectionResizeMode(9, QtWidgets.QHeaderView.ResizeToContents)
-        self.tree2.setColumnWidth(9, 150)
+        self.tree2.header().setSectionResizeMode(16, QtWidgets.QHeaderView.ResizeToContents)
+        self.tree2.setColumnWidth(16, 160)
 
     def _apply_queue_select(self, uid: str, new_q: int):
         target=None; target_idx=None
@@ -1329,8 +1355,8 @@ class Main(QtWidgets.QWidget):
         self.card_result.title_lbl.setText(f"Result Schedule Operating Room (Private)  —  อัปเดตคิว {datetime.now():%H:%M:%S}")
         self._render_tree2()
         self._flash_row_by_uid(uid)
-        self.tree2.header().setSectionResizeMode(9, QtWidgets.QHeaderView.ResizeToContents)
-        self.tree2.setColumnWidth(9, 150)
+        self.tree2.header().setSectionResizeMode(16, QtWidgets.QHeaderView.ResizeToContents)
+        self.tree2.setColumnWidth(16, 160)
 
     def _find_item_by_uid(self, uid:str):
         root = self.tree2.invisibleRootItem()
@@ -1543,7 +1569,7 @@ class SearchSelectAdder(QtWidgets.QWidget):
 
         row = QtWidgets.QHBoxLayout()
         row.setSpacing(6)
-        self.combo = QtWidgets.QComboBox()
+        self.combo = NoWheelComboBox()  # กัน scroll เปลี่ยนค่าโดยไม่ตั้งใจ
         self.combo.setEditable(True)
         self.combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
         self.combo.setMinimumWidth(280)
@@ -1613,6 +1639,8 @@ class SearchSelectAdder(QtWidgets.QWidget):
         comp.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
         comp.setFilterMode(QtCore.Qt.MatchContains)
         self.combo.setCompleter(comp)
+        # ปิดการเลื่อนด้วยล้อเมาส์บนคอมโบ (กันเปลี่ยนค่าเวลาเลื่อนหน้า)
+        self.combo.setFocusPolicy(QtCore.Qt.StrongFocus)
 
     def _emit_items_changed(self):
         self.itemsChanged.emit(self.items())
