@@ -1,0 +1,1510 @@
+# -*- coding: utf-8 -*-
+"""
+(ปรับปรุงจาก registry_patient_connect.py — แก้ strike-through logic & ปรับสไตล์ตาราง)
+"""
+import os, sys, json, argparse, csv
+from pathlib import Path
+from typing import List, Optional, Tuple, Dict
+from datetime import datetime, timedelta, time as dtime
+
+import requests
+from requests.adapters import HTTPAdapter, Retry
+
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtCore import QSettings, QUrl, QLocale
+from PySide6.QtGui import QIcon, QPixmap, QPainter, QLinearGradient
+from PySide6.QtWebSockets import QWebSocket
+
+from icd10_catalog import (
+    ALL_OPERATIONS,
+    diagnosis_suggestions,
+    operation_suggestions,
+)
+
+# ---------------------- Helpers: "done" style ----------------------
+DONE_KEYWORDS = ("ผ่าตัดเสร็จ", "done", "completed", "finished")
+
+def _is_done_status(text: str) -> bool:
+    if not text:
+        return False
+    t = str(text).strip().lower()
+    return any(k in t for k in DONE_KEYWORDS)
+
+def _apply_done_style(item: QtWidgets.QTreeWidgetItem, col_count: int) -> None:
+    """ขีดฆ่า + โทนสีเทาให้อ่านง่าย"""
+    font = item.font(0)
+    font.setStrikeOut(True)
+    gray = QtGui.QBrush(QtGui.QColor("#9ca3af"))
+    for c in range(col_count):
+        item.setFont(c, font)
+        item.setForeground(c, gray)
+
+# ---------------------- Modern theme ----------------------
+def apply_modern_theme(widget: QtWidgets.QWidget):
+    widget.setStyleSheet("""
+    QWidget{font-family:'Segoe UI','Inter','Noto Sans',system-ui;font-size:11pt;color:#0f172a;background:#f4f6fb;}
+    QLineEdit, QDateEdit, QTimeEdit, QComboBox, QPlainTextEdit{
+        padding:8px 12px;border-radius:12px;border:1px solid #e6eaf2;background:#fff;
+    }
+    QLineEdit:hover, QDateEdit:hover, QTimeEdit:hover, QComboBox:hover, QPlainTextEdit:hover{border-color:#cfd8e6;}
+    QLineEdit:focus, QDateEdit:focus, QTimeEdit:focus, QComboBox:focus, QPlainTextEdit:focus{border:1px solid #7aa2ff;background:#fff;}
+    QPushButton{padding:9px 16px;border-radius:14px;border:1px solid #e7ecf4;background:#fff;font-weight:800;}
+    QPushButton:hover{background:#f7faff;border-color:#d9e4fb;}
+    QPushButton:pressed{background:#eef4ff;}
+    QPushButton[variant="primary"]{background:#2563eb;border-color:#2563eb;color:#fff;}
+    QPushButton[variant="primary"]:hover{background:#1d4ed8;}
+    QPushButton[variant="danger"]{background:#ef4444;border-color:#ef4444;color:#fff;}
+    QPushButton[variant="danger"]:hover{background:#dc2626;}
+    QPushButton[variant="ghost"]{background:transparent;border-color:#e7ecf4;color:#0f172a;}
+    QTableWidget, QTreeWidget{background:#fff;border:1px solid #e6e6ef;border-radius:12px;gridline-color:#e6e6ef;selection-background-color:#e0f2fe;}
+    QTreeWidget::item{height:36px;}
+    QTreeWidget::item:hover{ background: rgba(2,132,199,0.06); }
+    QHeaderView::section{background:#f1f5f9;border-bottom:1px solid #e6eaf2;padding:10px 12px;font-weight:900;color:#0f172a;}
+    QLabel[role='t']{ font-weight:900; font-size:16pt; letter-spacing:.2px; }
+    QLabel[role='s']{ color:#64748b; font-size:10pt; }
+    QLabel[role='h']{
+        font-weight:900; font-size:12.5pt; color:#0f2167; letter-spacing:.2px;
+    }
+    QFrame#SectionHeader{
+        background:#eef4ff; border:1px solid #dbeafe; border-radius:12px; padding:6px 10px;
+    }
+    QLabel[hint="1"]{color:#64748b;}
+    QLabel[warn="1"]{color:#b91c1c;font-weight:700;}
+    TabWidget::pane{border:0;}
+    QTabBar::tab{
+        padding:10px 16px;border-radius:12px;margin:4px;background:#e9eef8;font-weight:700;color:#0f172a;
+    }
+    QTabBar::tab:hover{ background:#eef3ff; }
+    QTabBar::tab:selected{ background:#2563eb;color:#fff; }
+    """)
+
+
+def add_shadow(widget: QtWidgets.QWidget, blur=28, x=0, y=8, color="#24000000"):
+    eff = QtWidgets.QGraphicsDropShadowEffect(widget)
+    eff.setBlurRadius(blur); eff.setOffset(x, y); eff.setColor(QtGui.QColor(color))
+    widget.setGraphicsEffect(eff)
+
+
+def make_search_combo(options: list[str]) -> QtWidgets.QComboBox:
+    cb = QtWidgets.QComboBox()
+    cb.setEditable(True)
+    cb.addItems([""] + options)
+    cb.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+    comp = QtWidgets.QCompleter(options)
+    comp.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+    comp.setFilterMode(QtCore.Qt.MatchContains)
+    cb.setCompleter(comp)
+    cb.setMinimumWidth(180)
+    return cb
+
+
+def section_header(text: str) -> QtWidgets.QFrame:
+    wrap = QtWidgets.QFrame()
+    wrap.setObjectName("SectionHeader")
+    h = QtWidgets.QHBoxLayout(wrap)
+    h.setContentsMargins(10, 6, 10, 6)
+    lab = QtWidgets.QLabel(text)
+    lab.setProperty("role", "h")
+    h.addWidget(lab)
+    h.addStretch(1)
+    return wrap
+
+class Card(QtWidgets.QFrame):
+    def __init__(self, title="", subtitle=""):
+        super().__init__()
+        self.setObjectName("Card")
+        self.setStyleSheet("""
+            QFrame#Card { background:#ffffff; border:1px solid #e6eaf2; border-radius:22px; }
+            QLabel[role='t'] { font-weight:900; font-size:16pt; letter-spacing:0.2px; }
+            QLabel[role='s'] { color:#64748b; font-size:10pt; }
+        """)
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(20,20,20,20); v.setSpacing(12)
+        self.title_lbl = QtWidgets.QLabel(title); self.title_lbl.setProperty("role","t"); v.addWidget(self.title_lbl)
+        if subtitle:
+            s = QtWidgets.QLabel(subtitle); s.setProperty("role","s"); v.addWidget(s)
+        self.body = QtWidgets.QWidget()
+        self.grid = QtWidgets.QGridLayout(self.body)
+        self.grid.setHorizontalSpacing(14); self.grid.setVerticalSpacing(12)
+        v.addWidget(self.body); add_shadow(self)
+
+# ---------------------- Config ----------------------
+DEFAULT_HOST = os.getenv("SURGIBOT_CLIENT_HOST", "127.0.0.1")
+DEFAULT_PORT = int(os.getenv("SURGIBOT_CLIENT_PORT", "8088"))
+DEFAULT_TOKEN = os.getenv("SURGIBOT_SECRET", "uTCoBelMyNfSSNmUulT_Kz6zrrCVkvD578MxEuLKZoaaXX0pVlpAD8toYHBxsFxI")
+
+API_HEALTH = "/api/health"; API_LIST="/api/list"; API_LIST_FULL="/api/list_full"; API_WS="/api/ws"
+
+STATUS_COLORS = {
+    "รอผ่าตัด": "#fde047", "กำลังผ่าตัด": "#ef4444", "กำลังพักฟื้น": "#22c55e",
+    "กำลังส่งกลับตึก": "#a855f7", "เลื่อนการผ่าตัด": "#64748b",
+}
+PULSE_STATUS = {"กำลังผ่าตัด","กำลังพักฟื้น","กำลังส่งกลับตึก"}
+DEFAULT_OR_ROOMS = ["OR1","OR2","OR3","OR4","OR5","OR6","OR8"]
+
+WARD_LIST = [
+    "— กรุณาเลือก —",
+    "หอผู้ป่วยอภิบาลสงฆ์",
+    "หอผู้ป่วยพิเศษศัลยกรรม ชั้น 4",
+    "หอผู้ป่วยศัลยกรรมกระดูกและข้อ",
+    "หอผู้ป่วยศัลยกรรมหญิง",
+    "หอผู้ป่วยศัลยกรรมชาย",
+    "หอผู้ป่วยพิเศษอายุรกรรม ชั้น 5",
+    "หอผู้ป่วยพิเศษอายุรกรรม ชั้น 4",
+    "หอผู้ป่วยICU-MED",
+    "หอผู้ป่วย ICU รวม",
+    "หอผู้ป่วยอายุรกรรมหญิง",
+    "หอผู้ป่วยอายุรกรรมชาย",
+    "หอผู้ป่วยพิเศษรวมน้ำใจ",
+    "หอผู้ป่วยหนักกุมารเวช",
+    "หอผู้ป่วยหู ตา คอ จมูก",
+    "หอผู้ป่วยกุมารเวช",
+    "หอผู้ป่วยพิเศษสูติ-นรีเวช ชั้น 5",
+    "หอผู้ป่วยพิเศษสูติ-นรีเวช ชั้น 4",
+    "หอผู้ป่วยศัลยกรรมประสาทและสมอง",
+    "หอผู้ป่วยสูติ-นรีเวช",
+    "ห้องคลอด",
+    "ห้องผ่าตัด",
+    "แผนกอุบัติเหตุและฉุกเฉิน",
+]
+
+WARD_PLACEHOLDER = WARD_LIST[0]
+
+SCRUB_NURSES = [
+    "อรุณี", "ศิวดาติ์", "กัญญณัช", "ชัญญาภัค", "สุนทรี", "พิศมัย", "เทวัญ", "กันต์พงษ์",
+    "ปนัฏฐา", "สุจิตรา", "ชัยยงค์", "สุภาวัลย์", "จันทจร", "วรรณิภา", "ณัฐพงษ์", "ตะวัน",
+    "ปวีณา", "นิฤมล", "ปริญญา", "สยุมพร", "สุรสิทธ์", "บุศรินทร์", "ศิริกัญญา", "นราวัตน์",
+    "บัณฑิตา", "วรรณวิสา", "ชลดา", "วรีสา",
+]
+
+
+ORG_NAME="ORNBH"; APP_SHARED="SurgiBotShared"; OR_KEY="schedule/or_rooms"; ENTRIES_KEY="schedule/entries"; SEQ_KEY="schedule/seq"
+
+DEPT_DOCTORS = {
+    "Surgery | ศัลยกรรมทั่วไป": ["นพ.สุริยา คุณาชน","นพ.ธนวัฒน์ พันธุ์พรหม","พญ.สุภาภรณ์ พิณพาทย์","พญ.รัฐพร ตั้งเพียร","พญ.พิชัย สุวัฒนพูนลาภ"],
+    "Orthopedics | ศัลยกรรมกระดูกและข้อ": ["นพ.ชัชพล องค์โฆษิต","นพ.ณัฐพงศ์ ศรีโพนทอง","นพ.อำนาจ อนันต์วัฒนกุล","นพ.อภิชาติ ลักษณะ","นพ.กฤษฎา อิ้งอำพร","นพ.วิษณุ ผูกพันธ์"],
+    "Urology | ศัลยกรรมระบบทางเดินปัสสาวะ": ["พญ.สายฝน บรรณจิตร์"],
+    "ENT | ศัลยกรรม โสต ศอ นาสิก": ["พญ.พิรุณยา แสนวันดี","พญ.สุทธิพร หมวดไธสง","นพ.วรวิช พลเวียงธรรม"],
+    "Obstetrics-Gynecology | สูติ-นรีเวช": ["นพ.สุรจิตต์ นิมิตรวงษ์สกุล","พญ.ขวัญตา ทุนประเทือง","พญ.วัชราภรณ์ อนวัชชกุล","พญ.รุ่งฤดี โขมพัตร","พญ.ฐิติมน ชัยชนะทรัพย์"],
+    "Ophthalmology | จักษุ": ["นพ.สราวุธ สารีย์","พญ.ดวิษา อังศรีประเสริฐ","พญ.สาวิตรี ถนอมวงศ์ไทย","พญ.สีกชมพู ตั้งสัตยาธิษฐาน","พญ.นันท์นภัส ชีวะเกรียงไกร"],
+    "Maxillofacial | ศัลยกรรมขากรรไกร": ["นพ.ฉลองรัฐ เดชา","พญ.อรุณนภา คิสารัง"],
+}
+
+def _dept_key(label:str)->str:
+    t=(label or "").lower()
+    if "กระดูก" in t or "ortho" in t: return "Orthopedics"
+    if "ปัสสาวะ" in t or "uro" in t: return "Urology"
+    if "สูติ" in t or "ob" in t: return "OBGYN"
+    if "โสต" in t or "ent" in t or "คอ" in t: return "ENT"
+    if "จักษุ" in t or "oph" in t: return "Ophthalmology"
+    if "ขากรรไกร" in t or "max" in t: return "Maxillofacial"
+    return "Surgery"
+
+class Toast(QtWidgets.QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("""
+            QFrame{background:#111827; color:#fff; border-radius:12px; padding:10px 14px;}
+            QLabel{color:#fff;}
+        """)
+        add_shadow(self, blur=30, x=0, y=8, color="#40000000")
+        self.lab = QtWidgets.QLabel("", self)
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(14,10,14,10)
+        lay.addWidget(self.lab)
+        self._anim: Optional[QtCore.QPropertyAnimation] = None
+        self.hide()
+
+    def show_toast(self, text: str, msec: int = 2200):
+        self.lab.setText(text)
+        if self.parent():
+            p = self.parent()
+            geo = p.geometry()
+            self.adjustSize()
+            w, h = self.width(), self.height()
+            self.setGeometry(geo.width() - w - 24, 24, w, h)
+
+        if self._anim is not None:
+            try:
+                self._anim.stop()
+            except Exception:
+                pass
+            self._anim.deleteLater()
+            self._anim = None
+
+        self.setWindowOpacity(0.0)
+        self.show()
+        self.raise_()
+
+        anim = QtCore.QPropertyAnimation(self, b"windowOpacity", self)
+        anim.setDuration(msec)
+        anim.setStartValue(0.0)
+        anim.setKeyValueAt(0.1, 1.0)
+        anim.setKeyValueAt(0.9, 1.0)
+        anim.setEndValue(0.0)
+
+        anim.finished.connect(self.hide)
+        self._anim = anim
+        anim.start()
+
+class StatusChipWidget(QtWidgets.QWidget):
+    def __init__(self, text:str, color:str, pulse:bool=False, parent=None):
+        super().__init__(parent)
+        self._text=text; self._color=color; self._pulse=pulse
+        if pulse:
+            self.eff = QtWidgets.QGraphicsOpacityEffect(self); self.setGraphicsEffect(self.eff)
+            self.anim = QtCore.QPropertyAnimation(self.eff, b"opacity", self)
+            self.anim.setDuration(1200); self.anim.setStartValue(0.5); self.anim.setEndValue(1.0)
+            self.anim.setEasingCurve(QtCore.QEasingCurve.InOutQuad); self.anim.setLoopCount(-1); self.anim.start()
+    def minimumSizeHint(self):
+        fm = QtGui.QFontMetrics(self.font())
+        w = fm.horizontalAdvance(self._text) + 22 + 16
+        h = fm.height() + 10
+        return QtCore.QSize(w, h)
+    def paintEvent(self, e):
+        p=QtGui.QPainter(self); p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        rect = self.rect().adjusted(2,2,-2,-2)
+        bg = QtGui.QColor(self._color); bg.setAlpha(205)
+        p.setPen(QtCore.Qt.NoPen); p.setBrush(bg)
+        p.drawRoundedRect(rect, 10, 10)
+        p.setPen(QtGui.QColor("#ffffff"))
+        p.drawText(rect.adjusted(12,0,-8,0), QtCore.Qt.AlignVCenter|QtCore.Qt.AlignLeft, self._text)
+
+class ScheduleEntry(QtCore.QObject):
+    def __init__(
+        self,
+        or_room="",
+        dt=None,
+        time_str="",
+        hn="",
+        name="",
+        age=0,
+        dept="",
+        doctor="",
+        diags=None,
+        ops=None,
+        ward="",
+        queue=0,
+        period="in",
+        assist1="",
+        assist2="",
+        scrub="",
+        circulate="",
+        time_start="",
+        time_end="",
+    ):
+        super().__init__()
+        self.or_room = or_room
+        self.date = dt or datetime.now().date()
+        self.time = time_str
+        self.hn = (hn or "").strip()
+        self.name = (name or "").strip()
+        self.age = int(age) if str(age).isdigit() else 0
+        self.dept = dept
+        self.doctor = doctor
+        self.diags = diags or []
+        self.ops = ops or []
+        self.ward = (ward or "").strip()
+        self.queue = int(queue) if str(queue).isdigit() else 0
+        self.period = period  # "in" | "off"
+        self.assist1 = assist1
+        self.assist2 = assist2
+        self.scrub = scrub
+        self.circulate = circulate
+        self.time_start = time_start
+        self.time_end = time_end
+
+    def to_dict(self):
+        return {
+            "or": self.or_room,
+            "date": str(self.date),
+            "time": self.time,
+            "hn": self.hn,
+            "name": self.name,
+            "age": self.age,
+            "dept": self.dept,
+            "doctor": self.doctor,
+            "diags": self.diags,
+            "ops": self.ops,
+            "ward": self.ward,
+            "queue": self.queue,
+            "period": self.period,
+            "assist1": self.assist1,
+            "assist2": self.assist2,
+            "scrub": self.scrub,
+            "circulate": self.circulate,
+            "time_start": self.time_start,
+            "time_end": self.time_end,
+        }
+
+    @staticmethod
+    def from_dict(d:dict):
+        try:
+            fromiso = datetime.fromisoformat(d.get("date")).date()
+        except Exception:
+            fromiso = datetime.now().date()
+        return ScheduleEntry(
+            d.get("or",""),
+            fromiso,
+            d.get("time",""),
+            d.get("hn",""),
+            d.get("name",""),
+            d.get("age",0),
+            d.get("dept",""),
+            d.get("doctor",""),
+            d.get("diags",[]) or [],
+            d.get("ops",[]) or [],
+            d.get("ward",""),
+            d.get("queue",0),
+            d.get("period","in"),
+            d.get("assist1",""),
+            d.get("assist2",""),
+            d.get("scrub",""),
+            d.get("circulate",""),
+            d.get("time_start",""),
+            d.get("time_end",""),
+        )
+
+    def uid(self)->str:
+        return f"{self.or_room}|{self.hn}|{self.time}|{self.date}"
+
+class SharedScheduleModel:
+    def __init__(self):
+        self.s = QSettings(ORG_NAME, APP_SHARED)
+        self.entries = self._load(); self.or_rooms = self._load_or()
+        if not self.s.contains(SEQ_KEY): self.s.setValue(SEQ_KEY, 0)
+    def _load(self)->List[ScheduleEntry]:
+        raw=self.s.value(ENTRIES_KEY, []); out=[]
+        if isinstance(raw,list):
+            for d in raw:
+                if isinstance(d,dict): out.append(ScheduleEntry.from_dict(d))
+        return out
+    def _save(self):
+        self.s.setValue(ENTRIES_KEY, [e.to_dict() for e in self.entries])
+        self.s.setValue(SEQ_KEY, int(self.s.value(SEQ_KEY,0))+1); self.s.sync()
+    def _load_or(self)->List[str]:
+        lst=self.s.value(OR_KEY)
+        if not isinstance(lst,list) or not lst: lst=DEFAULT_OR_ROOMS[:]; self.s.setValue(OR_KEY, lst)
+        return [str(x) for x in lst]
+    def set_or_rooms(self, rooms:List[str]):
+        norm=[]
+        for r in rooms:
+            r=r.strip().upper()
+            if r and r.startswith("OR") and r!="OR7" and r not in norm: norm.append(r)
+        if not norm: norm=DEFAULT_OR_ROOMS[:]
+        self.or_rooms=norm; self.s.setValue(OR_KEY, norm); self.s.setValue(SEQ_KEY, int(self.s.value(SEQ_KEY,0))+1); self.s.sync()
+    def add(self, e:ScheduleEntry): self.entries.append(e); self._save()
+    def update(self, idx:int, e:ScheduleEntry):
+        if 0<=idx<len(self.entries): self.entries[idx]=e; self._save()
+    def delete(self, idx:int):
+        if 0<=idx<len(self.entries): self.entries.pop(idx); self._save()
+    def seq(self)->int: return int(self.s.value(SEQ_KEY, 0))
+
+class LocalDBLogger:
+    def __init__(self, path="schedule.db"):
+        import sqlite3
+        self.sqlite3 = sqlite3
+        self.conn = sqlite3.connect(path); self._init()
+    def _init(self):
+        cur = self.conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS schedule(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT, period TEXT, or_room TEXT, date TEXT, time TEXT,
+                hn TEXT, name TEXT, age INTEGER, dept TEXT, doctor TEXT,
+                diagnosis TEXT, operation TEXT, ward TEXT, queue INTEGER
+            )
+        """); self.conn.commit()
+    def append_entry(self, e: 'ScheduleEntry'):
+        cur = self.conn.cursor()
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur.execute("""
+            INSERT INTO schedule(timestamp,period,or_room,date,time,hn,name,age,dept,doctor,diagnosis,operation,ward,queue)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (ts, ("ในเวลาราชการ" if e.period=="in" else "นอกเวลาราชการ"), e.or_room, str(e.date), e.time, e.hn, e.name, e.age,
+              e.dept, e.doctor, " with ".join(e.diags), " with ".join(e.ops), e.ward, e.queue))
+        self.conn.commit()
+
+def _fmt_td(td: timedelta) -> str:
+    total = int(abs(td.total_seconds())); h = total // 3600; m = (total % 3600) // 60; s = total % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def _parse_iso(ts: str):
+    if not ts: return None
+    try: return datetime.fromisoformat(ts.replace("Z",""))
+    except Exception: return None
+
+def _app_icon() -> QIcon:
+    pm=QtGui.QPixmap(64,64); pm.fill(QtCore.Qt.transparent)
+    pa=QPainter(pm); pa.setRenderHint(QtGui.QPainter.Antialiasing,True)
+    gr=QLinearGradient(0,0,64,64)
+    gr.setColorAt(0,"#d9ecff"); gr.setColorAt(.55,"#e1f5ff"); gr.setColorAt(1,"#e6fff5")
+    pa.setBrush(gr); pa.setPen(QtCore.Qt.NoPen); pa.drawEllipse(6,6,52,52)
+    pa.setBrush(QtGui.QColor("#0f172a"))
+    pa.drawEllipse(26,20,12,12)
+    pa.end()
+    return QIcon(pm)
+
+
+def _load_app_icon() -> QIcon:
+    p = Path("assets/app.ico")
+    if p.exists():
+        ico = QIcon(str(p))
+        if not ico.isNull():
+            return ico
+    return _app_icon()
+
+def _now_period(dt_val: datetime) -> str:
+    start = dtime(8,30); end = dtime(16,30)
+    return "in" if (start <= dt_val.time() < end) else "off"
+
+def _period_label(code: str) -> str: return "ในเวลาราชการ" if code=="in" else "นอกเวลาราชการ"
+
+class ClientHTTP:
+    def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, token=DEFAULT_TOKEN, timeout=1.2):
+        self.base, self.token, self.timeout = f"http://{host}:{port}", token, timeout
+        self.s = requests.Session()
+        self.s.mount("http://", HTTPAdapter(max_retries=Retry(
+            total=3, connect=2, read=2, backoff_factor=0.35,
+            status_forcelist=(429,500,502,503,504),
+            allowed_methods=frozenset(["GET","POST"])
+        )))
+    def health(self):
+        r=self.s.get(self.base+API_HEALTH, timeout=self.timeout, headers={"Accept":"application/json"})
+        r.raise_for_status(); return r.json()
+    def list_items(self):
+        try:
+            r=self.s.get(f"{self.base}{API_LIST_FULL}?token={self.token}",timeout=self.timeout,headers={"Accept":"application/json"})
+            if r.status_code==200: return self._wrap(r.json())
+        except Exception: pass
+        try:
+            r=self.s.get(self.base+API_LIST,timeout=self.timeout,headers={"Accept":"application/json"})
+            if r.status_code==200: return self._wrap(r.json())
+        except Exception: pass
+        return {"items":[]}
+    @staticmethod
+    def _wrap(d):
+        if isinstance(d,list): return {"items":d}
+        if isinstance(d,dict):
+            for k in ("items","data","table","rows","list"):
+                if k in d and isinstance(d[k],list): return {"items":d[k]}
+            for v in d.values():
+                if isinstance(v,list): return {"items":v}
+            return d
+        return {"items":[]}
+
+def extract_rows(payload):
+    if isinstance(payload,list): src=payload
+    elif isinstance(payload,dict):
+        for k in ("items","data","table","rows","list"):
+            if k in payload and isinstance(payload[k],list): src=payload[k]; break
+        else:
+            src=next((v for v in payload.values() if isinstance(v, list)), [])
+    else: src=[]
+    rows=[]
+    for i,it in enumerate(src,1):
+        if not isinstance(it,dict): continue
+        hn=str(it.get("hn_full") or it.get("hn") or "").strip()
+        pid=str(it.get("patient_id") or it.get("pid") or it.get("queue_id") or "")
+        if not pid:
+            orr=str(it.get("or") or it.get("or_room") or ""); q=str(it.get("queue") or it.get("q") or "")
+            if orr and q: pid=f"{orr}-{q}"
+        status=str(it.get("status") or "")
+        ts=(it.get("timestamp") or it.get("ts") or it.get("updated_at") or it.get("created_at") or it.get("time"))
+        eta=it.get("eta_minutes", it.get("eta", it.get("eta_min")))
+        if isinstance(eta,str) and eta.isdigit(): eta=int(eta)
+        elif not isinstance(eta,int): eta=None
+        rows.append({"id": hn if hn else i, "hn_full": hn or None, "patient_id": pid, "status": status, "timestamp": ts, "eta_minutes": eta})
+    return rows
+
+class QueueSelectWidget(QtWidgets.QWidget):
+    changed = QtCore.Signal(int)
+    def __init__(self, value:int=0, parent=None):
+        super().__init__(parent)
+        h = QtWidgets.QHBoxLayout(self); h.setContentsMargins(2, 0, 2, 0); h.setSpacing(6)
+        self.combo = QtWidgets.QComboBox()
+        self.combo.addItem("ตามเวลา", 0)
+        for i in range(1, 10): self.combo.addItem(str(i), i)
+        self.combo.setStyleSheet("""
+            QComboBox{
+                padding:6px 10px;border-radius:10px;border:1px solid #e6eaf2;background:#ffffff;
+                min-width: 110px; font-weight:700;
+            }
+            QComboBox:hover{border-color:#cfd8e6;}
+            QComboBox:focus{border:1px solid #7aa2ff;background:#ffffff;}
+        """)
+        idx = 0
+        for i in range(self.combo.count()):
+            if int(self.combo.itemData(i)) == int(value): idx = i; break
+        self.combo.setCurrentIndex(idx)
+        self.combo.currentIndexChanged.connect(self._emit_changed)
+        h.addWidget(self.combo, 1)
+        self.setMinimumWidth(120)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+    def _emit_changed(self, _i): self.changed.emit(int(self.combo.currentData() or 0))
+    def value(self)->int: return int(self.combo.currentData() or 0)
+
+class Main(QtWidgets.QWidget):
+    def __init__(self, host, port, token):
+        super().__init__()
+        self.cli = ClientHTTP(host, port, token)
+        self.sched = SharedScheduleModel()
+        self.db_logger = LocalDBLogger()
+        self.ws=None; self.rows_cache=[]
+        self.seq_seen = self.sched.seq()
+        icon = _load_app_icon()
+        self.setWindowIcon(icon)
+        self.tray = QtWidgets.QSystemTrayIcon(icon, self); self.tray.show()
+
+        # new: เก็บ HN ที่เคยเห็นใน Monitor (historical) เพื่อไม่ให้ขีดฆ่ารายการที่เพิ่งเพิ่มใหม่
+        self._historical_monitor_seen = set()
+
+        # form edit mode
+        self._edit_idx: Optional[int] = None
+        self._last_focus_uid: Optional[str] = None  # ใช้ไฮไลต์หลังบันทึก
+
+        self.toast = Toast(self)
+        self._current_specialty_key = "Surgery"
+
+        self.setWindowTitle("Registry Patient Connect — ORNBH")
+        self.resize(1360, 900)
+        apply_modern_theme(self)
+        self._build_ui(); self._load_settings(); self._start_timers()
+
+    # ---------- UI ----------
+    def _build_ui(self):
+        outer = QtWidgets.QVBoxLayout(self); outer.setSpacing(12); outer.setContentsMargins(14,14,14,14)
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.setStyleSheet("QTabWidget::pane{border:0;} QTabBar::tab{padding:10px 16px;border-radius:12px;margin:4px;background:#e9eef8;} QTabBar::tab:selected{background:#2563eb;color:#fff;}")
+        outer.addWidget(self.tabs)
+
+        # TAB 1 — ลงทะเบียน
+        tab1 = QtWidgets.QWidget(); t1 = QtWidgets.QVBoxLayout(tab1); t1.setSpacing(12)
+        form = Card("ลงทะเบียนผู้ป่วย (Schedule — Private)", "ข้อมูลเก็บในเครื่อง และแชร์ให้โปรแกรมหลักแบบเรียลไทม์")
+        g=form.grid; r=0
+        g.setColumnStretch(0, 0); g.setColumnStretch(1, 2); g.setColumnStretch(2, 0); g.setColumnStretch(3, 1)
+        g.setColumnStretch(4, 0); g.setColumnStretch(5, 2)
+        g.addWidget(QtWidgets.QLabel("OR"), r,0)
+        self.cb_or=QtWidgets.QComboBox(); self._refresh_or_cb(self.cb_or); self.cb_or.setMinimumWidth(140)
+        g.addWidget(self.cb_or, r,1)
+        self.btn_manage_or=QtWidgets.QPushButton("จัดการ OR"); self.btn_manage_or.setProperty("variant","ghost")
+        g.addWidget(self.btn_manage_or, r,2,1,2)
+        r+=1
+        g.addWidget(QtWidgets.QLabel("ชื่อ-สกุล"), r,0)
+        self.ent_name=QtWidgets.QLineEdit()
+        g.addWidget(self.ent_name, r,1,1,3)
+        g.addWidget(QtWidgets.QLabel("อายุ"), r,4)
+        self.ent_age=QtWidgets.QLineEdit(); self.ent_age.setValidator(QtGui.QIntValidator(0,150,self))
+        g.addWidget(self.ent_age,r,5)
+        r+=1
+        g.addWidget(QtWidgets.QLabel("HN"), r,0)
+        self.ent_hn=QtWidgets.QLineEdit(); self.ent_hn.setMaxLength(9); self.ent_hn.setValidator(QtGui.QIntValidator(0,999999999,self))
+        g.addWidget(self.ent_hn,r,1)
+        g.addWidget(QtWidgets.QLabel("Ward"), r,2)
+        self.cb_ward = QtWidgets.QComboBox(); self.cb_ward.setEditable(True)
+        self.cb_ward.addItems(WARD_LIST)
+        self.cb_ward.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        ward_options = [w for w in WARD_LIST if w and w != WARD_PLACEHOLDER]
+        comp = QtWidgets.QCompleter(ward_options)
+        comp.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        comp.setFilterMode(QtCore.Qt.MatchContains)
+        self.cb_ward.setCompleter(comp)
+        self.cb_ward.setCurrentIndex(0)
+        self.cb_ward.setEditText(WARD_PLACEHOLDER)
+        g.addWidget(self.cb_ward, r,3)
+        g.addWidget(QtWidgets.QLabel("ช่วงเวลา"), r,4)
+        self.rb_in  = QtWidgets.QRadioButton("ในเวลาราชการ (08:30-16:30)")
+        self.rb_off = QtWidgets.QRadioButton("นอกเวลาราชการ (16:30-08:30)")
+        pr = QtWidgets.QHBoxLayout(); pr.setSpacing(10); pr.addWidget(self.rb_in); pr.addWidget(self.rb_off); pr.addStretch(1)
+        g.addLayout(pr, r,5)
+        r+=1
+        g.addWidget(QtWidgets.QLabel("วันที่"), r,0)
+        self.date=QtWidgets.QDateEdit(QtCore.QDate.currentDate()); self.date.setCalendarPopup(True); self.date.setDisplayFormat("dd/MM/yyyy"); self.date.setLocale(QLocale("en_US"))
+        g.addWidget(self.date,r,1)
+        g.addWidget(QtWidgets.QLabel("เวลา"), r,2)
+        self.time=QtWidgets.QTimeEdit(QtCore.QTime.currentTime()); self.time.setDisplayFormat("HH:mm"); self.time.setLocale(QLocale("en_US"))
+        g.addWidget(self.time,r,3)
+        g.addWidget(QtWidgets.QLabel("แผนก"), r,4)
+        self.cb_dept=QtWidgets.QComboBox(); self.cb_dept.addItems(["— เลือกแผนก —"] + list(DEPT_DOCTORS.keys()))
+        g.addWidget(self.cb_dept,r,5)
+        r+=1
+        self.lbl_warn = QtWidgets.QLabel(""); self.lbl_warn.setProperty("warn","1")
+        g.addWidget(self.lbl_warn, r,0,1,6)
+        r+=1
+        self.row_doctor_label = QtWidgets.QLabel("แพทย์ผู้ผ่าตัด"); g.addWidget(self.row_doctor_label, r,0)
+        self.cb_doctor=QtWidgets.QComboBox(); g.addWidget(self.cb_doctor,r,1,1,5)
+        r+=1
+
+        g.addWidget(section_header("Diagnosis"), r,0,1,6)
+        r+=1
+        self.diag_adder = SearchSelectAdder("ค้นหา ICD-10 / ICD-10-TM...", suggestions=[])
+        g.addWidget(self.diag_adder, r,0,1,6)
+        r+=1
+
+        g.addWidget(section_header("Operation"), r,0,1,6)
+        r+=1
+        self.op_adder = SearchSelectAdder("ค้นหา/เลือก Operation...", suggestions=[])
+        self.op_adder.itemsChanged.connect(self._on_operations_changed)
+        g.addWidget(self.op_adder, r,0,1,6)
+        r+=1
+
+        g.addWidget(section_header("Scrub Nurse / ทีมพยาบาล"), r,0,1,6)
+        r+=1
+        row_n = QtWidgets.QHBoxLayout(); row_n.setSpacing(8)
+
+        def _hint(txt: str) -> QtWidgets.QLabel:
+            lab = QtWidgets.QLabel(txt)
+            lab.setProperty("hint", "1")
+            return lab
+
+        self.cb_assist1 = make_search_combo(SCRUB_NURSES)
+        self.cb_assist2 = make_search_combo(SCRUB_NURSES)
+        self.cb_scrub = make_search_combo(SCRUB_NURSES)
+        self.cb_circulate = make_search_combo(SCRUB_NURSES)
+
+        row_n.addWidget(_hint("Assist 1")); row_n.addWidget(self.cb_assist1, 1)
+        row_n.addWidget(_hint("Assist 2")); row_n.addWidget(self.cb_assist2, 1)
+        row_n.addWidget(_hint("Scrub")); row_n.addWidget(self.cb_scrub, 1)
+        row_n.addWidget(_hint("Circulate")); row_n.addWidget(self.cb_circulate, 1)
+        g.addLayout(row_n, r,0,1,6)
+        r+=1
+
+        g.addWidget(section_header("เวลาเริ่ม–จบผ่าตัด (ใส่หรือไม่ใส่ก็ได้)"), r,0,1,6)
+        r+=1
+        row_t = QtWidgets.QHBoxLayout(); row_t.setSpacing(10)
+        self.ck_time_start = QtWidgets.QCheckBox("ระบุเวลาเริ่ม")
+        self.time_start = QtWidgets.QTimeEdit(QtCore.QTime.currentTime())
+        self.time_start.setDisplayFormat("HH:mm")
+        self.time_start.setEnabled(False)
+        self.ck_time_end = QtWidgets.QCheckBox("ระบุเวลาจบ")
+        self.time_end = QtWidgets.QTimeEdit(QtCore.QTime.currentTime())
+        self.time_end.setDisplayFormat("HH:mm")
+        self.time_end.setEnabled(False)
+
+        self.ck_time_start.toggled.connect(lambda ch: self.time_start.setEnabled(ch))
+        self.ck_time_end.toggled.connect(lambda ch: self.time_end.setEnabled(ch))
+
+        row_t.addWidget(self.ck_time_start)
+        row_t.addWidget(self.time_start)
+        row_t.addSpacing(16)
+        row_t.addWidget(self.ck_time_end)
+        row_t.addWidget(self.time_end)
+        row_t.addStretch(1)
+        g.addLayout(row_t, r,0,1,6)
+        r+=1
+
+        self.btn_add=QtWidgets.QPushButton("➕ เพิ่ม"); self.btn_add.setProperty("variant","primary")
+        self.btn_cancel_edit=QtWidgets.QPushButton("ยกเลิกแก้ไข"); self.btn_cancel_edit.setProperty("variant","ghost"); self.btn_cancel_edit.hide()
+        self.btn_clear=QtWidgets.QPushButton("🧹 เคลียร์"); self.btn_clear.setProperty("variant","ghost")
+        rowb=QtWidgets.QHBoxLayout(); rowb.setSpacing(10); rowb.addWidget(self.btn_add); rowb.addWidget(self.btn_cancel_edit); rowb.addWidget(self.btn_clear); rowb.addStretch(1)
+        g.addLayout(rowb, r,0,1,6)
+        r+=1
+
+        t1.addWidget(form); self.tabs.addTab(tab1, "ลงทะเบียนผู้ป่วย")
+
+        # TAB 2 — Result Schedule
+        tab2 = QtWidgets.QWidget(); t2 = QtWidgets.QVBoxLayout(tab2); t2.setSpacing(12)
+        self.card_result = Card("Result Schedule Operating Room (Private)", "อัปเดตเรียลไทม์ (QSettings) — คลิกขวาเพื่อแก้ไข/ลบ, ดับเบิลคลิกเพื่อแก้ไขทันที")
+        gr2 = self.card_result.grid
+        self.tree2 = QtWidgets.QTreeWidget()
+        self.tree2.setColumnCount(10)
+        # หัวตารางชัดเจน (Diagnosis / Operation เต็ม)
+        self.tree2.setHeaderLabels(["ช่วงเวลา","OR/เวลา","HN","ชื่อ-สกุล","อายุ","Diagnosis","Operation","แพทย์","Ward","คิว"])
+        self.tree2.setTextElideMode(QtCore.Qt.ElideNone); self.tree2.setWordWrap(True); self.tree2.setUniformRowHeights(False)
+        self.tree2.setAlternatingRowColors(True)
+        self.tree2.setRootIsDecorated(False)
+        self.tree2.setIndentation(12)
+        self.tree2.setMouseTracking(True)
+        self.tree2.setStyleSheet("""
+            QTreeWidget{ background:#ffffff; border-radius:16px; gridline-color:#eef2ff; }
+            QTreeWidget::item{ margin:2px 4px; }
+            QTreeWidget::item:alternate{ background:#f8fbff; }
+            QTreeWidget::item:selected{ background:rgba(37,99,235,0.16); border-radius:10px; }
+            QTreeWidget::item:hover{ background:rgba(2,132,199,0.08); }
+            QHeaderView::section{ background:#f8fafc; border-bottom:1px solid #e6eaf2; padding:10px 14px; font-weight:900; color:#0f172a; }
+        """)
+        hdr=self.tree2.header(); hdr.setStretchLastSection(False)
+        hdr.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        hdr.setFixedHeight(40)
+        for i in (0,1,2,3,4,7,8):
+            hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(5, QtWidgets.QHeaderView.Stretch)
+        hdr.setSectionResizeMode(6, QtWidgets.QHeaderView.Stretch)
+        hdr.setSectionResizeMode(9, QtWidgets.QHeaderView.ResizeToContents)
+        self.tree2.setColumnWidth(9, 150)
+        self.wrap_delegate = WrapItemDelegate(self.tree2)
+        for col in (5,6,7):
+            self.tree2.setItemDelegateForColumn(col, self.wrap_delegate)
+        self.tree2.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.tree2.customContextMenuRequested.connect(self._result_ctx_menu)
+        gr2.addWidget(self.tree2,0,0,1,1)
+        t2.addWidget(self.card_result, 1)
+        self.tabs.addTab(tab2, "Result Schedule")
+
+        # TAB 3 — Monitor
+        tab3 = QtWidgets.QWidget(); t3 = QtWidgets.QVBoxLayout(tab3); t3.setSpacing(12)
+        server_bar = QtWidgets.QFrame(); server_bar.setStyleSheet("QFrame{background:#fff;border:1px solid #e6eaf2;border-radius:14px;padding:8px;}"); add_shadow(server_bar)
+        hb = QtWidgets.QHBoxLayout(server_bar); hb.setContentsMargins(8,8,8,8)
+        self.ent_host = QtWidgets.QLineEdit("127.0.0.1"); self.ent_host.setMaximumWidth(180); self.ent_host.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.ent_port = QtWidgets.QLineEdit(str(DEFAULT_PORT)); self.ent_port.setMaximumWidth(90)
+        self.ent_token = QtWidgets.QLineEdit(DEFAULT_TOKEN); self.ent_token.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.btn_health = QtWidgets.QPushButton("Health"); self.btn_health.setProperty("variant","ghost"); self.btn_health.clicked.connect(self._on_health)
+        for w,lbl in [(self.ent_host,"Host"),(self.ent_port,"Port"),(self.ent_token,"Token")]:
+            box=QtWidgets.QHBoxLayout(); lab=QtWidgets.QLabel(lbl); lab.setProperty("hint","1"); box.addWidget(lab); box.addWidget(w); hb.addLayout(box)
+        hb.addWidget(self.btn_health); hb.addStretch(1)
+        self.status_chip = QtWidgets.QLabel("● Offline")
+        self.status_chip.setStyleSheet("color:#ef4444;font-weight:800;padding:6px 10px;border:1px solid #e5e7eb;border-radius:999px;background:#fff;")
+        hb.addWidget(self.status_chip)
+        t3.addWidget(server_bar)
+
+        mon = Card("Monitor Realtime (จากเซิร์ฟเวอร์)", "สถานะสด (ดับเบิลคลิกเพื่อส่ง HN ไปลงทะเบียน/แก้ไข)")
+        gm=mon.grid
+        self.table = QtWidgets.QTableWidget(0,4); self.table.setHorizontalHeaderLabels(["ID","Patient ID","สถานะ","เวลา"])
+        hdr2=self.table.horizontalHeader(); hdr2.setStretchLastSection(True)
+        hdr2.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        hdr2.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        hdr2.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        hdr2.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
+        self.table.verticalHeader().setDefaultSectionSize(34)
+        gm.addWidget(self.table,0,0,1,2)
+        self.btn_refresh=QtWidgets.QPushButton("รีเฟรช"); self.btn_refresh.setProperty("variant","ghost")
+        self.btn_export=QtWidgets.QPushButton("Export CSV"); self.btn_export.setProperty("variant","ghost")
+        gm.addWidget(self.btn_refresh,1,0); gm.addWidget(self.btn_export,1,1)
+        t3.addWidget(mon,1)
+        self.tabs.addTab(tab3, "Monitor Realtime")
+
+        # signals
+        self.btn_refresh.clicked.connect(lambda: self._refresh(True))
+        self.btn_export.clicked.connect(self._export_csv)
+        self.btn_manage_or.clicked.connect(self._manage_or)
+        self.cb_dept.currentTextChanged.connect(self._on_dept_changed)
+        self.btn_add.clicked.connect(self._on_add_or_update)
+        self.btn_cancel_edit.clicked.connect(self._cancel_edit_mode)
+        self.btn_clear.clicked.connect(self._clear_form)
+        self.table.itemDoubleClicked.connect(self._on_monitor_double_click)
+        self.tree2.itemDoubleClicked.connect(self._on_result_double_click)
+
+        # default period
+        self._default_period()
+        self.date.dateChanged.connect(self._update_period_warning)
+        self.time.timeChanged.connect(self._update_period_warning)
+        self.rb_in.toggled.connect(self._update_period_warning)
+        self.rb_off.toggled.connect(self._update_period_warning)
+
+        self._set_doctor_visibility(False)
+        self._on_dept_changed(self.cb_dept.currentText())
+        self._render_tree2()
+
+    # ---------- settings / timers ----------
+    def _load_settings(self):
+        self.cfg = QSettings(ORG_NAME, "RegistryPatientConnect")
+        self.tabs.setCurrentIndex(0)
+    def _save_settings(self): pass
+    def closeEvent(self, e):
+        try:
+            if self.ws: self.ws.close()
+        except Exception: pass
+        super().closeEvent(e)
+
+    def _start_timers(self):
+        self._pull = QtCore.QTimer(self); self._pull.timeout.connect(lambda: self._refresh(True)); self._pull.start(3000)
+        self._seq_timer = QtCore.QTimer(self); self._seq_timer.timeout.connect(self._check_seq); self._seq_timer.start(1000)
+        QtCore.QTimer.singleShot(200, lambda: self._refresh(True))
+        QtCore.QTimer.singleShot(600, self._start_ws)
+
+    # ---------- helpers ----------
+    def _client(self):
+        try:
+            return ClientHTTP(self.ent_host.text().strip() or "127.0.0.1",
+                              int(self.ent_port.text().strip() or DEFAULT_PORT),
+                              self.ent_token.text().strip() or DEFAULT_TOKEN)
+        except Exception:
+            return ClientHTTP()
+    def _on_health(self):
+        try: self._client().health(); self._chip(True)
+        except Exception: self._chip(False)
+    def _chip(self, ok:bool):
+        if ok:
+            self.status_chip.setText("● Online"); self.status_chip.setStyleSheet("color:#10b981;font-weight:800;padding:6px 10px;border:1px solid #e5e7eb;border-radius:999px;background:#fff;")
+        else:
+            self.status_chip.setText("● Offline"); self.status_chip.setStyleSheet("color:#ef4444;font-weight:800;padding:6px 10px;border:1px solid #e5e7eb;border-radius:999px;background:#fff;")
+    def _refresh(self, prefer_server=True):
+        self.btn_refresh.setEnabled(False)
+        try:
+            data=self._client().list_items()
+            rows=extract_rows(data)
+            # อัปเดต historical monitor seen ก่อน render (เก็บ HN ที่ monitor รายงานมา)
+            for r in rows:
+                hn = str(r.get("hn_full") or "").strip()
+                if not hn:
+                    rid = str(r.get("id") or "")
+                    if rid.isdigit() and len(rid)==9:
+                        hn = rid
+                if hn:
+                    self._historical_monitor_seen.add(hn)
+            self._rebuild_table(rows); self._chip(True)
+        except Exception:
+            self._chip(False); self._rebuild_table([])
+        finally:
+            self.btn_refresh.setEnabled(True)
+
+    def _rebuild_table(self, rows):
+        self.rows_cache=rows; self.table.setRowCount(0)
+        if not rows:
+            self.table.setRowCount(1); self.table.setSpan(0,0,1,4)
+            empty=QtWidgets.QTableWidgetItem("ไม่มีข้อมูล (กดรีเฟรช)")
+            empty.setFlags(QtCore.Qt.ItemIsEnabled); empty.setForeground(QtGui.QBrush(QtGui.QColor("#64748b")))
+            self.table.setItem(0,0,empty)
+            # อัปเดต Result tree ให้ปรับตัวกรองกรณี HN หายไป
+            self._render_tree2()
+            return
+        for r in rows:
+            i=self.table.rowCount(); self.table.insertRow(i)
+            self.table.setItem(i,0,QtWidgets.QTableWidgetItem(str(r.get("id",""))))
+            self.table.setItem(i,1,QtWidgets.QTableWidgetItem(str(r.get("patient_id",""))))
+            status = str(r.get("status",""))
+            col=STATUS_COLORS.get(status, "#64748b")
+            chip = StatusChipWidget(status or "-", col, pulse=(status in PULSE_STATUS))
+            self.table.setCellWidget(i,2, chip)
+            ts=_parse_iso(r.get("timestamp")); txt=""
+            if ts: txt=_fmt_td(datetime.now()-ts)
+            self.table.setItem(i,3,QtWidgets.QTableWidgetItem(txt))
+        # ให้ Result tree รีเฟรชเงื่อนไขแสดงผลด้วย เมื่อ monitor เปลี่ยน
+        self._render_tree2()
+
+    def _ws_url(self):
+        return f"ws://{self.ent_host.text().strip() or '127.0.0.1'}:{int(self.ent_port.text().strip() or DEFAULT_PORT)}{API_WS}?token={self.ent_token.text().strip() or DEFAULT_TOKEN}"
+    def _start_ws(self):
+        try:
+            self.ws=QWebSocket()
+            self.ws.errorOccurred.connect(lambda _e:self._ws_disc())
+            self.ws.connected.connect(lambda:(self._chip(True), self._pull.stop()))
+            self.ws.disconnected.connect(self._ws_disc)
+            self.ws.textMessageReceived.connect(self._on_ws_msg)
+            self.ws.open(QUrl(self._ws_url()))
+        except Exception:
+            self._ws_disc()
+    def _ws_disc(self):
+        if self._pull.isActive()==False: self._pull.start(3000)
+    def _on_ws_msg(self, msg):
+        try:
+            rows=extract_rows(json.loads(msg))
+            # update historical seen on live ws msgs too
+            for r in rows:
+                hn = str(r.get("hn_full") or "").strip()
+                if not hn:
+                    rid = str(r.get("id") or "")
+                    if rid.isdigit() and len(rid)==9:
+                        hn = rid
+                if hn:
+                    self._historical_monitor_seen.add(hn)
+            self._rebuild_table(rows)
+        except Exception: pass
+
+    # ---------- schedule ----------
+    def _refresh_or_cb(self, cb:QtWidgets.QComboBox):
+        cb.clear(); cb.addItems(self.sched.or_rooms)
+    def _manage_or(self):
+        dlg=QtWidgets.QDialog(self); dlg.setWindowTitle("จัดการ OR"); v=QtWidgets.QVBoxLayout(dlg)
+        lst=QtWidgets.QListWidget(); lst.addItems(self.sched.or_rooms); v.addWidget(lst)
+        h=QtWidgets.QHBoxLayout(); ent=QtWidgets.QLineEdit(); ent.setPlaceholderText("เช่น OR9"); btn_add=QtWidgets.QPushButton("เพิ่ม"); btn_del=QtWidgets.QPushButton("ลบ"); h.addWidget(ent,1); h.addWidget(btn_add); h.addWidget(btn_del); v.addLayout(h)
+        ok=QtWidgets.QPushButton("บันทึก"); ok.setProperty("variant","primary"); v.addWidget(ok)
+        btn_add.clicked.connect(lambda: (ent.text().strip().upper() and lst.addItem(ent.text().strip().upper()), ent.setText("")))
+        btn_del.clicked.connect(lambda: [lst.takeItem(lst.row(x)) for x in lst.selectedItems()])
+        def save():
+            rooms=[lst.item(i).text() for i in range(lst.count())]; self.sched.set_or_rooms(rooms); self._refresh_or_cb(self.cb_or); dlg.accept()
+        ok.clicked.connect(save); dlg.exec()
+
+    def _default_period(self):
+        now = datetime.now()
+        self.rb_in.setChecked(_now_period(now)=="in"); self.rb_off.setChecked(_now_period(now)!="in")
+        self._update_period_warning()
+    def _get_selected_period(self)->str: return "in" if self.rb_in.isChecked() else "off"
+    def _update_period_warning(self):
+        qd=self.date.date(); qtime=self.time.time()
+        dt = datetime(qd.year(), qd.month(), qd.day(), qtime.hour(), qtime.minute())
+        auto = _now_period(dt); chosen = self._get_selected_period()
+        self.lbl_warn.setText("" if auto==chosen else f"คำเตือน: วัน/เวลา {dt:%d/%m/%Y %H:%M} เป็น '{_period_label(auto)}' แต่คุณเลือก '{_period_label(chosen)}'")
+
+    def _on_dept_changed(self, dept_label:str):
+        if dept_label and not dept_label.startswith("—"):
+            self._set_doctor_visibility(True); self.cb_doctor.clear(); self.cb_doctor.addItems(DEPT_DOCTORS.get(dept_label, []))
+        else:
+            self._set_doctor_visibility(False); self.cb_doctor.clear()
+        key = _dept_key(dept_label or "")
+        self._current_specialty_key = key
+        primary_ops = operation_suggestions(key)
+        fallback_ops = [op for op in ALL_OPERATIONS if op not in primary_ops]
+        self.op_adder.set_suggestions(primary_ops + fallback_ops)
+        self._refresh_diag_suggestions()
+
+    def _refresh_diag_suggestions(self):
+        if not hasattr(self, "op_adder"):
+            return
+        ops = self.op_adder.items() if hasattr(self.op_adder, "items") else []
+        suggestions = diagnosis_suggestions(self._current_specialty_key, ops)
+        self.diag_adder.set_suggestions(suggestions)
+
+    def _on_operations_changed(self, _items: List[str]):
+        self._refresh_diag_suggestions()
+
+    def _set_doctor_visibility(self, visible: bool):
+        self.row_doctor_label.setVisible(visible); self.cb_doctor.setVisible(visible)
+
+    def _collect(self):
+        qd=self.date.date()
+        dt = datetime(qd.year(), qd.month(), qd.day(), self.time.time().hour(), self.time.time().minute())
+        ward_text = self.cb_ward.currentText().strip()
+        if ward_text == WARD_PLACEHOLDER:
+            ward_text = ""
+        return ScheduleEntry(
+            or_room=self.cb_or.currentText().strip(), dt=dt.date(), time_str=self.time.time().toString("HH:mm"),
+            hn=self.ent_hn.text().strip(), name=self.ent_name.text().strip(), age=self.ent_age.text().strip() or "0",
+            dept=(self.cb_dept.currentText().strip() if not self.cb_dept.currentText().startswith("—") else ""),
+            doctor=self.cb_doctor.currentText().strip() if self.cb_doctor.isVisible() else "",
+            diags=self.diag_adder.items(), ops=self.op_adder.items(),
+            ward=ward_text,
+            queue=0,
+            period=self._get_selected_period(),
+            assist1=self.cb_assist1.currentText().strip(),
+            assist2=self.cb_assist2.currentText().strip(),
+            scrub=self.cb_scrub.currentText().strip(),
+            circulate=self.cb_circulate.currentText().strip(),
+            time_start=(self.time_start.time().toString("HH:mm") if self.ck_time_start.isChecked() else ""),
+            time_end=(self.time_end.time().toString("HH:mm") if self.ck_time_end.isChecked() else ""),
+        )
+
+    def _clear_form(self):
+        self.cb_or.setCurrentIndex(0)
+        self.ent_name.clear(); self.ent_age.clear(); self.ent_hn.clear()
+        self.cb_dept.setCurrentIndex(0); self.cb_doctor.clear(); self._set_doctor_visibility(False)
+        self.diag_adder.clear(); self.op_adder.clear()
+        self.cb_ward.setCurrentIndex(0); self.cb_ward.setEditText(WARD_PLACEHOLDER)
+        for cb in (self.cb_assist1, self.cb_assist2, self.cb_scrub, self.cb_circulate):
+            cb.setCurrentIndex(0)
+            cb.setEditText("")
+        self.ck_time_start.setChecked(False); self.time_start.setEnabled(False); self.time_start.setTime(QtCore.QTime.currentTime())
+        self.ck_time_end.setChecked(False); self.time_end.setEnabled(False); self.time_end.setTime(QtCore.QTime.currentTime())
+        self.date.setDate(QtCore.QDate.currentDate())
+        self.time.setTime(QtCore.QTime.currentTime())
+        self._default_period()
+        self._on_dept_changed(self.cb_dept.currentText())
+        self._set_add_mode()
+
+    # ---------- ADD / UPDATE ----------
+    def _set_edit_mode(self, idx:int):
+        self._edit_idx = idx
+        self.btn_add.setText("💾 บันทึกการแก้ไข")
+        self.btn_cancel_edit.show()
+        self.toast.show_toast("เข้าสู่โหมดแก้ไข")
+
+    def _set_add_mode(self):
+        self._edit_idx = None
+        self.btn_add.setText("➕ เพิ่ม")
+        self.btn_cancel_edit.hide()
+
+    def _cancel_edit_mode(self):
+        self._set_add_mode()
+        self.toast.show_toast("ยกเลิกโหมดแก้ไข")
+
+    def _load_form_from_entry(self, e:ScheduleEntry):
+        idx = self.cb_or.findText(e.or_room)
+        if idx >= 0: self.cb_or.setCurrentIndex(idx)
+        self.ent_name.setText(e.name or "")
+        self.ent_age.setText(str(e.age or 0))
+        self.ent_hn.setText(e.hn or "")
+        if e.period == "in": self.rb_in.setChecked(True)
+        else: self.rb_off.setChecked(True)
+        try:
+            d = QtCore.QDate(e.date.year, e.date.month, e.date.day)
+            self.date.setDate(d)
+        except Exception: pass
+        try:
+            hh, mm = (e.time or "00:00").split(":")
+            self.time.setTime(QtCore.QTime(int(hh), int(mm)))
+        except Exception: pass
+        if e.dept:
+            for i in range(self.cb_dept.count()):
+                if self.cb_dept.itemText(i).startswith(e.dept) or self.cb_dept.itemText(i)==e.dept:
+                    self.cb_dept.setCurrentIndex(i); break
+        if e.doctor and self.cb_doctor.isVisible():
+            j = self.cb_doctor.findText(e.doctor)
+            if j >= 0: self.cb_doctor.setCurrentIndex(j)
+        self.diag_adder.clear(); [self.diag_adder.list.addItem(x) for x in (e.diags or [])]
+        self.op_adder.clear();   [self.op_adder.list.addItem(x)   for x in (e.ops   or [])]
+        # Ward
+        j = self.cb_ward.findText(e.ward) if e.ward else -1
+        if j >= 0:
+            self.cb_ward.setCurrentIndex(j)
+        else:
+            if e.ward:
+                self.cb_ward.setEditText(e.ward)
+            else:
+                self.cb_ward.setCurrentIndex(0)
+                self.cb_ward.setEditText(WARD_PLACEHOLDER)
+
+        # Nurse roles
+        for combo, value in (
+            (self.cb_assist1, e.assist1),
+            (self.cb_assist2, e.assist2),
+            (self.cb_scrub, e.scrub),
+            (self.cb_circulate, e.circulate),
+        ):
+            val = value or ""
+            idx_val = combo.findText(val) if val else 0
+            if val and idx_val >= 0:
+                combo.setCurrentIndex(idx_val)
+            else:
+                combo.setCurrentIndex(0)
+            combo.setEditText(val)
+
+        # Start/End time (optional)
+        if e.time_start:
+            self.ck_time_start.setChecked(True)
+            try:
+                hh, mm = e.time_start.split(":")
+                self.time_start.setTime(QtCore.QTime(int(hh), int(mm)))
+            except Exception:
+                pass
+        else:
+            self.ck_time_start.setChecked(False)
+            self.time_start.setEnabled(False)
+            self.time_start.setTime(QtCore.QTime.currentTime())
+
+        if e.time_end:
+            self.ck_time_end.setChecked(True)
+            try:
+                hh, mm = e.time_end.split(":")
+                self.time_end.setTime(QtCore.QTime(int(hh), int(mm)))
+            except Exception:
+                pass
+        else:
+            self.ck_time_end.setChecked(False)
+            self.time_end.setEnabled(False)
+            self.time_end.setTime(QtCore.QTime.currentTime())
+
+    def _on_add_or_update(self):
+        e = self._collect()
+        errs=[]
+        if not e.or_room: errs.append("กรุณาเลือก OR")
+        if not e.name: errs.append("กรุณากรอกชื่อ-สกุล")
+        if not e.hn: errs.append("กรุณากรอก HN")
+        if e.hn and not e.hn.isdigit(): errs.append("HN ต้องเป็นตัวเลขเท่านั้น")
+        if errs:
+            self.lbl_warn.setText(" • ".join(errs))
+            try: QtWidgets.QApplication.beep()
+            except Exception: pass
+            return
+        else:
+            self.lbl_warn.setText("")
+
+        # จำ uid ไว้เพื่อโฟกัสหลังบันทึก
+        self._last_focus_uid = e.uid()
+
+        if self._edit_idx is None:
+            self.sched.add(e)
+            try: self.db_logger.append_entry(e)
+            except Exception: pass
+            self._notify("เพิ่มรายการแล้ว", f"OR {e.or_room} • {e.time} • HN {e.hn}")
+            self.toast.show_toast("เพิ่มรายการสำเร็จ")
+            # ไม่เพิ่มเข้า historical_monitor_seen ที่นี่ — ปล่อยให้ monitor รายงาน HN จะเป็นคนเพิ่ม
+        else:
+            self.sched.update(self._edit_idx, e)
+            self._notify("บันทึกการแก้ไขแล้ว", f"OR {e.or_room} • {e.time} • HN {e.hn}")
+            self.toast.show_toast("อัปเดตรายการสำเร็จ")
+            self._set_add_mode()
+
+        self.card_result.title_lbl.setText(f"Result Schedule Operating Room (Private)  —  อัปเดต {datetime.now():%H:%M:%S}")
+        self._render_tree2()
+
+        # เด้งไปแท็บ Result และโฟกัส/ไฮไลต์ชื่อผู้ป่วย
+        self.tabs.setCurrentIndex(1)
+        QtCore.QTimer.singleShot(120, lambda: self._focus_uid(self._last_focus_uid))
+
+        self._clear_form()
+
+    # ---------- Result tree (with off-hours filtering + strike-through) ----------
+    def _monitor_hn_set(self) -> set:
+        """ดึงชุด HN ที่ยังอยู่ใน Monitor (rows_cache ปัจจุบัน)"""
+        s=set()
+        for r in (self.rows_cache or []):
+            hn = str(r.get("hn_full") or "").strip()
+            if not hn:
+                rid = str(r.get("id") or "")
+                if rid.isdigit() and len(rid)==9:
+                    hn = rid
+            if hn:
+                s.add(hn)
+        return s
+
+    def _is_entry_completed(self, e: ScheduleEntry) -> bool:
+        """ตรวจว่ารายการถูกเติมข้อมูลหลังผ่าตัดครบถ้วนพอสำหรับการปิดเคส"""
+        nurse_ok = bool(e.scrub or e.circulate)
+        time_ok = bool(e.time_start) and bool(e.time_end)
+        return nurse_ok and time_ok
+
+    def _render_tree2(self):
+        self.tree2.clear()
+
+        # เลือก entries ที่ต้องแสดงตามกติกา
+        now_code = _now_period(datetime.now())  # "in" / "off"
+        in_monitor = self._monitor_hn_set()
+
+        def should_show(entry: ScheduleEntry) -> bool:
+            if now_code == "in":
+                return True  # ในเวลาราชการ แสดงทั้งหมด
+            # นอกเวลาราชการ: แสดงเฉพาะ off-period และ in-period ที่ยังไม่เสร็จ (HN ยังอยู่ใน monitor)
+            return (entry.period == "off") or (entry.period == "in" and entry.hn in in_monitor)
+
+        entries_to_show: List[Tuple[int, ScheduleEntry]] = [
+            (idx, entry) for idx, entry in enumerate(self.sched.entries) if should_show(entry)
+        ]
+
+        # ปรับ subtitle บอกโหมดตัวกรอง
+        mode_txt = "ทั้งหมด (ในเวลาราชการ)" if now_code=="in" else "เฉพาะนอกเวลาฯ + ในเวลาที่ยังไม่เสร็จ"
+        self.card_result.title_lbl.setText(f"Result Schedule Operating Room (Private) — โหมดแสดงผล: {mode_txt}")
+
+        # เคสไม่มีข้อมูลให้คืนค่าอย่างนุ่มนวล
+        if not entries_to_show:
+            self.tree2.expandAll()
+            self.tree2.header().setSectionResizeMode(9, QtWidgets.QHeaderView.ResizeToContents)
+            self.tree2.setColumnWidth(9, 150)
+            return
+
+        # จัดกลุ่มตาม OR
+        groups: Dict[str, List[Tuple[int, ScheduleEntry]]] = {}
+        for idx, entry in entries_to_show:
+            groups.setdefault(entry.or_room or "-", []).append((idx, entry))
+
+        order=self.sched.or_rooms
+
+        def time_key(se:Tuple[int,ScheduleEntry]):
+            entry = se[1]
+            return entry.time or "99:99"
+
+        for orr in sorted(groups.keys(), key=lambda x: (order.index(x) if x in order else 999, x)):
+            parent=QtWidgets.QTreeWidgetItem(["", orr])
+            parent.setFirstColumnSpanned(True)
+            # style parent group
+            pfont = parent.font(1)
+            pfont.setBold(True)
+            parent.setFont(1, pfont)
+            parent.setBackground(0, QtGui.QBrush(QtGui.QColor("#f1f5f9")))
+            parent.setBackground(1, QtGui.QBrush(QtGui.QColor("#f1f5f9")))
+            self.tree2.addTopLevelItem(parent)
+
+            # คิว 1–9 มาก่อน (เรียงตามเลขคิว), คิว 0 ตามเวลา
+            rows_sorted = sorted(
+                groups[orr],
+                key=lambda se: (0, int(se[1].queue)) if int(se[1].queue or 0) > 0 else (1, time_key(se))
+            )
+
+            for idx, entry in rows_sorted:
+                diag_txt = " with ".join(entry.diags) if entry.diags else "-"
+                op_txt   = " with ".join(entry.ops)   if entry.ops   else "-"
+                row=QtWidgets.QTreeWidgetItem([
+                    _period_label(entry.period), entry.time or "-", entry.hn, entry.name or "-",
+                    str(entry.age or 0), diag_txt, op_txt, entry.doctor or "-", entry.ward or "-", ""
+                ])
+                row.setData(0, QtCore.Qt.UserRole, entry.uid())
+                row.setData(0, QtCore.Qt.UserRole+1, idx)
+                parent.addChild(row)
+
+                qs = QueueSelectWidget(int(entry.queue or 0))
+                uid = entry.uid()
+                qs.changed.connect(lambda new_q, u=uid: self._apply_queue_select(u, int(new_q)))
+                self.tree2.setItemWidget(row, 9, qs)
+
+                # ขีดฆ่าเมื่อ "เสร็จแล้ว"
+                # ปรับ: จะขีดเฉพาะเมื่อ HN เคยถูกเห็นใน Monitor แต่ขณะนี้ไม่อยู่ใน Monitor อีกต่อไป
+                if (
+                    entry.hn
+                    and (entry.hn not in in_monitor)
+                    and (entry.hn in self._historical_monitor_seen)
+                    and self._is_entry_completed(entry)
+                ):
+                    _apply_done_style(row, row.columnCount())
+
+        self.tree2.expandAll()
+        self.tree2.header().setSectionResizeMode(9, QtWidgets.QHeaderView.ResizeToContents)
+        self.tree2.setColumnWidth(9, 150)
+
+    def _apply_queue_select(self, uid: str, new_q: int):
+        target=None; target_idx=None
+        for i, entry in enumerate(self.sched.entries):
+            if entry.uid()==uid:
+                target=entry; target_idx=i; break
+        if not target: return
+        new_q = max(0, min(9, int(new_q)))
+        if new_q == target.queue: return
+        target.queue = int(new_q)
+        self.sched._save()
+        try: QtWidgets.QApplication.beep()
+        except Exception: pass
+        self._notify("อัปเดตคิวสำเร็จ", f"OR {target.or_room} • HN {target.hn} → คิว {new_q or 'ตามเวลา'}")
+        self.card_result.title_lbl.setText(f"Result Schedule Operating Room (Private)  —  อัปเดตคิว {datetime.now():%H:%M:%S}")
+        self._render_tree2()
+        self._flash_row_by_uid(uid)
+        self.tree2.header().setSectionResizeMode(9, QtWidgets.QHeaderView.ResizeToContents)
+        self.tree2.setColumnWidth(9, 150)
+
+    def _find_item_by_uid(self, uid:str):
+        root = self.tree2.invisibleRootItem()
+        for i in range(root.childCount()):
+            parent = root.child(i)
+            for j in range(parent.childCount()):
+                ch = parent.child(j)
+                if ch.data(0, QtCore.Qt.UserRole)==uid:
+                    return ch
+        return None
+
+    def _flash_row_by_uid(self, uid:str):
+        it = self._find_item_by_uid(uid)
+        if not it: return
+        rect = self.tree2.visualItemRect(it)
+        overlay = QtWidgets.QFrame(self.tree2.viewport())
+        overlay.setGeometry(0, rect.y(), self.tree2.viewport().width(), rect.height())
+        overlay.setStyleSheet("QFrame{background:rgba(250,204,21,0.35);border-radius:4px;}")
+        overlay.raise_(); overlay.show()
+        anim = QtCore.QPropertyAnimation(overlay, b"windowOpacity", self)
+        anim.setDuration(900); anim.setStartValue(1.0); anim.setKeyValueAt(0.5, 0.0); anim.setEndValue(1.0); anim.setLoopCount(2)
+        anim.finished.connect(overlay.deleteLater)
+        anim.start(QtCore.QAbstractAnimation.DeleteWhenStopped)
+
+    def _focus_uid(self, uid:str):
+        if not uid: return
+        it = self._find_item_by_uid(uid)
+        if not it: return
+        self.tree2.scrollToItem(it, QtWidgets.QAbstractItemView.PositionAtCenter)
+        self.tree2.setCurrentItem(it)
+        self._flash_row_by_uid(uid)
+
+    # ---------- Result context menu / Double-click ----------
+    def _result_ctx_menu(self, pos: QtCore.QPoint):
+        it = self.tree2.itemAt(pos)
+        if not it: return
+        idx = it.data(0, QtCore.Qt.UserRole+1)
+        if idx is None: return
+        menu = QtWidgets.QMenu(self)
+        a_edit = menu.addAction("แก้ไขรายการ")
+        a_del  = menu.addAction("ลบรายการ")
+        act = menu.exec(self.tree2.viewport().mapToGlobal(pos))
+        if act == a_edit:
+            self._on_result_double_click(it, 0)
+        elif act == a_del:
+            self._delete_entry_idx(int(idx))
+
+    def _delete_entry_idx(self, idx:int):
+        if 0 <= idx < len(self.sched.entries):
+            entry = self.sched.entries[idx]
+            ok = QtWidgets.QMessageBox.question(self, "ยืนยันการลบ", f"ลบรายการ HN {entry.hn} ({entry.name}) ?")
+            if ok == QtWidgets.QMessageBox.StandardButton.Yes:
+                self.sched.delete(idx)
+                self._render_tree2()
+                self.toast.show_toast("ลบรายการแล้ว")
+
+    def _on_monitor_double_click(self, item:QtWidgets.QTableWidgetItem):
+        row = item.row()
+        hn = self.table.item(row, 0).text().strip() if self.table.item(row,0) else ""
+        if not hn:
+            self.toast.show_toast("ไม่พบ HN ของแถวนี้"); return
+        self._route_to_identify(hn)
+
+    def _on_result_double_click(self, item:QtWidgets.QTreeWidgetItem, col:int):
+        idx = item.data(0, QtCore.Qt.UserRole+1)
+        if idx is None: return
+        if 0 <= int(idx) < len(self.sched.entries):
+            entry = self.sched.entries[int(idx)]
+            self._load_form_from_entry(entry)
+            self._set_edit_mode(int(idx))
+            self.tabs.setCurrentIndex(0)  # ไปที่ฟอร์ม
+
+    # ---------- Identify routing ----------
+    def _find_entry_index_by_hn(self, hn:str)->Optional[int]:
+        for i, entry in enumerate(self.sched.entries):
+            if str(entry.hn).strip()==str(hn).strip():
+                return i
+        return None
+
+    def _route_to_identify(self, hn:str):
+        QtWidgets.QApplication.clipboard().setText(hn)
+        idx = self._find_entry_index_by_hn(hn)
+        if idx is not None:
+            entry = self.sched.entries[idx]
+            self._load_form_from_entry(entry)
+            self._set_edit_mode(idx)
+            self.tabs.setCurrentIndex(0)
+            self.toast.show_toast(f"HN {hn}: พบในรายการ → โหมดแก้ไข")
+        else:
+            self._clear_form()
+            self.ent_hn.setText(hn)
+            self._set_add_mode()
+            self.tabs.setCurrentIndex(0)
+            self.toast.show_toast(f"HN {hn}: ยังไม่มี → เพิ่มใหม่")
+
+    def apply_external_update(self, uid: str, patch: dict) -> bool:
+        """รับข้อมูลจาก client ภายนอกเพื่อเติมรายละเอียดหลังผ่าตัด"""
+        accepted_keys = {
+            "assist1",
+            "assist2",
+            "scrub",
+            "circulate",
+            "time_start",
+            "time_end",
+            "ward",
+            "doctor",
+        }
+        for i, entry in enumerate(self.sched.entries):
+            if entry.uid() == uid:
+                for key in accepted_keys:
+                    if key in patch:
+                        setattr(entry, key, str(patch.get(key) or ""))
+                self.sched._save()
+                self._render_tree2()
+                self._flash_row_by_uid(uid)
+                self.toast.show_toast("อัปเดตข้อมูลจาก Client สำเร็จ")
+                return True
+        return False
+
+    # ---------- export ----------
+    def _export_csv(self):
+        path,_=QtWidgets.QFileDialog.getSaveFileName(self,"Export CSV","monitor.csv","CSV (*.csv)")
+        if not path: return
+        try:
+            with open(path,"w",newline="",encoding="utf-8-sig") as f:
+                w=csv.writer(f); w.writerow(["ID","Patient ID","Status","Timestamp","ETA(min)"])
+                for r in self.rows_cache: w.writerow([r.get("id",""), r.get("patient_id",""), r.get("status",""), r.get("timestamp",""), r.get("eta_minutes","")])
+            QtWidgets.QMessageBox.information(self,"ส่งออกแล้ว",path)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self,"ผิดพลาด",str(e))
+
+    # ---------- notify ----------
+    def _notify(self, title:str, msg:str):
+        try: self.tray.showMessage(title, msg, QtWidgets.QSystemTrayIcon.Information, 3000)
+        except Exception: pass
+
+    # ---------- seq watcher ----------
+    def _check_seq(self):
+        cur=self.sched.seq()
+        if cur!=self.seq_seen:
+            self.seq_seen=cur
+            self.sched.entries=self.sched._load()
+            self.sched.or_rooms=self.sched._load_or()
+            self._refresh_or_cb(self.cb_or)
+            self._render_tree2()
+
+class WrapItemDelegate(QtWidgets.QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        text = index.data(QtCore.Qt.DisplayRole)
+        opt = QtWidgets.QStyleOptionViewItem(option); self.initStyleOption(opt, index); opt.text=""
+        style = opt.widget.style() if opt.widget else QtWidgets.QApplication.style()
+        style.drawControl(QtWidgets.QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+        rect = style.subElementRect(QtWidgets.QStyle.SE_ItemViewItemText, opt, opt.widget)
+        doc = QtGui.QTextDocument(); doc.setDefaultFont(opt.font)
+        topt = QtGui.QTextOption(); topt.setWrapMode(QtGui.QTextOption.WordWrap); doc.setDefaultTextOption(topt)
+        doc.setTextWidth(rect.width()); doc.setPlainText(str(text) if text is not None else "")
+        painter.save(); painter.translate(rect.topLeft()); doc.drawContents(painter, QtCore.QRectF(0,0,rect.width(),rect.height())); painter.restore()
+    def sizeHint(self, option, index):
+        text = index.data(QtCore.Qt.DisplayRole) or ""
+        doc = QtGui.QTextDocument(); doc.setDefaultFont(option.font)
+        topt = QtGui.QTextOption(); topt.setWrapMode(QtGui.QTextOption.WordWrap); doc.setDefaultTextOption(topt)
+        w = option.rect.width() if option.rect.width()>0 else 360; doc.setTextWidth(w); doc.setPlainText(str(text))
+        s = doc.size(); return QtCore.QSize(int(w), int(s.height()) + 10)
+
+class SearchSelectAdder(QtWidgets.QWidget):
+    """Searchable selector with a multi-select list and change signal."""
+
+    itemsChanged = QtCore.Signal(list)
+
+    def __init__(self, placeholder="ค้นหา ICD-10...", suggestions=None, parent=None):
+        super().__init__(parent)
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(6)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(6)
+        self.combo = QtWidgets.QComboBox()
+        self.combo.setEditable(True)
+        self.combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.combo.setMinimumWidth(280)
+        if self.combo.lineEdit():
+            self.combo.lineEdit().setPlaceholderText(placeholder)
+        self.btn = QtWidgets.QPushButton("➕ เพิ่ม")
+        self.btn.setProperty("variant", "ghost")
+        row.addWidget(self.combo, 1)
+        row.addWidget(self.btn)
+        v.addLayout(row)
+
+        self.list = QtWidgets.QListWidget()
+        self.list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.list.setStyleSheet("QListWidget{ border:1px dashed #e6eaf2; border-radius:12px; background:#fff; }")
+        v.addWidget(self.list)
+
+        self.set_suggestions(suggestions or [])
+        self.btn.clicked.connect(self._add_current)
+        if self.combo.lineEdit():
+            self.combo.lineEdit().returnPressed.connect(self._add_current)
+        self.list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._ctx_menu)
+        model = self.list.model()
+        model.rowsInserted.connect(lambda *_: self._emit_items_changed())
+        model.rowsRemoved.connect(lambda *_: self._emit_items_changed())
+
+    def _ctx_menu(self, pos):
+        menu = QtWidgets.QMenu(self)
+        a1 = menu.addAction("ลบรายการที่เลือก")
+        a2 = menu.addAction("ลบทั้งหมด")
+        act = menu.exec(self.list.mapToGlobal(pos))
+        if act == a1:
+            for it in self.list.selectedItems():
+                self.list.takeItem(self.list.row(it))
+        elif act == a2:
+            self.list.clear()
+        self._emit_items_changed()
+
+    def _add_current(self):
+        text = self.combo.currentText().strip()
+        if text and text.lower() not in [self.list.item(i).text().lower() for i in range(self.list.count())]:
+            self.list.addItem(text)
+        self.combo.setCurrentIndex(0)
+        self.combo.setEditText("")
+        self._emit_items_changed()
+
+    def items(self) -> List[str]:
+        return [self.list.item(i).text().strip() for i in range(self.list.count())]
+
+    def clear(self):
+        self.list.clear()
+        self.combo.setCurrentIndex(0)
+        self.combo.setEditText("")
+        self._emit_items_changed()
+
+    def set_suggestions(self, suggestions):
+        options = sorted({s for s in suggestions if s})
+        current = self.combo.currentText() if self.combo.count() else ""
+        self.combo.blockSignals(True)
+        self.combo.clear()
+        self.combo.addItem("")
+        self.combo.addItems(options)
+        self.combo.blockSignals(False)
+        if current:
+            self.combo.setEditText(current)
+        comp = QtWidgets.QCompleter(options)
+        comp.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        comp.setFilterMode(QtCore.Qt.MatchContains)
+        self.combo.setCompleter(comp)
+
+    def _emit_items_changed(self):
+        self.itemsChanged.emit(self.items())
+
+
+def main():
+    QLocale.setDefault(QLocale("en_US"))
+    app=QtWidgets.QApplication(sys.argv); app.setApplicationName("RegistryPatientConnect"); app.setOrganizationName(ORG_NAME); app.setWindowIcon(_load_app_icon())
+    ap=argparse.ArgumentParser(); ap.add_argument("--host",default="127.0.0.1"); ap.add_argument("--port",type=int,default=DEFAULT_PORT); ap.add_argument("--token",default=DEFAULT_TOKEN)
+    a=ap.parse_args()
+    w=Main(a.host,a.port,a.token); w.show(); sys.exit(app.exec())
+
+if __name__=="__main__":
+    main()

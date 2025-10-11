@@ -1,0 +1,370 @@
+Operation ทั้งหมด
+const specId = '1'; // Surgery
+  [
+    'Above Knee Amputation (AKA)','Finger Amputation','Appendectomy','Abdominoperineal Resection (APR)',
+    'Below Knee Amputation (BKA)','Colonoscopy','Abdominal Wound Closure','Debridement (DB)','Colostomy',
+    'Esophagogastroduodenoscopy (EGD)','Exploratory Laparotomy (EL)','Wound Exploration','ERCP','Excision',
+    'Excision of Farafinoma','Excision of Breast Mass','Fasciotomy','Fistulectomy','Feeding Jejunostomy',
+    'Feeding Enterostomy','Gastrostomy','Hemorrhoidectomy','Hydrocelectomy','Herniorrhaphy / Hernioplasty',
+    'Bilateral Herniorrhaphy / Hernioplasty','Incision and Drainage (I&D)','Low Anterior Resection (LAR)',
+    'Lymph Node Biopsy','Laparoscopic Cholecystectomy (LC)','Conversion from LC to Open Cholecystectomy (OC)',
+    'Laparoscopic Low Anterior Resection','Laparoscopic Omentectomy','Mastectomy','Modified Radical Mastectomy (MRM)',
+    'Open Cholecystectomy (OC)','Open Cholecystectomy with CBD Exploration','Choledochoduodenostomy (CD)',
+    'Tracheostomy Procedures','Proctoscopy','Percutaneous Drainage (PCD)','Revision Jejunostomy',
+    'Removal of Clot from MRM site','Revision of BKA Stump','Removal of Foreign Body (FB)','Revision Colostomy',
+    'Ray Amputation','Wound Suturing','T-Tube Insertion with Cholangiogram','Transmetatarsal Amputation',
+    'Split Thickness Skin Graft (STSG)','Subtotal Gastrectomy','Wide Excision'
+  ].forEach(n => add(n, specId, 'main'));
+
+  [
+    'Debridement (DB)','Hemoclip','Biopsy (Bx)','Adrenaline Injection','Endoscopic Variceal Ligation (EVL)','Colonoscopy',
+    'CLO Test','Revision Colostomy','Lysis of Adhesion','Temporary Abdominal Closure / Observation','Open Cholecystectomy (OC)',
+    'Repair of Serosa','Cholecystectomy','Herniorrhaphy','Repair Abdominal Hernia','Omental Graft','Repair Scrotum',
+    'Abdominal Toilet','Omental Biopsy','Colostomy','Appendectomy (App)','Omentectomy','Omentum Graft / Patch',
+    'Retention Suture','Wound Suturing','Hepatorrhaphy','Delayed Suture','Repair of Stomach','Hernioplasty',
+    'Repair Abdominal Wall','Small Bowel Resection (SBR)','Feeding Jejunostomy with Omental Biopsy','End Colostomy',
+    'EEA (End-to-End Anastomosis)','Swab Packing','Iliocecal Anastomosis',
+    'Repair of Mesenteric Injury with Intraoperative Decompression','Hartmann’s Procedure','Ileostomy','Low Anterior Resection (LAR)',
+    'Roux-en-Y Reconstruction','Repair Artery','Mesenteric Biopsy','Balloon Dilatation','SLS (Second Look Surgery)',
+    'Ureterolithotomy','Choledochoduodenostomy (CD)','T-Tube Insertion','Removal of Swab','Off T-Tube'
+  ].forEach(n => add(n, specId, 'op2'));
+
+  [
+    'Debridement (DB)','Hemoclip','Biopsy (Bx)','Adrenaline Injection','Endoscopic Variceal Ligation (EVL)','Colonoscopy','Polypectomy',
+    'CLO Test','Revision Colostomy','Lysis of Adhesion','Intra-abdominal Toilet (Abdominal Toilet)','Temporary Abdominal Closure / Observation',
+    'Swab Packing','Open Cholecystectomy (OC)','Repair of Serosa','Cholecystectomy','Herniorrhaphy','Repair Abdominal Hernia','Omental Graft',
+    'Repair of Scrotum','Omental Biopsy','Appendectomy (App)','Omentectomy','Omentum Graft / Patch','Retention Suture','Wound Suturing',
+    'Hepatorrhaphy','Delayed Suture','Repair of Stomach','Repair of Bowel','Hernioplasty','Repair of Abdominal Wall','Small Bowel Resection (SBR)',
+    'Feeding Jejunostomy with Omental Biopsy','End Colostomy','End-to-End Anastomosis (EEA)','Iliocecal Anastomosis',
+    'Repair of Mesenteric Injury with Intraoperative Decompression','Hartmann’s Procedure','Ileostomy','Low Anterior Resection (LAR)',
+    'Roux-en-Y Reconstruction','Choledochoduodenostomy (CD)','SO','Repair Artery','Mesenteric Biopsy','Balloon Dilatation','Balloon Extraction',
+    'Second Look Surgery (SLS)','Ureterolithotomy','DJ Stent (Double J Stent Insertion)','T-Tube Insertion with Cholangiogram','Removal of Swab','Off T-Tube'
+  ].forEach(n => add(n, specId, 'op3'));
+
+  return 'Seeded Surgery procedures.';
+}
+
+/* ---------------------------- Seed: UROLOGY (3) --------------------------- */
+function seedUrologyProcedures(){
+  ensureSheets_();
+  const sh = getSheet_(SHEET.PROCEDURES);
+  const header = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const idx = headerIndex_(header);
+  const rows = sh.getDataRange().getValues().slice(1);
+  const existing = new Set(rows.map(r =>
+    (String(r[idx.name_en]) + '|' + String(r[idx.specialty_id]) + '|' + String(r[idx.type])).toLowerCase()
+  ));
+  const specId = '3';
+  const LIST = [
+    'Cystoscopy','Bladder Biopsy (Bx)','Flexible Cystoscopy','TRUS Biopsy (TRUS Bx)',
+    'Percutaneous Nephrolithotomy (PCNL)','Retrograde Intrarenal Surgery (RIRS)',
+    'Transurethral Resection of Prostate (TURP)','Transurethral Resection of Bladder Tumor (TUR-BT)',
+    'Ureteroscopy with Lithotripsy (URSL)','Nephrectomy','Radical Orchidectomy','Vasectomy',
+    'Fulguration of Tumor','Urethral Dilatation','Foley Catheter (F/C)','Removal of Double J Stent (DJ)',
+    'Double J Stent (DJ Stent)','Circumcision','Bilateral Orchidectomy','Antegrade DJ Stent Placement',
+    'Off DJ Stent','Drainage of Abscess','Transurethral Lithotripsy (TUL)','Urethral Calibration',
+    'DJ Stent Placement','DJ Stent Removal','Repair of Transverse Colon','CBI (Continuous Bladder Irrigation)','Removal of PCN'
+  ];
+  const add = (name_en, type) => {
+    const key = (name_en + '|' + specId + '|' + type).toLowerCase();
+    if (existing.has(key)) return;
+    sh.appendRow([uuid_(), name_en, '', specId, type]);
+    existing.add(key);
+  };
+  LIST.forEach(n => add(n, 'main'));
+  LIST.forEach(n => add(n, 'op2'));
+  LIST.forEach(n => add(n, 'op3'));
+  return 'Seeded Urology (main/op2/op3).';
+}
+
+/* ------------------------------ Seed: ENT (4) ----------------------------- */
+function seedENTProceduresFromUserList(){
+  ensureSheets_();
+  const specId = '4';
+  const sh = getSheet_(SHEET.PROCEDURES);
+  const header = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const idx = headerIndex_(header);
+  const rows = sh.getDataRange().getValues().slice(1);
+  const existing = new Set(rows.map(r =>
+    (String(r[idx.name_en]) + '|' + String(r[idx.specialty_id]) + '|' + String(r[idx.type])).toLowerCase()
+  ));
+
+  const MAIN = [
+    'Frenectomy','Adreno Tonsillectomy','Bilate Radiofrequency (RF)','Cervical LN',
+    'Close fistula of tracheostomy','Change Tracheostomy','Debridement (DB)','Suture wound',
+    'Direct Laryngoscopy (DL)','Direct Laryngoscopy exam','Endoscopic Bilateral RF',
+    'Enucleation maxillary cyst','Endoscope Remove FB','Endoscopic Cauterization',
+    'Endoscopic myringotomy ear','Endoscope tympanoplasty','Endoscope','ethmoidectomy',
+    'Excision','Excision biopsy','Excision nasal Flab','Excision submandibular','Excision Deep Cervical',
+    'Excision DB','Excision Preauricular cyst','Explore neck','Electrical Cauterization',
+    'Functional Endoscopic Sinus Surgery (FESS)','Fiber Optic Laryngoscope (FOL)','Incision biopsy',
+    'Lymph Node Biopsy','Incision and Drainage (I&D)','I&D Submandible','Intra oral I&D',
+    'Intra Tympanic steriod injections','Nasal endoscope','Micro scope Exam','Myringotomy',
+    'Remove FB','Tracheostomy','Endo','Temporary Tracheostomy','Revise Tracheostomy',
+    'Closure tracheal fistula','Tympanoplasty','Sinus scope for remove FB nasal cavity',
+    'Subtotal thyroidectomy','Wide excision','Biopsy Anterior pillar of tonsil','Tonsillectomy',
+    'Tossilectomy','Adreno tonsillectomy','Total thyroidectomy','Lobectomy','Total parathyroidectomy',
+    'Sub Total parathyroidectomy','Sistrunk operation','Parotidectomy','Parotid glossectomy',
+    'Revision tracheostomy','Radiofrequency IT(RF)','Bilateral Radiofrequency IT','Rigid endoscopic',
+    'Endoscopic Intratympanic steroid inj','Pan endoscope','Bilateral Radiofrequency (RF)','Suture',
+    'Repair cartilage','Telescope','Remove Foreign Body (FB)','Biopsy (Bx)',
+    'Esophagoscopy / Esophageal Examination (Esophago exam)',
+    'Change Tracheostomy with Fiberoptic Trochoscope','Exploratory Wound (Explor wound)',
+    'Rigid Esophagoscopy (Esophago scope rigid)','Excision Oropharynx','Excision Mass of Base of Tongue',
+    'Bilateral Inferior Turbinectomy','Anterior Nasal Packing','Pressure Equalization Tube (PE tube)',
+    'Remove Foreign Body (FB) at Ear','Perichondrial Graft','Septoplasty / Septectomy','Dacryocystorhinostomy',
+    'Perichondrium Graft','Bilateral Radiofrequency (Both RF)','Sphenoidectomy','Repair Lower Lip',
+    'Bilobed Flap Reconstruction','Excision Deep Neck Cervical Lymph Node (LN)',
+    'Excision Debridement of Neck (DB of Neck)','Intraoral Incision and Drainage (I&D)',
+    'Tumor Removal','Drainage','Explore Wound Oral Cavity','Endoscopic Procedure',
+    'Middle Turbinectomy','Bilateral Polypectomy','Middle Turbinoplasty','Change Tube','Cauterization',
+    'Remove Foreign Body (FB) Ear Toilet','Methylprednisolone Injection','Direct Laryngoscopy Biopsy (DL Bx)',
+    'DL Biopsy Mass at Supraglottis','Endoscopic Direct Laryngoscopy (DL exam)','Tracheostoscopic Examination',
+    'Fiberoptic Examination','Guide Scope for Laryngeal Examination','Sistrunk’s Operation',
+    'Suture Para-pharyngeal Area','Adenoidectomy','Endoscopic Adenoidectomy','Modified Neck Dissection (MND)',
+    'Total Parathyroidectomy','SWD 1–3 Selection (Selective Neck Dissection – SWD 1–3)',
+    'Biopsy (Bx) at Bilateral Nasopharynx Tonsil'
+  ];
+  const OP_ADJUNCT = [
+    'Stop Bleeding','Tracheostomy','Direct Laryngoscopy (DL)','Dental Extraction',
+    'Esophagogastroduodenoscopy (EGD)','Remove Foreign Body (FB)','Abrasion Upper Lip',
+    'Suture Wound at Nose','Telescope Examination of Trachea and Larynx',
+    'Esophagogastroduodenoscopy (EGD) with Removal of Foreign Body (FB)'
+  ];
+
+  const dedup = arr => Array.from(new Set((arr||[]).map(x => (x||'').trim()).filter(Boolean)));
+  const add = (name_en, type) => {
+    const key = (name_en + '|' + specId + '|' + type).toLowerCase();
+    if (existing.has(key)) return;
+    sh.appendRow([uuid_(), name_en, '', specId, type]);
+    existing.add(key);
+  };
+
+  dedup(MAIN).forEach(n => add(n, 'main'));
+  const ADJ = dedup(OP_ADJUNCT);
+  ADJ.forEach(n => add(n, 'op2'));
+  ADJ.forEach(n => add(n, 'op3'));
+
+  return 'Seeded ENT (main/op2/op3) from user list.';
+}
+
+/* ---------------------------- Seed: OBGYN (5) ----------------------------- */
+function seedOBGYNProceduresFromUserList(){
+  ensureSheets_();
+  const specId = '5';
+  const sh = getSheet_(SHEET.PROCEDURES);
+  const header = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const idx = headerIndex_(header);
+  const rows = sh.getDataRange().getValues().slice(1);
+  const existing = new Set(rows.map(r =>
+    (String(r[idx.name_en]) + '|' + String(r[idx.specialty_id]) + '|' + String(r[idx.type])).toLowerCase()
+  ));
+
+  const MAIN = [
+    'Biopsy Cervix','Cesarean Section (C/S)','Dilatation and Curettage (D&C)','Debridement (DB)',
+    'Explor wound','EL for seen','Exploratory Laparotomy (EL)','Evacuation hematoma',
+    'Evecuation hematoma e resuture','Electrical Cautilization','Re-EL','Excision','Fail Remove IUD',
+    'Fractional Curettage (F&C)','Hysterotomy','Loop Electrosurgical Excision Procedure (LEEP)',
+    'Marzupialization','Revise marzupialization','Polypectomy','Remove placenta','Repair vagina',
+    'Re-Suture','Re-LEEP','Stop bleeding','Subtotal Abdominal Hysterectomy (SubTAH)','Suture wound',
+    'Suture Episiotomy','Suture vagina stump','Tubal Resection (TR)','TR Fail',
+    'Total Abdominal Hysterectomy (TAH)','Vaginal myomectomy','Electrocautery Stump','Normal Labor (NL'];
+  
+  const OP2 = [
+    'Tubal Resection (TR)','Oophorectomy','Lysis Adhesion','Manual Vacuum Aspiration (MVA)','Suture','Stop Bleeding',
+    'Swab Packing','Salpingo-Oophorectomy (SO)','Bilateral Salpingo-Oophorectomy (BSO)','Salpingectomy',
+    'Cystectomy','Bilateral Ovarian Cystectomy','Remove Hematoma','Repair Ovary',
+    'Subtotal Abdominal Hysterectomy (SubTAH)','Oophorectomy','Episiotomy','Remove Swab','Myomectomy','Polypectomy','Marzupialization'
+  ];
+  const OP3 = [
+    'Repair Small Bowel','Salpingo-Oophorectomy (SO)','Suture Wound','Cystectomy','Lysis Adhesion',
+    'Appendectomy (App)','Bilateral Cystectomy','Stop Bleeding','Subtotal Abdominal Hysterectomy (SubTAH)',
+    'Abdominal Toilet','Repair ureter'
+  ];
+
+  const dedup = arr => Array.from(new Set((arr||[]).map(x => (x||'').trim()).filter(Boolean)));
+  const add = (name_en, type) => {
+    const key = (name_en + '|' + specId + '|' + type).toLowerCase();
+    if (existing.has(key)) return;
+    sh.appendRow([uuid_(), name_en, '', specId, type]);
+    existing.add(key);
+  };
+
+  dedup(MAIN).forEach(n => add(n, 'main'));
+  dedup(OP2).forEach(n => add(n, 'op2'));
+  dedup(OP3).forEach(n => add(n, 'op3'));
+
+  return 'Seeded OBGYN (main/op2/op3) from user list.';
+}
+
+/* ------------------------ Seed: ORTHOPEDICS (2) --------------------------- */
+function seedOrthopedicsProceduresFromUserList(){
+  ensureSheets_();
+  const specId = '2';
+  const sh = getSheet_(SHEET.PROCEDURES);
+  const header = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const idx = headerIndex_(header);
+  const rows = sh.getDataRange().getValues().slice(1);
+  const existing = new Set(rows.map(r =>
+    (String(r[idx.name_en]) + '|' + String(r[idx.specialty_id]) + '|' + String(r[idx.type])).toLowerCase()
+  ));
+
+  const LIST = [
+    'Anterior Cervical Discectomy and Fusion (ACDF)',
+    'Anterior Cruciate Ligament Reconstruction (ACL Reconstruction)',
+    'Adjunct External Fixation (EF)','Above Knee Amputation (AKA)',
+    'Arthrotomy','Arthrotomy Shoulder','Arthrotomy Hip',
+    'Amputation','Amputation Hand',
+    'Arthroscopic Debridement (DB)',
+    'Arthroscopic Removal of Fragment/Screw Fixation',
+    'Bipolar Hemiarthroplasty','Below Knee Amputation (BKA)','Close Stump',
+    'Closed Reduction (CR)','Closed Reduction and Internal Fixation (CRIF)',
+    'Core Decompression Hip','Carpal Tunnel Release (CTR)',
+    'Debridement (DB)','Incision and Drainage (I&D)','Incision Biopsy (Bx)',
+    'Discectomy','Epidural Steroid Injection (ESI)',
+    'Excision K-wire','Excision','Excision Biopsy (Bx)',
+    'Exploration Wound','External Fixation (EF)','Fasciotomy',
+    'Failed Proximal Femoral Nail Antirotation (PFNA)',
+    'Fusion of Metatarsophalangeal Joint (MTP Joint)',
+    'Head Resection','Hybrid Total Hip Replacement (THR)',
+    'Iliac Bone Graft','Laminectomy','Interlocking Nail (ILN)','Intramedullary Nail (IM Nail)',
+    'Manipulation of Knee','Medial Collateral Ligament Repair (MCL Repair)',
+    'Open Reduction Elbow','Open Reduction','Open Reduction and Internal Fixation (ORIF)',
+    'Minimally Invasive Plate Osteosynthesis with Locking Compression Plate (MIPO LCP)',
+    'Tension Band Wiring (TBW)','Percutaneous Sacroiliac Screw',
+    'Pedicle Screw Fixation (PDS)','Revision Pedicle Screw Fixation (PDS)',
+    'Percutaneous Pedicle Screw Fixation (PDS)','Proximal Femoral Nail Antirotation (PFNA)',
+    'Ray Amputation','Remove Intramedullary Locking Nail (ILN) Tibia','Remove Hook Plate',
+    'Remove Plate (LCP) Convert to PFNA','Remove Prosthesis','Remove Locking Compression Plate (LCP)',
+    'Remove Femoral Neck System (FNS)','Remove Proximal Femoral Nail Antirotation (PFNA)',
+    'Remove Tibial Locking Nail (TLN)','Remove Plate and Screw (P+S)','Remove Screw','Remove K-wire',
+    'Remove Foreign Body (FB)','Remove External Fixation (EF)','Remove Hematoma',
+    'Revision Narrow Dynamic Compression Plate (NDCP)','Revision Plate and Screw (P+S)',
+    'Revision Locking Compression Plate (LCP)','Revise Screw','Remove Pedicle Screw Fixation (PDS)',
+    'Repair Tendon','Repair Muscle','Repair Nerve','Repair Nail Base',
+    'Repair Extensor Hallucis Longus (EHL)','Repair Achilles Tendon',
+    'Release A1 Pulley (A1PR)','Release Trigger Finger','Release Elbow','Release Capitate Bone',
+    'Remove Drain','Revision Total Knee Arthroplasty (TKA)','Revision Total Hip Replacement (THR)',
+    'Suture Wound','Skeletal Traction','Split-Thickness Skin Graft (STSG)','Synovectomy',
+    'Total Knee Arthroplasty (TKA)','Bilateral Total Knee Arthroplasty (TKA)',
+    'Total Hip Replacement (THR)','Unicompartmental Knee Arthroplasty (UKA)',
+    'Tenosynovectomy','Tenar Flap','Tapping Knee','Tapping Hip',
+    'Tendon Transfer','Ulnar Transposition','V-Y Flap','Web Spacer Release',
+    'Slab Immobilization (Slab)','Short Arm Cast (SAC)','Cast Immobilization (Cast)',
+    'Broad Dynamic Compression Plate (BDCP)','Narrow Dynamic Compression Plate (NDCP)','Small Dynamic Compression Plate (SDCP)',
+    'Locking Compression Plate (LCP)','Hook Plate Fixation','Mini Plate Fixation','Screw Fixation',
+    'Antibiotic Cement Spacer','Antibiotic Cement Implantation','Insert Antibiotic Cement (ATB Cement)','Cement Spacer Hip',
+    'Bone Biopsy (Bx)','Anchor Suture','Irrigation','Second-Look Surgery (SLS)',
+    'Posterolateral Fusion (PLF)','Transforaminal Lumbar Interbody Fusion (TLIF)','Rod Fixation',
+    'Drain Abscess','Correction Osteotomy with Locking Compression Plate (LCP) Fixation'
+  ];
+
+  const dedup = arr => Array.from(new Set((arr||[]).map(x => (x||'').trim()).filter(Boolean)));
+  const add = (name_en, type) => {
+    const key = (name_en + '|' + specId + '|' + type).toLowerCase();
+    if (existing.has(key)) return;
+    sh.appendRow([uuid_(), name_en, '', specId, type]);
+    existing.add(key);
+  };
+
+  const L = dedup(LIST);
+  L.forEach(n => add(n, 'main'));
+  L.forEach(n => add(n, 'op2'));
+  L.forEach(n => add(n, 'op3'));
+
+  return 'Seeded Orthopedics (main/op2/op3).';
+}
+
+/* ---------------------- Seed: OPHTHALMOLOGY (6) -------------------------- */
+function seedOphthalmologyProceduresFromUserList(){
+  ensureSheets_();
+  const specId = '6';
+  const sh = getSheet_(SHEET.PROCEDURES);
+  const header = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const idx = headerIndex_(header);
+  const rows = sh.getDataRange().getValues().slice(1);
+  const existing = new Set(rows.map(r =>
+    (String(r[idx.name_en]) + '|' + String(r[idx.specialty_id]) + '|' + String(r[idx.type])).toLowerCase()
+  ));
+
+  const MAIN = [
+    'Anterior Vitrectomy','Ahmed Anterior Drainage Implant Shunt (AADI Shunt)',
+    'Antibiotic Injection – Vitreous Tapping','Bilateral Upper Lid Blepharoplasty (BULB)',
+    'Corneal Scraping','Capsular Tension Ring Implantation (CTR Implantation)','Conjunctivectomy',
+    'Debridement (DB)','Electrolysis – Right Lower Lid (RLL)','Eye Examination',
+    'Excision','Excision Graft','Excision Biopsy (Bx)','Exploration of Wound',
+    'Endoscopic Dacryocystorhinostomy (Endo-DCR)','Exenteration','Evisceration','Enucleation',
+    'Extracapsular Cataract Extraction (ECCE)','Intracapsular Cataract Extraction (ICCE)',
+    'Irrigation Anterior Chamber (A/C)','Lacrimal Gland Biopsy','Incision and Curettage (I&C)',
+    'Incision and Drainage (I&D)','Trabeculectomy','Pterygium Excision','Blepharoplasty',
+    'Direct Brow Lift','Dermis Fat Graft','Autologous Fascia Lata Frontalis Sling',
+    'Lateral Tarsal Strip (LTS)','Vitreous Tapping','Suture Conjunctiva','Suture Bleb',
+    'Epiblepharon Correction','Temporary Tarsorrhaphy','Wedge Resection',
+    'Dilation of Punctum','Hugh Flap (Stage II Repair)'
+  ];
+  const OP2 = [
+    'Implantation (AADI Shunt)','Lateral Canthoplasty (LA BE)',
+    'Tarsal Fixation – Lower Lid (LLL)','Intraocular Lens Implantation (IOL)','Glass Ball Implantation',
+    'Folliculectomy – Eyelid','Scleral Fixation (SF)','Repair Conjunctiva','Retain Silicone Tube',
+    'Graft (Pterygium Excision with Graft / AMT Graft)','Fat Transfer (Blepharoplasty with Fat Transfer)',
+    'External Levator Advancement (for ptosis correction)','Resuture (A/C or Wound)',
+    'Injection of Triamcinolone – Intralesional'
+  ];
+  const OP3 = [
+    'Tarsal Fixation – Upper Lid (RUL)','Anterior Vitrectomy (ICCE with Anterior Vitrectomy)',
+    'Glass Ball Implant (Evisceration with Glass Ball)','Repair Avulsion Wound','Remove Foreign Body (FB)',
+    'Repair Canaliculi','Remove Silicone','Iris Reposition','Autologous Fascia Graft',
+    'Dermis Fat Graft (Eyelid or Orbit Reconstruction)'
+  ];
+  const OP4 = [
+    'Repair Conjunctiva Laceration','Repair Globe','Repair Eyelid','Repair Canaliculus','Repair Lacrimal Wound',
+    'Levator Advancement','Revision of Blepharoplasty','Fat Transfer / Reconstruction',
+    'Resuture Eyelid Margin','Temporary Tarsorrhaphy','External Levator Advancement','Scleral Fixation IOL'
+  ];
+
+  const dedup = arr => Array.from(new Set((arr||[]).map(x => (x||'').trim()).filter(Boolean)));
+  const add = (name_en, type) => {
+    const key = (name_en + '|' + specId + '|' + type).toLowerCase();
+    if (existing.has(key)) return;
+    sh.appendRow([uuid_(), name_en, '', specId, type]);
+    existing.add(key);
+  };
+
+  dedup(MAIN).forEach(n => add(n, 'main'));
+  dedup(OP2).forEach(n => add(n, 'op2'));
+  dedup(OP3).forEach(n => add(n, 'op3'));
+  dedup(OP4).forEach(n => add(n, 'op4'));
+
+  return 'Seeded Ophthalmology (main/op2/op3/op4).';
+}
+
+/* ---------------------- Seed: MAXILLOFACIAL (7) -------------------------- */
+function seedMaxillofacialProceduresFromUserList(){
+  ensureSheets_();
+  const specId = '7';
+  const sh = getSheet_(SHEET.PROCEDURES);
+  const header = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const idx = headerIndex_(header);
+  const rows = sh.getDataRange().getValues().slice(1);
+  const existing = new Set(rows.map(r =>
+    (String(r[idx.name_en]) + '|' + String(r[idx.specialty_id]) + '|' + String(r[idx.type])).toLowerCase()
+  ));
+  const LIST = [
+    'Closed Reduction Nasal Bone Fracture (CR Nasal Bone)',
+    'Closed Reduction Le Fort Fracture (CR Le Fort)',
+    'Closed Reduction (CR)',
+    'Arch Bar Fixation (CR with Arch Bar)',
+    'Debridement (DB)',
+    'Excision',
+    'Enucleation of Mandibular Cyst',
+    'Incisional Biopsy (Bx)',
+    'Open Reduction and Internal Fixation (ORIF)',
+    'Mini Plate and Screw (Mini P&S)',
+    'Removal of Mini Plate and Screw (Mini P&S)',
+    'Removal of Foreign Body (FB)',
+    'Repair of Facial Wound',
+    'Surgical Removal (e.g. tooth or lesion)',
+    'Suture of Wound',
+    'Wide Excision',
+    'Skin Graft'
+  ];

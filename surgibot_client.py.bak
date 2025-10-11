@@ -1,0 +1,2230 @@
+# -*- coding: utf-8 -*-
+"""
+SurgiBot Client — PySide6 (compact left, wider right)
+"""
+
+import os, sys, json, argparse
+from pathlib import Path
+from typing import Union, List, Dict
+from datetime import datetime, timedelta, time as dtime
+
+import requests
+from requests.adapters import HTTPAdapter, Retry
+
+from PySide6 import QtCore, QtGui, QtWidgets
+
+# ---- DEBUG: print uncaught exceptions and Qt messages ----
+import traceback as _tb
+
+
+def _excepthook(exc_type, exc, tb):
+    _tb.print_exception(exc_type, exc, tb)
+    sys.stderr.flush()
+
+
+sys.excepthook = _excepthook
+try:
+    QtCore.qInstallMessageHandler(lambda mode, ctx, msg: print("[Qt]", msg))
+except Exception:
+    pass
+
+from PySide6.QtCore import QSettings, QUrl
+from PySide6.QtGui import (
+    QShortcut, QKeySequence, QIcon, QPixmap, QPainter,
+    QLinearGradient, QColor, QImageReader
+)
+from PySide6.QtWidgets import QSystemTrayIcon, QSizePolicy, QFormLayout
+from PySide6.QtWebSockets import QWebSocket
+
+
+# ---------- ENV ----------
+def _load_env():
+    try:
+        from dotenv import load_dotenv
+        p = Path.cwd() / ".env"
+        if p.exists(): load_dotenv(p)
+    except Exception:
+        pass
+
+
+_load_env()
+
+# ---------- Defaults ----------
+DEFAULT_HOST = os.getenv("SURGIBOT_CLIENT_HOST", "127.0.0.1")
+DEFAULT_PORT = int(os.getenv("SURGIBOT_CLIENT_PORT", "8088"))
+DEFAULT_TOKEN = os.getenv("SURGIBOT_SECRET", "uTCoBelMyNfSSNmUulT_Kz6zrrCVkvD578MxEuLKZoaaXX0pVlpAD8toYHBxsFxI")
+
+API_HEALTH = "/api/health"
+API_UPDATE = "/api/update"
+API_LIST = "/api/list"
+API_LIST_FULL = "/api/list_full"
+API_WS = "/api/ws"
+
+STATUS_CHOICES = ["รอผ่าตัด", "กำลังผ่าตัด", "กำลังพักฟื้น", "กำลังส่งกลับตึก", "เลื่อนการผ่าตัด"]
+OR_CHOICES = ["OR1", "OR2", "OR3", "OR4", "OR5", "OR6", "OR8"]
+QUEUE_CHOICES = ["0-1", "0-2", "0-3", "0-4", "0-5", "0-6", "0-7"]
+
+STATUS_COLORS = {
+    "รอผ่าตัด": "#fde047",
+    "กำลังผ่าตัด": "#ef4444",
+    "กำลังพักฟื้น": "#22c55e",
+    "กำลังส่งกลับตึก": "#a855f7",
+    "เลื่อนการผ่าตัด": "#64748b",
+}
+OR_HEADER_COLORS = {
+    "OR1": "#3b82f6",
+    "OR2": "#10b981",
+    "OR3": "#f59e0b",
+    "OR4": "#ef4444",
+    "OR5": "#8b5cf6",
+    "OR6": "#0ea5e9",
+    "OR8": "#64748b",
+}
+
+# ---- Auto purge (client-side) ----
+AUTO_PURGE_MINUTES = int(os.getenv("SURGIBOT_CLIENT_PURGE_MINUTES", "3"))
+AUTO_PURGE_STATUSES = {"กำลังส่งกลับตึก"}  # สามารถเพิ่มได้ภายหลัง
+
+# ---------- Shared schedule ----------
+ORG_NAME = "ORNBH"
+APP_SHARED = "SurgiBotShared"
+OR_KEY = "schedule/or_rooms"
+ENTRIES_KEY = "schedule/entries"
+SEQ_KEY = "schedule/seq"
+
+# ---------- Persistent monitor keys ----------
+PERSIST_ORG = "ORNBH"
+PERSIST_APP = "SurgiBotClient"
+KEY_LAST_ROWS = "monitor/last_rows_json"
+KEY_WAS_IN_MONITOR = "monitor/was_in_monitor_json"
+KEY_CURRENT_MONITOR = "monitor/current_monitor_json"
+
+
+# ---------- Working-hours helpers ----------
+def _now_period(dt_val: datetime) -> str:
+    """คืนค่า 'in' ถ้าเวลาอยู่ช่วง 08:30–16:30, นอกนั้น 'off' """
+    start = dtime(8, 30);
+    end = dtime(16, 30)
+    return "in" if (start <= dt_val.time() < end) else "off"
+
+
+def _period_label(code: str) -> str:
+    return "ในเวลาราชการ" if code == "in" else "นอกเวลาราชการ"
+
+
+class _SchedEntry:
+
+
+def __init__(self, host=None, port=None, token=None, *args, **kwargs):
+    super().__init__()
+    self.cli = SurgiBotClientHTTP(host or DEFAULT_HOST, port or DEFAULT_PORT, token or DEFAULT_TOKEN)
+    self.model = LocalTableModel()
+    self._build_ui()
+    if self.layout() is None:
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addWidget(QtWidgets.QLabel("UI failed to build — check console for errors"))
+    self._sched_timer = getattr(self, "_sched_timer", QtCore.QTimer(self))
+    self._sched_timer.setInterval(1500)
+    if hasattr(self, "_check_schedule_seq"):
+        try:
+            self._sched_timer.timeout.disconnect()
+        except Exception:
+            pass
+        self._sched_timer.timeout.connect(self._check_schedule_seq)
+        self._sched_timer.start()
+    self.show()
+    self.or_room = str(d.get("or", "") or "")
+    self.date = str(d.get("date", "") or "")
+    self.time = str(d.get("time", "") or "")
+    self.hn = str(d.get("hn", "") or "")
+    self.name = str(d.get("name", "") or "")
+    self.age = int(d.get("age") or 0)
+    self.dept = str(d.get("dept", "") or "")
+    self.doctor = str(d.get("doctor", "") or "")
+    self.diags = d.get("diags") or []
+    self.ops = d.get("ops") or []
+    self.ward = str(d.get("ward", "") or "")
+    self.queue = int(d.get("queue") or 1)
+    # <<< NEW: keep period from registry >>>
+    self.period = str(d.get("period") or "in")
+
+
+class SharedScheduleReader:
+    def __init__(self):
+        self.s = QSettings(ORG_NAME, APP_SHARED)
+        self._seq = int(self.s.value(SEQ_KEY, 0))
+        self.or_rooms = self._load_or()
+        self.entries = self._load_entries()
+
+    def _load_or(self) -> List[str]:
+        lst = self.s.value(OR_KEY, [])
+        return [str(x) for x in (lst or [])]
+
+    def _load_entries(self) -> List[_SchedEntry]:
+        raw = self.s.value(ENTRIES_KEY, [])
+        out = []
+        if isinstance(raw, list):
+            for d in raw:
+                if isinstance(d, dict):
+                    out.append(_SchedEntry(d))
+        return out
+
+    def seq(self) -> int:
+        return int(self.s.value(SEQ_KEY, 0))
+
+    def refresh_if_changed(self) -> bool:
+        cur = self.seq()
+        if cur != self._seq:
+            self._seq = cur
+            self.or_rooms = self._load_or()
+            self.entries = self._load_entries()
+            return True
+        return False
+
+
+def _fmt_td(td: timedelta) -> str:
+    total = int(abs(td.total_seconds()))
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _parse_iso(ts: str):
+    if not isinstance(ts, str) or not ts: return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", ""))
+    except Exception:
+        return None
+
+
+# ---------- HTTP ----------
+class SurgiBotClientHTTP:
+    def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, token=DEFAULT_TOKEN, timeout=6):
+        self.base, self.token, self.timeout = f"http://{host}:{port}", token, timeout
+        self.sess = requests.Session()
+        retries = Retry(total=3, connect=2, read=2, backoff_factor=0.35,
+                        status_forcelist=(429, 500, 502, 503, 504),
+                        allowed_methods=frozenset(["GET", "POST"]))
+        self.sess.mount("http://", HTTPAdapter(max_retries=retries))
+
+    def health(self):
+        r = self.sess.get(self.base + API_HEALTH, timeout=self.timeout, headers={"Accept": "application/json"})
+        r.raise_for_status();
+        return r.json()
+
+    def send_update(self, action, or_room=None, queue=None, status=None, patient_id=None, eta_minutes=None, hn=None):
+        payload = {"token": self.token, "action": action}
+        if patient_id:
+            payload["patient_id"] = str(patient_id)
+        else:
+            if or_room: payload["or"] = str(or_room)
+            if queue:   payload["queue"] = str(queue)
+        if status is not None: payload["status"] = str(status)
+        if hn: payload["hn"] = str(hn)
+        if eta_minutes is not None and str(eta_minutes).strip() != "":
+            try:
+                payload["eta_minutes"] = int(eta_minutes)
+            except Exception:
+                pass
+        r = self.sess.post(self.base + API_UPDATE, json=payload, timeout=self.timeout,
+                           headers={"Accept": "application/json"})
+        try:
+            data = r.json()
+        except Exception:
+            data = {"ok": False, "error": f"HTTP {r.status_code}", "text": r.text}
+        if r.status_code >= 400:
+            raise requests.HTTPError(json.dumps(data, ensure_ascii=False))
+        return data
+
+    def _wrap_items(self, data):
+        if isinstance(data, list): return {"items": data}
+        if isinstance(data, dict):
+            for k in ("items", "data", "table", "rows", "list"):
+                if k in data and isinstance(data[k], list): return {"items": data[k]}
+            for v in data.values():
+                if isinstance(v, list): return {"items": v}
+            return data
+        return {"items": []}
+
+    def list_items(self):
+        try:
+            r = self.sess.get(f"{self.base}{API_LIST_FULL}?token={self.token}", timeout=self.timeout,
+                              headers={"Accept": "application/json"})
+            if r.status_code == 200: return self._wrap_items(r.json())
+        except Exception:
+            pass
+        try:
+            r = self.sess.get(self.base + API_LIST, timeout=self.timeout, headers={"Accept": "application/json"})
+            if r.status_code == 200: return self._wrap_items(r.json())
+        except Exception:
+            pass
+        return {"items": []}
+
+
+# ---------- Local model ----------
+class LocalTableModel:
+    def __init__(self):
+        self.rows, self._seq = [], 1
+
+    def _find(self, pid):
+        for i, r in enumerate(self.rows):
+            if r["patient_id"] == pid: return i
+        return -1
+
+    def add_or_edit(self, pid, status, timestamp=None, eta_minutes=None, hn=None):
+        i = self._find(pid)
+        if i >= 0:
+            self.rows[i]["status"] = status
+            if timestamp is not None: self.rows[i]["timestamp"] = timestamp
+            if eta_minutes is not None: self.rows[i]["eta_minutes"] = eta_minutes
+            if hn is not None: self.rows[i]["hn_full"] = hn
+            return self.rows[i]["id"]
+        rid = self._seq;
+        self._seq += 1
+        self.rows.append({"id": hn or rid, "hn_full": hn, "patient_id": pid, "status": status,
+                          "timestamp": timestamp, "eta_minutes": eta_minutes})
+        return rid
+
+    def delete(self, pid):
+        i = self._find(pid)
+        if i >= 0: self.rows.pop(i)
+
+
+# ---------- UI helpers ----------
+class ShadowButton(QtWidgets.QPushButton):
+    def __init__(self, text="", color="#2dd4bf", parent=None):
+        super().__init__(text, parent)
+        self.base_color = QtGui.QColor(color)
+        self.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.setMinimumHeight(40)
+        self.setStyleSheet(
+            f"QPushButton{{border:none;color:white;padding:6px 10px;border-radius:10px;font-weight:600;background:{self.base_color.name()};}}")
+        sh = QtWidgets.QGraphicsDropShadowEffect(self);
+        sh.setBlurRadius(14);
+        sh.setXOffset(0);
+        sh.setYOffset(4);
+        sh.setColor(QtGui.QColor(0, 0, 0, 64))
+        self.setGraphicsEffect(sh)
+
+
+# ---------- Schedule OR header styling ----------
+class Card(QtWidgets.QFrame):
+    def __init__(self, title="", parent=None):
+        super().__init__(parent)
+        self.setObjectName("Card")
+        self.setStyleSheet("""
+            QFrame#Card { background:#ffffff; border-radius:14px; border:1px solid #e6e6ef; }
+            QLabel[role="title"]{ font-size:14px; font-weight:800; color:#0f172a; }
+        """)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10);
+        lay.setSpacing(8)
+        self.title = QtWidgets.QLabel(title);
+        self.title.setProperty("role", "title")
+        lay.addWidget(self.title)
+        self.body = QtWidgets.QWidget()
+        self._grid = QtWidgets.QGridLayout();
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setHorizontalSpacing(6);
+        self._grid.setVerticalSpacing(6)
+        self.body.setLayout(self._grid);
+        lay.addWidget(self.body)
+
+        shadow = QtWidgets.QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(20);
+        shadow.setXOffset(0);
+        shadow.setYOffset(6)
+        shadow.setColor(QtGui.QColor(15, 23, 42, 36))
+        self.setGraphicsEffect(shadow)
+
+    def grid(self): return self.body.layout()
+
+
+class GlassCard(QtWidgets.QFrame):
+    def __init__(self, title: str, subtitle: str = "", icon: str = "",
+                 parent=None, accent: str = "#2563eb", header_bg: str | None = None):
+        super().__init__(parent)
+        self.setObjectName("GlassCard")
+        header_fill = header_bg or _rgba(accent, 0.12)
+        self.setStyleSheet(f"""
+            QFrame#GlassCard {{
+                background:#ffffff;
+                border-radius:14px;
+                border:1px solid #e6e6ef;
+            }}
+            QLabel[role="card-title"]{{ font-size:13.5px; font-weight:800; color:#0f172a; }}
+            QLabel[role="card-sub"]  {{ font-size:11px;  color:#64748b; }}
+        """)
+        shadow = QtWidgets.QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(20);
+        shadow.setXOffset(0);
+        shadow.setYOffset(6)
+        shadow.setColor(QtGui.QColor(15, 23, 42, 36));
+        self.setGraphicsEffect(shadow)
+
+        lay = QtWidgets.QVBoxLayout(self);
+        lay.setContentsMargins(10, 10, 10, 10);
+        lay.setSpacing(8)
+        headerFrame = QtWidgets.QFrame();
+        headerFrame.setObjectName("HeaderCapsule")
+        headerFrame.setStyleSheet(f"""
+            QFrame#HeaderCapsule {{
+                background:{header_fill};
+                border:1px solid #e2e8f0;
+                border-radius:10px;
+                padding:6px 10px;
+                border-left:6px solid {accent};
+            }}
+        """)
+        hh = QtWidgets.QHBoxLayout(headerFrame);
+        hh.setContentsMargins(8, 4, 8, 4);
+        hh.setSpacing(8)
+        badge = QtWidgets.QLabel(icon or "•");
+        badge.setFixedWidth(18);
+        hh.addWidget(badge, 0)
+        tbox = QtWidgets.QVBoxLayout();
+        tbox.setSpacing(0)
+        ttl = QtWidgets.QLabel(title);
+        ttl.setProperty("role", "card-title")
+        sub = QtWidgets.QLabel(subtitle);
+        sub.setProperty("role", "card-sub")
+        tbox.addWidget(ttl);
+        tbox.addWidget(sub);
+        hh.addLayout(tbox, 1)
+        lay.addWidget(headerFrame)
+        self.body = QtWidgets.QWidget()
+        self.grid = QtWidgets.QGridLayout(self.body)
+        self.grid.setContentsMargins(0, 0, 0, 0);
+        self.grid.setHorizontalSpacing(6);
+        self.grid.setVerticalSpacing(6)
+        lay.addWidget(self.body)
+
+
+# ---------- Color helpers ----------
+from PySide6.QtGui import QColor
+
+
+def _rgba(hex_color: str, a: float) -> str:
+    c = QColor(hex_color)
+    return f"rgba({c.red()},{c.green()},{c.blue()},{a})"
+
+
+# ---------- Elevated Card ----------
+class ElevatedCard(QtWidgets.QFrame):
+    def __init__(self, title: str, icon: str = "📦",
+                 accent: str = "#2563eb", bg: str = "#ffffff",
+                 header_bg: str | None = None, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ElevatedCard")
+        header_fill = header_bg or _rgba(accent, 0.12)
+        self.setStyleSheet(f"""
+            QFrame#ElevatedCard {{
+                background:{bg};
+                border-radius:14px;
+                border:1px solid #e6e6ef;
+            }}
+            QLabel[role="x-title"] {{ font-size:14.5px; font-weight:900; color:#0f172a; }}
+            QFrame#XHeader {{
+                background:{header_fill};
+                border:1px solid #e2e8f0;
+                border-radius:10px; padding:6px 10px;
+                border-left:6px solid {accent};
+            }}
+            QLabel#XBadge {{
+                background:#ffffff; border:1px solid #e5e7eb; border-radius:9px;
+                min-width:18px; max-width:18px; min-height:18px; max-height:18px;
+                qproperty-alignment: 'AlignCenter';
+            }}
+        """)
+        shadow = QtWidgets.QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(24);
+        shadow.setXOffset(0);
+        shadow.setYOffset(10)
+        shadow.setColor(QtGui.QColor(15, 23, 42, 36));
+        self.setGraphicsEffect(shadow)
+        lay = QtWidgets.QVBoxLayout(self);
+        lay.setContentsMargins(10, 10, 10, 10);
+        lay.setSpacing(10)
+        header = QtWidgets.QFrame();
+        header.setObjectName("XHeader")
+        hl = QtWidgets.QHBoxLayout(header);
+        hl.setContentsMargins(10, 6, 10, 6);
+        hl.setSpacing(10)
+        badge = QtWidgets.QLabel(icon or "•");
+        badge.setObjectName("XBadge")
+        hl.addWidget(badge, 0, QtCore.Qt.AlignVCenter)
+        ttl = QtWidgets.QLabel(title);
+        ttl.setProperty("role", "x-title");
+        hl.addWidget(ttl, 1, QtCore.Qt.AlignVCenter)
+        lay.addWidget(header)
+        self.body = QtWidgets.QWidget()
+        self._grid = QtWidgets.QGridLayout(self.body)
+        self._grid.setContentsMargins(0, 0, 0, 0);
+        self._grid.setHorizontalSpacing(6);
+        self._grid.setVerticalSpacing(6)
+        lay.addWidget(self.body)
+
+    def grid(self): return self._grid
+
+
+class ElideDelegate(QtWidgets.QStyledItemDelegate):
+    def __init__(self, mode=QtCore.Qt.ElideRight, parent=None):
+        super().__init__(parent);
+        self._mode = mode
+
+    def paint(self, painter, option, index):
+        option = QtWidgets.QStyleOptionViewItem(option);
+        self.initStyleOption(option, index)
+        option.textElideMode = self._mode;
+        option.features &= ~QtWidgets.QStyleOptionViewItem.WrapText
+        super().paint(painter, option, index)
+
+
+# ---------- Schedule delegate (wrap + watermark + column lines) ----------
+class ScheduleDelegate(QtWidgets.QStyledItemDelegate):
+    WRAP_COLS = {2, 4, 5, 6, 7}  # ชื่อ-สกุล, Diagnosis, Operation, แพทย์, Ward
+
+    WATERMARK = "ผ่าตัดเสร็จและส่งกลับตึกเรียบร้อยแล้ว"
+
+    def __init__(self, tree: QtWidgets.QTreeWidget):
+        super().__init__(tree)
+        self._tree = tree
+
+    def _draw_wrapped_text(self, painter, option, index):
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+
+        # ความกว้างพื้นที่วาดจริงของคอลัมน์
+        view = opt.widget
+        col_w = max(10, view.columnWidth(index.column()) - 12)
+
+        txt = opt.text
+        doc = QtGui.QTextDocument()
+        doc.setDefaultFont(opt.font)
+        doc.setTextWidth(col_w)
+        doc.setPlainText(txt)
+
+        painter.save()
+        style = opt.widget.style() if isinstance(opt.widget, QtWidgets.QWidget) else QtWidgets.QApplication.style()
+        opt.text = ''  # ป้องกันข้อความถูกวาดซ้ำ
+        style.drawControl(QtWidgets.QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+        painter.translate(opt.rect.topLeft())
+        clip = QtCore.QRectF(0, 0, col_w, opt.rect.height())
+        doc.drawContents(painter, clip)
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        # คอลัมน์ที่ต้องการตัดบรรทัด: คำนวณความสูงจาก QTextDocument
+        if index.column() in self.WRAP_COLS and index.model():
+            view = option.widget
+            col_w = max(10, view.columnWidth(index.column()) - 12)
+            fm = option.fontMetrics
+            doc = QtGui.QTextDocument()
+            doc.setDefaultFont(option.font)
+            doc.setTextWidth(col_w)
+            doc.setPlainText(index.data())
+            h = int(doc.size().height()) + 8
+            # เผื่อความสูงขั้นต่ำให้แตะได้สบายตา
+            h = max(h, max(34, fm.height() + 12))
+            return QtCore.QSize(col_w, h)
+
+        # อื่น ๆ ใช้ค่าเดิม
+        return super().sizeHint(option, index)
+
+    def paint(self, painter, option, index):
+        # แถวลูกเท่านั้น (ไม่ใช่หัว OR)
+        item = self._tree.itemFromIndex(index)
+        is_child = bool(item and item.parent() is not None)
+
+        # วาดข้อความแบบ wrap สำหรับคอลัมน์ยาว
+        if index.column() in self.WRAP_COLS and is_child:
+            self._draw_wrapped_text(painter, option, index)
+        else:
+            super().paint(painter, option, index)
+
+        # วาด watermark เมื่อ complete (คอลัมน์ชื่อ-สกุล)
+        try:
+            is_completed = (index.data(QtCore.Qt.UserRole) == "completed")
+            if is_completed and index.column() == 2:
+                painter.save()
+                painter.setRenderHint(QPainter.Antialiasing, True)
+                r = option.rect
+                f = option.font;
+                f.setBold(True)
+                painter.setFont(f)
+                painter.setPen(QtGui.QColor(100, 116, 139, 120))
+                painter.drawText(r, QtCore.Qt.AlignCenter, self.WATERMARK)
+                painter.restore()
+        except Exception:
+            pass
+
+        # เส้นแบ่งคอลัมน์ (เฉพาะแถวลูก และไม่ใช่คอลัมน์สุดท้าย)
+        try:
+            if is_child and index.column() < (self._tree.columnCount() - 1):
+                painter.save()
+                painter.setPen(QtGui.QPen(QtGui.QColor("#eef2f7")))
+                x = option.rect.right()
+                painter.drawLine(x, option.rect.top(), x, option.rect.bottom())
+                painter.restore()
+        except Exception:
+            pass
+
+
+def _read_png_safe(path: Path) -> QPixmap:
+    f = QtCore.QFile(str(path))
+    if not f.open(QtCore.QIODevice.ReadOnly): return QPixmap()
+    rd = QImageReader(f, b"png");
+    img = rd.read();
+    f.close()
+    return QPixmap.fromImage(img) if not img.isNull() else QPixmap()
+
+
+def _icon_from_png(p: Path) -> QIcon:
+    f = QtCore.QFile(str(p))
+    if not f.open(QtCore.QIODevice.ReadOnly): return QIcon()
+    rd = QImageReader(f, b"png");
+    img = rd.read();
+    f.close()
+    return QIcon(QPixmap.fromImage(img)) if not img.isNull() else QIcon()
+
+
+def _draw_fallback_icon(size=256) -> QIcon:
+    pm = QPixmap(size, size);
+    pm.fill(QtCore.Qt.transparent);
+    p = QPainter(pm);
+    p.setRenderHint(QPainter.Antialiasing, True)
+    grad = QLinearGradient(0, 0, size, size);
+    grad.setColorAt(0.0, QColor("#eaf2ff"));
+    grad.setColorAt(0.6, QColor("#e6f7ff"));
+    grad.setColorAt(1.0, QColor("#eefcf8"))
+    p.setBrush(grad);
+    p.setPen(QtCore.Qt.NoPen);
+    p.drawEllipse(8, 8, size - 16, size - 16);
+    p.end();
+    return QIcon(pm)
+
+
+def _load_app_icon() -> QIcon:
+    here = Path(__file__).resolve().parent;
+    assets = here / "assets"
+    for p in [assets / "app.ico", here / "app.ico", assets / "app.png", here / "app.png"]:
+        if p.exists():
+            if p.suffix.lower() == ".ico":
+                ico = QIcon(str(p))
+                if not ico.isNull(): return ico
+            else:
+                ico = _icon_from_png(p)
+                if not ico.isNull(): return ico
+    return _draw_fallback_icon(256)
+
+
+# ---------- Banner ----------
+class HeroBanner(QtWidgets.QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._title = "SurgiBot Client — Operating Room Nongbualamphu Hospital"
+        self.setMinimumHeight(56);
+        self.setMaximumHeight(60)
+        lay = QtWidgets.QHBoxLayout(self);
+        lay.setContentsMargins(10, 8, 10, 8);
+        lay.setSpacing(8)
+        self.logoLabel = QtWidgets.QLabel();
+        self.logoLabel.setFixedSize(34, 34);
+        lay.addWidget(self.logoLabel, 0, QtCore.Qt.AlignVCenter)
+        self.lblTitle = QtWidgets.QLabel(self._title);
+        f = self.lblTitle.font();
+        f.setPointSize(14);
+        f.setBold(True);
+        self.lblTitle.setFont(f)
+        lay.addWidget(self.lblTitle, 1)
+        self.rightBox = QtWidgets.QHBoxLayout();
+        self.rightBox.setSpacing(6);
+        lay.addLayout(self.rightBox, 0)
+
+    def setTitle(self, text: str):
+        self.lblTitle.setText(text)
+
+    def setRight(self, widget: QtWidgets.QWidget):
+        while self.rightBox.count():
+            it = self.rightBox.takeAt(0);
+            w = it.widget()
+            if w: w.setParent(None)
+        self.rightBox.addWidget(widget)
+
+    def setLogo(self, path: Union[Path, str], size: int = 34, radius: int = 8):
+        p = Path(path);
+        f = QtCore.QFile(str(p))
+        if not f.open(QtCore.QIODevice.ReadOnly): self.logoLabel.clear(); return
+        rd = QImageReader(f, b"png");
+        img = rd.read();
+        f.close()
+        if img.isNull(): self.logoLabel.clear(); return
+        pm = QPixmap.fromImage(img).scaled(size, size, QtCore.Qt.KeepAspectRatioByExpanding,
+                                           QtCore.Qt.SmoothTransformation)
+        canvas = QPixmap(size, size);
+        canvas.fill(QtCore.Qt.transparent);
+        painter = QPainter(canvas);
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        pathp = QtGui.QPainterPath();
+        pathp.addRoundedRect(0, 0, size, size, radius, radius);
+        painter.setClipPath(pathp);
+        painter.drawPixmap(0, 0, pm);
+        painter.end()
+        self.logoLabel.setPixmap(canvas)
+
+
+# ---------- Main ----------
+class Main(QtWidgets.QWidget):
+    def __init__(self, host=None, port=None, token=None, *args, **kwargs):
+        super().__init__()
+        # สร้าง client/model
+        self.cli = SurgiBotClientHTTP(host or DEFAULT_HOST,
+                                      port or DEFAULT_PORT,
+                                      token or DEFAULT_TOKEN)
+        self.model = LocalTableModel()
+
+        # สร้าง UI (อย่าครอบ try/except เพื่อให้เห็น error ถ้ามี)
+        self._build_ui()
+
+        # เผื่อกรณี UI ไม่สร้าง layout (กันจอขาว)
+        if self.layout() is None:
+            lay = QtWidgets.QVBoxLayout(self)
+            lay.addWidget(QtWidgets.QLabel("UI failed to build — check console for errors"))
+
+        # ตั้ง timer ถ้ามีเมธอดเช็คคิว
+        self._sched_timer = getattr(self, "_sched_timer", QtCore.QTimer(self))
+        self._sched_timer.setInterval(1500)
+        if hasattr(self, "_check_schedule_seq"):
+            try:
+                self._sched_timer.timeout.disconnect()
+            except Exception:
+                pass
+            self._sched_timer.timeout.connect(self._check_schedule_seq)
+            self._sched_timer.start()
+
+        # แสดงหน้าต่าง
+        self.show()
+
+    def _setup_schedule_header(self):
+        hdr = self.tree_sched.header()
+        m = QtWidgets.QHeaderView
+        hdr.setStretchLastSection(False)
+        hdr.setMinimumSectionSize(60)
+        self.tree_sched.setRootIsDecorated(False)
+        self.tree_sched.setAlternatingRowColors(True)
+        f = self.tree_sched.font();
+        f.setPointSize(max(10, f.pointSize() - 1));
+        self.tree_sched.setFont(f)
+        modes = {
+            0: m.ResizeToContents,
+            1: m.ResizeToContents,
+            2: m.Interactive,
+            3: m.ResizeToContents,
+            4: m.Interactive,
+            5: m.Interactive,
+            6: m.ResizeToContents,
+            7: m.ResizeToContents,
+            8: m.Interactive,
+            9: m.ResizeToContents,
+            10: m.ResizeToContents,
+            11: m.ResizeToContents,
+        }
+        for c, md in modes.items():
+            try:
+                hdr.setSectionResizeMode(c, md)
+            except Exception:
+                pass
+        defaults = {2: 220, 4: 160, 5: 190, 6: 140, 7: 120, 8: 420, 9: 150}
+        for c, w in defaults.items():
+            try:
+                self.tree_sched.setColumnWidth(c, w)
+            except Exception:
+                pass
+
+    def _update_start_end_time_for_hn(self, hn: str, start: "QtCore.QDateTime|None" = None,
+                                      end: "QtCore.QDateTime|None" = None):
+        item = self._find_schedule_item_by_hn(hn)
+        if not item:
+            return
+        col = 9  # Start-End Time index
+        if start and end:
+            fmt = "HH:mm"
+            item.setText(col, f"{start.toString(fmt)} - {end.toString(fmt)}")
+        elif start:
+            item.setText(col, f"{start.toString('HH:mm')} - …")
+
+    def _on_status_changed_for_timer(self, text: str):
+        try:
+            hn = (self.ent_hn.text() or "").strip()
+        except Exception:
+            hn = ""
+        if not hn:
+            return
+        now = QtCore.QDateTime.currentDateTime()
+        self._proc_times = getattr(self, "_proc_times", {})
+        rec = self._proc_times.get(hn, {"start": None, "end": None})
+        if "กำลังผ่าตัด" in text:
+            rec["start"] = now;
+            rec["end"] = None
+            self._proc_times[hn] = rec
+            self._update_start_end_time_for_hn(hn, start=now)
+        elif "กำลังพักฟื้น" in text:
+            end = now.addSecs(-600)  # minus 10 minutes
+            rec["end"] = end;
+            self._proc_times[hn] = rec
+            if rec.get("start"):
+                self._update_start_end_time_for_hn(hn, start=rec["start"], end=end)
+
+    def _blink_schedule_row_for_hn(self, hn: str, ms: int = 5000, interval: int = 250):
+        item = self._find_schedule_item_by_hn(hn)
+        if not item:
+            return
+        total = max(1, int(ms / interval))
+        cols = self.tree_sched.columnCount()
+        originals = [(item.foreground(c), item.background(c)) for c in range(cols)]
+        self._blink_counter = 0
+
+        def tick():
+            bc = QtGui.QColor("#fde68a") if (self._blink_counter % 2 == 0) else QtGui.QColor("#ffffff")
+            for c in range(cols):
+                item.setBackground(c, QtGui.QBrush(bc))
+            self._blink_counter += 1
+            if self._blink_counter >= total:
+                for c in range(cols):
+                    fg, bg = originals[c]
+                    item.setForeground(c, fg)
+                    item.setBackground(c, bg)
+                try:
+                    self._blink_timer.stop()
+                except Exception:
+                    pass
+
+        try:
+            self._blink_timer.stop()
+        except Exception:
+            pass
+        self._blink_timer = QtCore.QTimer(self)
+        self._blink_timer.timeout.connect(tick)
+        self._blink_timer.start(interval)
+
+    def _find_schedule_item_by_hn(self, hn: str):
+        hn = (hn or "").strip()
+        if not hn:
+            return None
+        try:
+            for i in range(self.tree_sched.topLevelItemCount()):
+                parent = self.tree_sched.topLevelItem(i)
+                for j in range(parent.childCount()):
+                    it = parent.child(j)
+                    if it.text(1).strip() == hn:  # col 1 is HN
+                        return it
+        except Exception:
+            pass
+        return None
+
+
+def _team_widget(self, hn: str) -> QtWidgets.QWidget:
+    names = [
+        "อรุณี", "ศิวดาติ์", "กัญญณัช", "ชัญญาภัค", "สุนทรี", "พิศมัย", "เทวัญ", "กันต์พงษ์",
+        "ปนัฏฐา", "สุจิตรา", "ชัยยงค์", "สุภาวัลย์", "จันทจร", "วรรณิภา", "ณัฐพงษ์", "ตะวัน",
+        "ปวีณา", "นิฤมล", "ปริญญา", "สยุมพร", "สุรสิทธ์", "บุศรินทร์", "ศิริกัญญา", "นราวัตน์",
+        "บัณฑิตา", "วรรณวิสา", "ชลดา", "วรีสา"
+    ]
+    wrap = QtWidgets.QWidget()
+    lay = QtWidgets.QVBoxLayout(wrap);
+    lay.setContentsMargins(4, 2, 4, 2);
+    lay.setSpacing(2)
+    rowLbl = QtWidgets.QHBoxLayout();
+    rowLbl.setSpacing(12)
+    for t in ("Assist1", "Assist2", "Scrub", "Cir"):
+        lbl = QtWidgets.QLabel(t);
+        f = lbl.font();
+        f.setPointSize(max(9, f.pointSize() - 2));
+        lbl.setFont(f)
+        rowLbl.addWidget(lbl)
+    lay.addLayout(rowLbl)
+    rowCb = QtWidgets.QHBoxLayout();
+    rowCb.setSpacing(12)
+    roles = ["Assistant", "Assistant2", "Scrub", "Circulate"]
+    self._team_assignments = getattr(self, "_team_assignments", {})
+    self._team_assignments.setdefault(hn, {r: "" for r in roles})
+
+    def make_combo(role):
+        cb = QtWidgets.QComboBox()
+        cb.setEditable(True)
+        cb.addItems([""] + names)
+        cb.setFixedHeight(28);
+        cb.setMinimumWidth(120)
+        cb.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        cb.setFocusPolicy(QtCore.Qt.StrongFocus)
+        cb.setMinimumContentsLength(8)
+        cb.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        comp = QtWidgets.QCompleter(names);
+        comp.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        cb.setCompleter(comp)
+        saved = self._team_assignments.get(hn, {}).get(role) or ""
+        if saved: cb.setCurrentText(saved)
+
+        def on_activated(text):
+            self._team_assignments.setdefault(hn, {})[role] = text
+
+        cb.textActivated.connect(on_activated)
+        cb.popupAboutToBeShown.connect(lambda: setattr(self, '_freeze_autofit', True))
+
+        def _unfreeze():
+            setattr(self, '_freeze_autofit', False)
+            try:
+                self._autofit_schedule_columns()
+            except Exception:
+                pass
+
+        cb.activated.connect(lambda *_: _unfreeze())
+        return cb
+
+    for role in roles:
+        rowCb.addWidget(make_combo(role))
+    lay.addLayout(rowCb)
+    return wrap
+
+    def __init__(self, host, port, token):
+        super().__init__()
+        self.cli = SurgiBotClientHTTP(host, port, token)
+        self.model = LocalTableModel()
+        self.rows_cache = []
+        self.sched_reader = SharedScheduleReader()
+        self.ws: QWebSocket | None = None
+        self.ws_connected = False
+        self.tray = None
+        self._last_states = {}
+
+        # Monitor knowledge
+        self.monitor_ready = False
+        self._was_in_monitor: set[str] = set()
+        self._current_monitor_hn: set[str] = set()
+
+        self.setWindowTitle("SurgiBot Client — Modern (PySide6)")
+        self.resize(1440, 900)
+        self._build_ui()
+        self._load_settings()
+
+        # ---------- load persisted monitor state BEFORE first refresh ----------
+        self._load_persisted_monitor_state()
+
+        # หากมี last_rows ที่บันทึกไว้ แสดงทันทีเพื่อให้ภาพเดิมกลับมาโดยไม่ต้องรอ server
+        if self.rows_cache:
+            self.monitor_ready = True
+            self._rebuild(self.rows_cache)  # ใช้ cache ที่โหลดขึ้นมา
+
+        # Barcode
+        self.scan_enabled = True;
+        self._scan_buf = "";
+        self._scan_timeout_ms = 120
+        self._scan_timer = QtCore.QTimer(self);
+        self._scan_timer.setSingleShot(True);
+        self._scan_timer.timeout.connect(self._finalize_scan_if_any)
+        self.installEventFilter(self)
+
+        self._ensure_tray()
+        self._refresh(prefer_server=True)
+
+        self._tick = QtCore.QTimer(self);
+        self._tick.timeout.connect(lambda: self._rebuild(self.rows_cache));
+        self._tick.start(1000)
+        self._pull = QtCore.QTimer(self);
+        self._pull.timeout.connect(lambda: self._refresh(True));
+        self._pull.start(2000)
+        self._sched_timer = QtCore.QTimer(self);
+        self._sched_timer.timeout.connect(self._check_schedule_seq);
+        self._sched_timer.start(1000)
+        self._start_websocket()
+
+    def _capture_or_expand_state(self):
+        """ดึงสถานะ expanded ของหัว OR ปัจจุบันเก็บไว้ใน dict"""
+        try:
+            st = {}
+            topc = self.tree_sched.topLevelItemCount()
+            for i in range(topc):
+                it = self.tree_sched.topLevelItem(i)
+                key = (it.text(0) or "").strip()
+                if key:
+                    st[key] = it.isExpanded()
+            self._or_expand_state = st
+        except Exception:
+            pass
+
+    def _apply_or_expand_state(self, item: QtWidgets.QTreeWidgetItem):
+        """คืนค่า expanded ของหัว OR ถ้ามีบันทึกไว้"""
+        key = (item.text(0) or "").strip()
+        expanded = self._or_expand_state.get(key, True)  # ดีฟอลต์ให้ 'ขยาย'
+        item.setExpanded(bool(expanded))
+
+    def _or_card_widget(self, title: str, accent: str) -> QtWidgets.QWidget:
+        w = QtWidgets.QFrame()
+        w.setObjectName("OrCard")
+
+        c = QtGui.QColor(accent)
+        dark = c.darker(130).name()
+        mid = c.name()
+        bar = c.lighter(110).name()
+
+        w.setStyleSheet(f"""
+        QFrame#OrCard {{
+            background: qlineargradient(x1:0,y1:0, x2:0,y2:1, stop:0 {dark}, stop:1 {mid});
+            border-radius: 12px;
+            border: 1px solid rgba(255,255,255,0.20);
+        }}
+        QLabel[role="or-title"] {{ color:#fff; font-weight:900; font-size:15px; }}
+        QLabel[role="or-sub"]   {{ color:rgba(255,255,255,0.90); font-weight:600; font-size:11px; }}
+        """)
+
+        # สำคัญ: ให้การ์ดยืดเต็มช่องของ item ที่ span ทั้งแถว
+        w.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        w.setMinimumHeight(44)  # สูงขึ้นเล็กน้อยให้ตัวหนังสือหายไม่ถูกตัด
+
+        lay = QtWidgets.QHBoxLayout(w)
+        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setSpacing(10)
+
+        barf = QtWidgets.QFrame()
+        barf.setFixedWidth(6)
+        barf.setStyleSheet(f"background:{bar}; border-radius:3px;")
+        lay.addWidget(barf, 0, QtCore.Qt.AlignVCenter)
+
+        box = QtWidgets.QVBoxLayout()
+        box.setSpacing(0)
+
+        lbl = QtWidgets.QLabel(title)
+        lbl.setProperty("role", "or-title")
+        lbl.setWordWrap(False)
+        lbl.setMinimumWidth(140)  # กันถูกตัด (เพิ่มได้ตามต้องการ)
+        lbl.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+
+        sub = QtWidgets.QLabel("ห้องผ่าตัด")
+        sub.setProperty("role", "or-sub")
+        sub.setWordWrap(False)
+        sub.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+
+        box.addWidget(lbl)
+        box.addWidget(sub)
+        lay.addLayout(box, 1)
+
+        shadow = QtWidgets.QGraphicsDropShadowEffect(w)
+        shadow.setBlurRadius(24);
+        shadow.setXOffset(0);
+        shadow.setYOffset(8)
+        shadow.setColor(QtGui.QColor(15, 23, 42, 48))
+        w.setGraphicsEffect(shadow)
+        return w
+
+    # ในคลาส Main
+    def _style_or_group_header(self, item: QtWidgets.QTreeWidgetItem, bg_hex: str = "#eef2ff"):
+        """
+        สไตล์หัวกลุ่ม OR ให้เห็นชัด แต่ไม่ selectable
+        - keep ENABLED เพื่อไม่โดน tone จาง
+        - ใช้พื้นอ่อนไล่ไปทาง indigo (#eef2ff) และตัวอักษรเข้ม
+        """
+        try:
+            cols = self.tree_sched.columnCount()
+
+            # ให้ยัง Enabled แต่ไม่ Selectable
+            item.setFlags((item.flags() | QtCore.Qt.ItemIsEnabled) & ~QtCore.Qt.ItemIsSelectable)
+
+            f = self.tree_sched.font()
+            f.setBold(True)
+            f.setPointSize(f.pointSize() + 1)
+
+            fg = QtGui.QBrush(QtGui.QColor("#1e293b"))  # ตัวอักษรเข้ม
+            bg = QtGui.QBrush(QtGui.QColor(bg_hex))  # พื้นอ่อนดูเป็นแถบหัวกลุ่ม
+
+            for c in range(cols):
+                item.setFont(c, f)
+                item.setForeground(c, fg)
+                item.setBackground(c, bg)
+
+            # สูงขึ้นเล็กน้อย
+            item.setSizeHint(0, QtCore.QSize(item.sizeHint(0).width(), 34))
+        except Exception:
+            pass
+
+    # ------ Header pulse helpers ------
+    def _ensure_sched_pulser(self):
+        if hasattr(self, "_sched_pulser"): return
+        self._sched_pulser = {"items": [], "phase": 0}
+        self._sched_timer2 = QtCore.QTimer(self)
+        self._sched_timer2.timeout.connect(self._tick_sched_pulse)
+        self._sched_timer2.start(60)
+
+    def _clear_sched_pulser(self):
+        if hasattr(self, "_sched_pulser"):
+            self._sched_pulser["items"].clear()
+
+    def _register_or_header_for_pulse(self, item: QtWidgets.QTreeWidgetItem, color_hex: str):
+        self._ensure_sched_pulser()
+        base = QtGui.QColor(color_hex)
+        f = self.tree_sched.font();
+        f.setBold(True);
+        item.setFont(0, f)
+        item.setForeground(0, QtGui.QBrush(base.darker(140)))
+        self._sched_pulser["items"].append((item, base))
+
+    def _tick_sched_pulse(self):
+        if not hasattr(self, "_sched_pulser"): return
+        import math
+        self._sched_pulser["phase"] = (self._sched_pulser["phase"] + 1) % 120
+        k = (1.0 + math.sin(self._sched_pulser["phase"] / 120.0 * 2.0 * math.pi)) * 0.5
+
+        alive_items = []
+        for item, base in list(self._sched_pulser["items"]):
+            try:
+                _ = item.text(0)
+            except RuntimeError:
+                continue
+            if item.treeWidget() is None:
+                continue
+            bg = QtGui.QColor(base);
+            bg.setAlpha(int(40 + k * 80))
+            brush = QtGui.QBrush(bg)
+            try:
+                for c in range(self.tree_sched.columnCount()):
+                    item.setBackground(c, brush)
+                alive_items.append((item, base))
+            except RuntimeError:
+                continue
+        self._sched_pulser["items"] = alive_items
+        self.tree_sched.viewport().update()
+
+    # ----------- Monitor helpers -----------
+    def _extract_hn_from_row(self, r: dict) -> str:
+        hn = str(r.get("hn_full") or "").strip()
+        if hn and hn.isdigit() and len(hn) == 9:
+            return hn
+        _id = str(r.get("id") or "").strip()
+        if _id.isdigit() and len(_id) == 9:
+            return _id
+        return ""
+
+    def _is_hn_in_monitor(self, hn: str) -> bool:
+        if not hn: return False
+        return hn in self._current_monitor_hn
+
+    def _should_auto_purge(self, row: dict) -> bool:
+        """ฝั่งไคลเอนต์ลบเองเมื่อสถานะอยู่ใน AUTO_PURGE_STATUSES และเกินเวลาที่กำหนด"""
+        st = str(row.get("status") or "")
+        if st not in AUTO_PURGE_STATUSES:
+            return False
+        ts = _parse_iso(row.get("timestamp"))
+        if not ts:
+            return False
+        return (datetime.now() - ts) >= timedelta(minutes=AUTO_PURGE_MINUTES)
+
+    # ----------- UI reactions -----------
+    def _on_sched_item_clicked_from_selection(self):
+        it = self.tree_sched.currentItem()
+        if it is not None:
+            self._on_sched_item_clicked(it, 0)
+
+    def _on_sched_item_clicked(self, item: QtWidgets.QTreeWidgetItem, column: int):
+        try:
+            if item is None or item.parent() is None:
+                return
+            if not (item.flags() & QtCore.Qt.ItemIsEnabled):
+                return
+
+            hn = (item.text(1) or "").strip()
+            if hn and hn.isdigit() and len(hn) == 9: self.ent_hn.setText(hn)
+
+            or_room = (item.parent().text(0) or "").strip()
+            if or_room:
+                i = self.cb_or.findText(or_room)
+                if i >= 0: self.cb_or.setCurrentIndex(i)
+
+            q_raw = (item.text(8) or "").strip()
+            if q_raw:
+                q_label = q_raw if q_raw.startswith("0-") else f"0-{q_raw}"
+                qi = self.cb_q.findText(q_label)
+                if qi >= 0: self.cb_q.setCurrentIndex(qi)
+
+            if self._is_hn_in_monitor(hn):
+                self.rb_edit.setChecked(True)
+            else:
+                self.rb_add.setChecked(True)
+
+            self._update_action_styles()
+            self.cb_status.setFocus()
+        except Exception:
+            pass
+
+    def _make_form_label(self, text: str) -> QtWidgets.QLabel:
+        lbl = QtWidgets.QLabel(text)
+        lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        lbl.setStyleSheet("padding-right: 10px; color:#0f172a;")
+        return lbl
+
+    def _autofit_schedule_columns(self):
+        if getattr(self, '_freeze_autofit', False):
+            return
+        hdr = self.tree_sched.header()
+        hdr.setStretchLastSection(False)
+        for c in range(self.tree_sched.columnCount()):
+            if hdr.sectionResizeMode(c) == QtWidgets.QHeaderView.ResizeToContents:
+                self.tree_sched.resizeColumnToContents(c)
+        self.tree_sched.doItemsLayout()
+
+    def _build_ui(self):
+        root = QtWidgets.QVBoxLayout(self)
+        self.setStyleSheet("""
+            QWidget { font-family:'Segoe UI','Inter','Noto Sans',system-ui; font-size:12pt; color:#0f172a; }
+            QComboBox, QLineEdit { padding:5px 8px; border-radius:8px; border:1px solid #e5e7eb; background:#f8fafc; min-height:32px; }
+            QHeaderView::section { background:#f1f5f9; border:none; padding:6px; font-weight:700; color:#0f172a; }
+            QTableWidget { background:white; border:1px solid #e6e6ef; border-radius:12px; gridline-color:#e6e6ef; selection-background-color:#e0f2fe; }
+            QTableView::item { height:34px; } QTreeView::item { height:34px; }
+        """)
+
+        # Banner
+        self.banner = HeroBanner()
+        here = Path(__file__).resolve().parent;
+        lp = here / "MascotAlert.png"
+        if lp.exists(): self.banner.setLogo(lp, size=34, radius=8)
+        chipWrap = QtWidgets.QHBoxLayout();
+        chipWrap.setSpacing(6)
+        holder = QtWidgets.QWidget();
+        holder.setLayout(chipWrap)
+        self.status_chip = QtWidgets.QLabel("● Offline")
+        self.status_chip.setStyleSheet(
+            "color:#ef4444;font-weight:800;padding:4px 8px;background:#fff;border:1px solid #e5e7eb;border-radius:999px;")
+        self.btn_reconnect = ShadowButton("🔌 Reconnect", "#64748b");
+        self.btn_reconnect.clicked.connect(self._on_reconnect_clicked)
+        chipWrap.addWidget(self.status_chip);
+        chipWrap.addWidget(self.btn_reconnect)
+        self.banner.setRight(holder)
+        root.addWidget(self.banner)
+
+        # Splitter
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal);
+        self.splitter.setHandleWidth(6);
+        self.splitter.setChildrenCollapsible(True)
+
+        # Left
+        leftPane = QtWidgets.QWidget();
+        leftPane.setMinimumWidth(120);
+        leftPane.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Expanding)
+        leftBox = QtWidgets.QVBoxLayout(leftPane);
+        leftBox.setContentsMargins(6, 6, 6, 6);
+        leftBox.setSpacing(6)
+
+        # Server card
+        server = Card("Server");
+        leftBox.addWidget(server)
+        form = QFormLayout();
+        form.setLabelAlignment(QtCore.Qt.AlignLeft);
+        form.setFormAlignment(QtCore.Qt.AlignLeft)
+        form.setHorizontalSpacing(6);
+        form.setVerticalSpacing(6)
+        w_host = QtWidgets.QWidget();
+        hl = QtWidgets.QHBoxLayout(w_host);
+        hl.setContentsMargins(0, 0, 0, 0);
+        hl.setSpacing(4)
+        self.ent_host = QtWidgets.QLineEdit(DEFAULT_HOST);
+        self.ent_host.setEchoMode(QtWidgets.QLineEdit.Password);
+        self.ent_host.setFixedHeight(32)
+        self.ent_host.setMaximumWidth(120)
+        self.btn_eye_host = ShadowButton("👁️", "#64748b");
+        self.btn_eye_host.setMinimumWidth(28);
+        self.btn_eye_host.clicked.connect(self._toggle_host)
+        hl.addWidget(self.ent_host);
+        hl.addWidget(self.btn_eye_host)
+
+        w_port = QtWidgets.QLineEdit(str(DEFAULT_PORT));
+        w_port.setFixedHeight(32);
+        w_port.setMaximumWidth(90);
+        self.ent_port = w_port
+        w_token = QtWidgets.QWidget();
+        tl = QtWidgets.QHBoxLayout(w_token);
+        tl.setContentsMargins(0, 0, 0, 0);
+        tl.setSpacing(4)
+        self.ent_token = QtWidgets.QLineEdit(DEFAULT_TOKEN);
+        self.ent_token.setEchoMode(QtWidgets.QLineEdit.Password);
+        self.ent_token.setFixedHeight(32);
+        self.ent_token.setMaximumWidth(200)
+        self.btn_eye = ShadowButton("👁️", "#64748b");
+        self.btn_eye.setMinimumWidth(28);
+        self.btn_eye.clicked.connect(self._toggle_token)
+        tl.addWidget(self.ent_token);
+        tl.addWidget(self.btn_eye)
+
+        form.addRow("Host", w_host)
+        form.addRow("Port", self.ent_port)
+        form.addRow("Token", w_token)
+        self.btn_health = ShadowButton("🩺 Health", "#3b82f6");
+        self.btn_health.clicked.connect(self._on_health)
+        form.addRow("", self.btn_health)
+        server.grid().addLayout(form, 0, 0, 1, 1)
+
+        # Identify
+        card_ident = GlassCard("1. Identify Patient", "สแกนหรือกรอก HN • ใช้ Patient ID ได้", "🩺")
+        g1 = card_ident.grid
+        self.ent_hn = QtWidgets.QLineEdit();
+        self.ent_hn.setPlaceholderText("เช่น 590166994");
+        self.ent_hn.setMaxLength(9)
+        self.ent_hn.setValidator(QtGui.QIntValidator(0, 999999999, self));
+        self.ent_hn.setFixedHeight(32);
+        self.ent_hn.setMaximumWidth(200)
+        self.ent_pid = QtWidgets.QLineEdit();
+        self.ent_pid.setFixedHeight(32);
+        self.ent_pid.setMaximumWidth(220)
+        g1.addWidget(QtWidgets.QLabel("HN (9 หลัก)"), 0, 0);
+        g1.addWidget(self.ent_hn, 0, 1)
+        g1.addWidget(QtWidgets.QLabel("Patient ID (ถ้ามี)"), 1, 0);
+        g1.addWidget(self.ent_pid, 1, 1)
+        scanRow = QtWidgets.QHBoxLayout();
+        self.chk_scan = QtWidgets.QCheckBox("โหมดสแกนบาร์โค้ด HN");
+        self.chk_scan.setChecked(True)
+        self.chk_scan.stateChanged.connect(lambda s: setattr(self, "scan_enabled", bool(s)))
+        self.lbl_scan_state = QtWidgets.QLabel("Scanner: Ready");
+        self.lbl_scan_state.setStyleSheet("color:#16a34a;font-weight:600;")
+        scanRow.addWidget(self.chk_scan, 0);
+        scanRow.addStretch(1);
+        scanRow.addWidget(self.lbl_scan_state, 0, QtCore.Qt.AlignRight)
+        g1.addLayout(scanRow, 2, 0, 1, 2)
+        leftBox.addWidget(card_ident)
+
+        # Assign Room
+        card_or = GlassCard("2. Assign Room", "กำหนด OR และ Queue", "🏥")
+        g2 = card_or.grid
+        self.cb_or = QtWidgets.QComboBox();
+        self.cb_or.addItems(OR_CHOICES);
+        self.cb_or.setFixedWidth(110);
+        self.cb_or.setFixedHeight(32)
+        self.cb_q = QtWidgets.QComboBox();
+        self.cb_q.addItems(QUEUE_CHOICES);
+        self.cb_q.setFixedWidth(110);
+        self.cb_q.setFixedHeight(32)
+        g2.addWidget(QtWidgets.QLabel("OR"), 0, 0);
+        g2.addWidget(self.cb_or, 0, 1)
+        g2.addWidget(QtWidgets.QLabel("Queue"), 1, 0);
+        g2.addWidget(self.cb_q, 1, 1)
+        leftBox.addWidget(card_or)
+
+        # Status & Timing
+        card_stat = GlassCard("3. Status & Timing", "สถานะการผ่าตัดและเวลาโดยประมาณ", "⏱️")
+        g3 = card_stat.grid
+        self.cb_status = QtWidgets.QComboBox();
+        self.cb_status.addItems(STATUS_CHOICES);
+        self.cb_status.setFixedWidth(200);
+        self.cb_status.setFixedHeight(32)
+        self.ent_eta = QtWidgets.QLineEdit();
+        self.ent_eta.setPlaceholderText("เช่น 90");
+        self.ent_eta.setFixedWidth(100);
+        self.ent_eta.setFixedHeight(32)
+        self.lbl_eta = QtWidgets.QLabel("เวลาโดยประมาณในการผ่าตัด (นาที)")
+        g3.addWidget(QtWidgets.QLabel("Status"), 0, 0);
+        g3.addWidget(self.cb_status, 0, 1)
+        g3.addWidget(self.lbl_eta, 1, 0);
+        g3.addWidget(self.ent_eta, 1, 1)
+        self.cb_status.currentTextChanged.connect(self._toggle_eta_visibility);
+        self._toggle_eta_visibility()
+        try:
+            self.cb_status.currentTextChanged.connect(self._on_status_changed_for_timer)
+        except Exception as _e:
+            print('[WARN] cannot connect status timer:', _e)
+        try:
+            self.cb_status.currentTextChanged.connect(self._on_status_changed_for_timer)
+        except Exception as _e:
+            print('[WARN] cannot connect status timer:', _e)
+        leftBox.addWidget(card_stat)
+
+        # Action
+        action = Card("Action");
+        leftBox.addWidget(action)
+        wrap = QtWidgets.QFrame();
+        hl2 = QtWidgets.QHBoxLayout(wrap);
+        hl2.setContentsMargins(0, 0, 0, 0);
+        hl2.setSpacing(0)
+
+        def mk_btn(text, corner):
+            btn = QtWidgets.QPushButton(text);
+            btn.setCheckable(True)
+            btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+            radius = {"left": "border-top-left-radius:8px;border-bottom-left-radius:8px;",
+                      "mid": "border-radius:0;",
+                      "right": "border-top-right-radius:8px;border-bottom-right-radius:8px;"}[corner]
+            btn.setMinimumHeight(32)
+            btn.setStyleSheet(
+                f"QPushButton{{padding:6px 10px;border:1px solid #e5e7eb;background:#f8fafc;color:#0f172a;font-weight:700;{radius}}}"
+                f"QPushButton:hover{{background:#eef2f7;}}"
+            )
+            return btn
+
+        self.rb_add = mk_btn("➕ เพิ่ม", "left")
+        self.rb_edit = mk_btn("✏️ แก้ไข", "mid")
+        self.rb_del = mk_btn("🗑️ ลบ", "right")
+        for b in (self.rb_add, self.rb_edit, self.rb_del): hl2.addWidget(b)
+        self.action_group = QtWidgets.QButtonGroup(self);
+        self.action_group.setExclusive(True)
+        for b in (self.rb_add, self.rb_edit, self.rb_del): self.action_group.addButton(b)
+        self.rb_add.setChecked(True)
+        for b in (self.rb_add, self.rb_edit, self.rb_del): b.toggled.connect(self._update_action_styles)
+        self.btn_send = ShadowButton("🚀 ส่งคำสั่ง", "#10b981");
+        self.btn_send.setMinimumWidth(110);
+        self.btn_send.clicked.connect(self._on_send)
+        gridA = action.grid();
+        gridA.addWidget(wrap, 0, 0, 1, 2);
+        gridA.addWidget(self.btn_send, 0, 2)
+        QtCore.QTimer.singleShot(0, self._update_action_styles)
+
+        # Right
+        rightPane = QtWidgets.QWidget();
+        rightPane.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        rightBox = QtWidgets.QVBoxLayout(rightPane);
+        rightBox.setContentsMargins(6, 6, 6, 6);
+        rightBox.setSpacing(6)
+        self.rightSplit = QtWidgets.QSplitter(QtCore.Qt.Vertical);
+        self.rightSplit.setHandleWidth(6)
+
+        # --- Schedule (10 cols) ---
+        self.card_sched = ElevatedCard(
+            "Result Schedule (Private) — จาก Registry",
+            icon="🗂", accent="#0ea5e9", bg="#ffffff", header_bg=_rgba("#0ea5e9", 0.12)
+        )
+        gs = self.card_sched.grid();
+        gs.setContentsMargins(0, 0, 0, 0)
+
+        # สร้าง tree_sched
+        self.tree_sched = QtWidgets.QTreeWidget()
+        self.tree_sched.setColumnCount(12)
+        self.tree_sched.setHeaderLabels(
+            ["OR/เวลา", "HN", "ชื่อ-สกุล", "อายุ", "Diagnosis", "Operation", "แพทย์", "Ward", "Team Scrub",
+             "Start-End Time", "คิว", "สถานะ"])
+        self.tree_sched.setWordWrap(False);
+        self.tree_sched.setUniformRowHeights(True)
+        hdr = self.tree_sched.header()
+        hdr.setStretchLastSection(False)
+
+        # คอลัมน์ 0 (หัว OR/เวลา) ให้ Stretch เพื่อให้การ์ดหัว OR กินเต็มความกว้าง
+        hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+
+        # คอลัมน์ 4,5 (Diagnosis, Operation) ให้ Stretch ด้วย — ที่เหลือเอาแบบพอดีเนื้อหา
+        for i in range(1, 10):
+            mode = QtWidgets.QHeaderView.Stretch if i in (4, 5) else QtWidgets.QHeaderView.ResizeToContents
+            hdr.setSectionResizeMode(i, mode)
+
+        # เลื่อนแนวนอนแบบนุ่ม ๆ เมื่อข้อความยาว
+        self.tree_sched.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self.tree_sched.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+
+        # >>> เพิ่ม 3 บรรทัดนี้
+        self.tree_sched.setObjectName("ScheduleTree")
+        self.tree_sched.setAlternatingRowColors(True)
+        self.tree_sched.setStyleSheet("""
+        QTreeWidget#ScheduleTree {
+            background:#ffffff;
+            border:1px solid #e6e6ef;
+            border-radius:12px;
+            gridline-color:#e6e6ef;
+        }
+
+        /* หัวคอลัมน์ (สีสวย ๆ + เส้นแบ่งคอลัมน์) */
+        QTreeWidget#ScheduleTree QHeaderView::section {
+            background: qlineargradient(x1:0,y1:0, x2:0,y2:1, stop:0 #1e3a8a, stop:1 #1e40af);
+            color:#ffffff;
+            font-weight:800;
+            padding:8px 10px;
+            border-top:0px;
+            border-bottom:2px solid #0b153f;   /* ขีดเข้มใต้หัว */
+            border-left:1px solid rgba(255,255,255,0.25);  /* เส้นแบ่งคอลัมน์ในหัว */
+        }
+
+        /* มนหัวมุมซ้าย/ขวานิดหน่อย (ไม่บังคับ) */
+        QTreeWidget#ScheduleTree QHeaderView::section:first {
+            border-top-left-radius:8px;
+        }
+        QTreeWidget#ScheduleTree QHeaderView::section:last {
+            border-top-right-radius:8px;
+        }
+
+        /* เส้นแบ่งคอลัมน์และแถวในบอดี้ */
+        QTreeWidget#ScheduleTree::item {
+            padding:6px 8px;
+            border-bottom:1px solid #e9edf3;      /* เส้นคั่นแนวนอน */
+        }
+        QTreeWidget#ScheduleTree::item:selected {
+            background:#e0f2fe;
+            color:#0f172a;
+        }
+        """)
+        # ปรับให้แถวสูงตามเนื้อหา + ตัดบรรทัดอัตโนมัติ
+        self.tree_sched.setUniformRowHeights(False)
+        self.tree_sched.setWordWrap(True)
+
+        hdr = self.tree_sched.header()
+        m = QtWidgets.QHeaderView
+        hdr.setStretchLastSection(False)
+
+        # 0=เวลา, 1=HN, 2=ชื่อ, 3=อายุ, 4=Diagnosis, 5=Operation, 6=แพทย์, 7=Ward, 8=คิว, 9=สถานะ
+        hdr.setSectionResizeMode(0, m.ResizeToContents)
+        hdr.setSectionResizeMode(1, m.ResizeToContents)
+        hdr.setSectionResizeMode(2, m.Stretch)
+        hdr.setSectionResizeMode(3, m.ResizeToContents)
+        hdr.setSectionResizeMode(4, m.Stretch)
+        hdr.setSectionResizeMode(5, m.Stretch)
+        hdr.setSectionResizeMode(6, m.Stretch)
+        hdr.setSectionResizeMode(7, m.Stretch)
+        hdr.setSectionResizeMode(8, m.ResizeToContents)
+        hdr.setSectionResizeMode(9, m.ResizeToContents)
+
+        # ใช้ delegate ใหม่ (wrap + watermark)
+        self.tree_sched.setItemDelegate(ScheduleDelegate(self.tree_sched))
+        # ใส่ Tree ลงการ์ด
+        gs.addWidget(self.tree_sched, 0, 0, 1, 1)
+
+        # >>> ใส่ connect ตรงนี้เท่านั้น <<<
+        self.tree_sched.itemClicked.connect(self._on_sched_item_clicked)
+        self.tree_sched.itemSelectionChanged.connect(self._on_sched_item_clicked_from_selection)
+        # เพิ่มความสูงขั้นต่ำของ item เล็กน้อย (กันฟอนต์ชนขอบ)
+        self.tree_sched.setStyleSheet(self.tree_sched.styleSheet() + "\nQTreeView::item{ min-height: 34px; }")
+
+        # Monitor
+        self.card_table = ElevatedCard(
+            "Result (Monitor) — จากเซิร์ฟเวอร์",
+            icon="📺", accent="#8b5cf6", bg="#ffffff", header_bg=_rgba("#8b5cf6", 0.12)
+        )
+        gt = self.card_table.grid();
+        gt.setContentsMargins(0, 0, 0, 0)
+        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table.setWordWrap(False);
+        self.table.setItemDelegate(ElideDelegate(QtCore.Qt.ElideRight, self.table))
+        self.table.setHorizontalHeaderLabels(
+            ["ID", "รหัสผู้ป่วย (Patient ID)", "สถานะ (Status)", "เวลา (Elapsed / เวลาคาดเสร็จ)"])
+        hdr = self.table.horizontalHeader();
+        hdr.setStretchLastSection(True);
+        hdr.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        for col, mode in [(0, QtWidgets.QHeaderView.ResizeToContents), (1, QtWidgets.QHeaderView.Stretch),
+                          (2, QtWidgets.QHeaderView.ResizeToContents), (3, QtWidgets.QHeaderView.ResizeToContents)]:
+            hdr.setSectionResizeMode(col, mode)
+        self.table.verticalHeader().setDefaultSectionSize(34)
+        gt.addWidget(self.table, 1, 0, 1, 1)
+        self.table.itemSelectionChanged.connect(self._on_table_select)
+
+        self.rightSplit.addWidget(self.card_sched);
+        self.rightSplit.addWidget(self.card_table)
+        self.rightSplit.setStretchFactor(0, 1);
+        self.rightSplit.setStretchFactor(1, 2)
+        rightBox.addWidget(self.rightSplit, 1)
+
+        # Put into splitter
+        self.splitter.addWidget(leftPane);
+        self.splitter.addWidget(rightPane)
+        self.splitter.setStretchFactor(0, 0);
+        self.splitter.setStretchFactor(1, 1)
+        total = max(self.width(), 1280)
+        self.splitter.setSizes([int(total * 0.30), int(total * 0.84)])
+        self.rightSplit.setSizes([int(total * 0.38), int(total * 0.30)])
+        root.addWidget(self.splitter, 1)
+
+        # Shortcuts
+        QShortcut(QKeySequence("Alt+S"), self, self._on_send)
+        QShortcut(QKeySequence("Alt+H"), self, self._on_health)
+        QShortcut(QKeySequence("Alt+R"), self, lambda: self._refresh(True))
+        self._render_schedule_tree()
+
+    # ---------- Helper styles ----------
+    def _update_action_styles(self):
+        pal = {self.rb_add: "#10b981", self.rb_edit: "#3b82f6", self.rb_del: "#f43f5e"}
+        for btn, color in pal.items():
+            radius = btn.property("cornerCSS") or ""
+            btn.setStyleSheet(
+                f"QPushButton{{padding:6px 12px;border:1px solid "
+                f"{color if btn.isChecked() else '#e5e7eb'};"
+                f"background:{color if btn.isChecked() else '#f8fafc'};"
+                f"color:{'#fff' if btn.isChecked() else '#0f172a'};font-weight:800;{radius}}}"
+                f"QPushButton:hover{{background:{color if btn.isChecked() else '#eef2f7'};}}"
+            )
+
+    # ---------- Settings ----------
+    def _load_settings(self):
+        s = QSettings("ORNBH", "SurgiBotClient")
+        self.ent_host.setText(s.value("host", self.ent_host.text()))
+        self.ent_port.setText(s.value("port", self.ent_port.text()))
+        self.ent_token.setText(s.value("token", self.ent_token.text()))
+        if g := s.value("geometry"):
+            try:
+                self.restoreGeometry(g)
+            except Exception:
+                pass
+        if st := s.value("splitter_state"):
+            try:
+                self.splitter.restoreState(st)
+                QtCore.QTimer.singleShot(0, self._enforce_split)
+            except Exception:
+                pass
+
+    def _enforce_split(self):
+        total = max(self.width(), 1200)
+        sizes = self.splitter.sizes()
+        if len(sizes) == 2 and sizes[0] > int(total * 0.35):
+            self.splitter.setSizes([int(total * 0.16), int(total * 0.84)])
+
+    def _save_settings(self):
+        s = QSettings("ORNBH", "SurgiBotClient")
+        s.setValue("host", self.ent_host.text());
+        s.setValue("port", self.ent_port.text())
+        s.setValue("token", self.ent_token.text());
+        s.setValue("geometry", self.saveGeometry())
+        try:
+            s.setValue("splitter_state", self.splitter.saveState())
+        except Exception:
+            pass
+
+    # ---------- Persist monitor state ----------
+    def _save_persisted_monitor_state(self, rows: List[dict]):
+        try:
+            s = QSettings(PERSIST_ORG, PERSIST_APP)
+            s.setValue(KEY_LAST_ROWS, json.dumps(rows, ensure_ascii=False))
+            s.setValue(KEY_WAS_IN_MONITOR, json.dumps(sorted(list(self._was_in_monitor))))
+            s.setValue(KEY_CURRENT_MONITOR, json.dumps(sorted(list(self._current_monitor_hn))))
+        except Exception:
+            pass
+
+    def _load_persisted_monitor_state(self):
+        """โหลด state ที่เคยบันทึกไว้เพื่อให้โปรแกรมกลับมาเหมือนเดิมทันทีหลังเปิดใหม่"""
+        try:
+            s = QSettings(PERSIST_ORG, PERSIST_APP)
+            last_rows_json = s.value(KEY_LAST_ROWS, "")
+            was_json = s.value(KEY_WAS_IN_MONITOR, "")
+            cur_json = s.value(KEY_CURRENT_MONITOR, "")
+
+            if isinstance(last_rows_json, bytes): last_rows_json = last_rows_json.decode("utf-8", "ignore")
+            if isinstance(was_json, bytes): was_json = was_json.decode("utf-8", "ignore")
+            if isinstance(cur_json, bytes): cur_json = cur_json.decode("utf-8", "ignore")
+
+            if last_rows_json:
+                try:
+                    rows = json.loads(last_rows_json)
+                    if isinstance(rows, list):
+                        self.rows_cache = rows[:]  # ใช้เป็น cache เริ่มต้น
+                except Exception:
+                    pass
+
+            if was_json:
+                try:
+                    arr = json.loads(was_json)
+                    if isinstance(arr, list):
+                        self._was_in_monitor = set(str(x) for x in arr if isinstance(x, (str, int)))
+                except Exception:
+                    pass
+
+            if cur_json:
+                try:
+                    arr = json.loads(cur_json)
+                    if isinstance(arr, list):
+                        self._current_monitor_hn = set(str(x) for x in arr if isinstance(x, (str, int)))
+                except Exception:
+                    pass
+
+        finally:
+            # ให้แน่ใจว่าตาราง schedule จะอัปเดตการขีด/ปุ่ม "ผ่าตัดเสร็จแล้ว" ตาม state ที่โหลดมา
+            self.monitor_ready = True
+            self._render_schedule_tree()
+            self._update_schedule_completion_markers()
+
+    def closeEvent(self, e):
+        # เซฟ UI + เซฟ monitor state (rows ล่าสุด + ชุด HN)
+        self._save_settings()
+        self._save_persisted_monitor_state(self.rows_cache)
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+        super().closeEvent(e)
+
+    def resizeEvent(self, e: QtGui.QResizeEvent):
+        try:
+            if e.size().width() >= 1100 and self.splitter.orientation() != QtCore.Qt.Horizontal:
+                self.splitter.setOrientation(QtCore.Qt.Horizontal)
+        except Exception:
+            pass
+        return super().resizeEvent(e)
+
+    # ---------- Small helpers ----------
+    def _toggle_eta_visibility(self):
+        is_op = (self.cb_status.currentText() == "กำลังผ่าตัด")
+        self.lbl_eta.setVisible(is_op);
+        self.ent_eta.setVisible(is_op);
+        self.ent_eta.setEnabled(is_op)
+        if not is_op: self.ent_eta.clear()
+
+    def _reset_form(self):
+        self.ent_hn.clear();
+        self.ent_pid.clear();
+        self.ent_eta.clear()
+        self.cb_status.setCurrentIndex(0);
+        self.cb_q.setCurrentIndex(0)
+        self._toggle_eta_visibility();
+        self.ent_hn.setFocus()
+        self.lbl_scan_state.setText("Scanner: Ready");
+        self.lbl_scan_state.setStyleSheet("color:#16a34a;font-weight:600;")
+
+    def _toggle_secret(self, line: QtWidgets.QLineEdit, btn: QtWidgets.QPushButton):
+        echo = line.echoMode()
+        line.setEchoMode(
+            QtWidgets.QLineEdit.Normal if echo == QtWidgets.QLineEdit.Password else QtWidgets.QLineEdit.Password)
+        btn.setText("🙈" if line.echoMode() == QtWidgets.QLineEdit.Normal else "👁️")
+
+    def _toggle_host(self):
+        self._toggle_secret(self.ent_host, self.btn_eye_host)
+
+    def _toggle_token(self):
+        self._toggle_secret(self.ent_token, self.btn_eye)
+
+    def _set_chip(self, ok: bool):
+        self.status_chip.setText("● Online" if ok else "● Offline")
+        self.status_chip.setStyleSheet(
+            f"color:{'#10b981' if ok else '#ef4444'};font-weight:800;padding:4px 8px;background:#fff;border:1px solid #e5e7eb;border-radius:999px;"
+        )
+
+    def _client(self):
+        try:
+            h = self.ent_host.text().strip() or DEFAULT_HOST
+            p = int(self.ent_port.text()) if self.ent_port.text().strip() else DEFAULT_PORT
+            t = self.ent_token.text().strip() or DEFAULT_TOKEN
+            return SurgiBotClientHTTP(h, p, t)
+        except Exception:
+            return self.cli
+
+    def _on_health(self):
+        try:
+            _ = self._client().health();
+            self._set_chip(True);
+            QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "Health OK")
+        except requests.exceptions.RequestException:
+            self._set_chip(False);
+            QtWidgets.QMessageBox.warning(self, "เชื่อมต่อไม่ได้",
+                                          "กรุณา check IP Address ให้ตรงกับเครื่อง Server ด้วยครับ")
+
+    def _extract_rows(self, payload):
+        src = []
+        if isinstance(payload, list):
+            src = payload
+        elif isinstance(payload, dict):
+            for k in ("items", "data", "table", "rows", "list"):
+                if k in payload and isinstance(payload[k], list): src = payload[k]; break
+            else:
+                src = next((v for v in payload.values() if isinstance(v, list)), [])
+        rows = []
+        for i, it in enumerate(src, start=1):
+            if not isinstance(it, dict): continue
+            hn_full = str(it.get("hn_full") or it.get("hn") or "").strip()
+            pid = str(it.get("patient_id") or it.get("pid") or it.get("queue_id") or "").strip()
+            if not pid:
+                or_room = str(it.get("or") or it.get("or_room") or "").strip()
+                q = str(it.get("queue") or it.get("q") or "").strip()
+                if or_room and q: pid = f"{or_room}-{q}"
+            status = str(it.get("status") or "").strip()
+            idx = it.get("id") or i
+            ts = (it.get("timestamp") or it.get("ts") or it.get("updated_at") or it.get("created_at") or it.get("time"))
+            eta_any = it.get("eta_minutes", it.get("eta", it.get("eta_min")))
+            if isinstance(eta_any, str) and eta_any.isdigit():
+                eta_any = int(eta_any)
+            elif not isinstance(eta_any, int):
+                eta_any = None
+            rows.append({"id": hn_full if hn_full else idx, "hn_full": hn_full or None,
+                         "patient_id": pid, "status": status, "timestamp": ts, "eta_minutes": eta_any})
+        return rows
+
+    def _render_time_cell(self, row: dict) -> str:
+        status = row.get("status", "");
+        ts_iso = row.get("timestamp");
+        eta_min = row.get("eta_minutes");
+        ts = _parse_iso(ts_iso)
+        if status == "กำลังผ่าตัด" and ts:
+            now = datetime.now();
+            elapsed = now - ts;
+            base = _fmt_td(elapsed)
+            if eta_min is not None:
+                try:
+                    eta_dt = ts + timedelta(minutes=int(eta_min));
+                    remain = eta_dt - now
+                    return f"{base} / ETA {eta_min} นาที ({'เหลือ' if remain.total_seconds() >= 0 else 'เกินเวลา'} {_fmt_td(remain)})"
+                except Exception:
+                    return base
+            return base
+        if ts and status in ("กำลังพักฟื้น", "พักฟื้นครบแล้ว", "กำลังส่งกลับตึก", "เลื่อนการผ่าตัด"):
+            return _fmt_td(datetime.now() - ts)
+        return ""
+
+    def _ensure_tray(self):
+        if self.tray is None:
+            self.tray = QSystemTrayIcon(_load_app_icon(), self);
+            self.tray.setToolTip("SurgiBot Client");
+            self.tray.show()
+
+    def _rebuild(self, rows):
+        # 1) track state change for tray
+        new_map = {}
+        for r in rows:
+            pid, st = r.get("patient_id", ""), r.get("status", "")
+            if pid:
+                new_map[pid] = st
+                prev = self._last_states.get(pid)
+                if prev is not None and prev != st and self.tray:
+                    self.tray.showMessage("SurgiBot", f"{pid} → {st}", QSystemTrayIcon.Information, 3000)
+        self._last_states = new_map
+
+        # 2) auto-purge (client-side) + caches
+        self.rows_cache = rows if isinstance(rows, list) else []
+        self.monitor_ready = True
+
+        # เคยอยู่ในมอนิเตอร์: ใช้ "ข้อมูลทั้งหมด (รวมที่ purge)" เพื่อบันทึกว่าเคยโผล่มาแล้ว
+        for r in self.rows_cache:
+            hn_all = self._extract_hn_from_row(r)
+            if hn_all:
+                self._was_in_monitor.add(hn_all)
+
+        # แถวที่จะแสดงจริง: ตัดรายการที่ควร purge ออก
+        visible_rows = [r for r in self.rows_cache if not self._should_auto_purge(r)]
+
+        # อัปเดตชุด HN ที่ "ปัจจุบันยังอยู่ในมอนิเตอร์ (หลัง purge)"
+        current = set()
+        for r in visible_rows:
+            hn = self._extract_hn_from_row(r)
+            if hn:
+                current.add(hn)
+        self._current_monitor_hn = current
+
+        # 3) วาดตาราง Monitor
+        self.table.setRowCount(0)
+        for r in visible_rows:
+            row = self.table.rowCount();
+            self.table.insertRow(row)
+            self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(r.get("id", ""))))
+            self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(r.get("patient_id", ""))))
+            status_item = QtWidgets.QTableWidgetItem(str(r.get("status", "")))
+            col = STATUS_COLORS.get(r.get("status", ""))
+            if col:
+                status_item.setBackground(QtGui.QBrush(QtGui.QColor(col)))
+                fg = "#ffffff" if r.get("status") in ("กำลังผ่าตัด", "กำลังส่งกลับตึก",
+                                                      "เลื่อนการผ่าตัด") else "#000000"
+                status_item.setForeground(QtGui.QBrush(QtGui.QColor(fg)))
+            self.table.setItem(row, 2, status_item)
+            self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(self._render_time_cell(r)))
+
+        # 4) sync schedule decorations + (re)render with period rules
+        self._render_schedule_tree()
+        self._update_schedule_completion_markers()
+
+        # 5) persist monitor state หลัง render เสมอ
+        self._save_persisted_monitor_state(self.rows_cache)
+
+    def _refresh(self, prefer_server=True):
+        try:
+            if prefer_server:
+                res = self._client().list_items();
+                rows = self._extract_rows(res)
+                if rows is not None: self._rebuild(rows); self._set_chip(True); return
+            self._rebuild(self.model.rows)
+        except requests.exceptions.RequestException:
+            self._set_chip(False);
+            self._rebuild(self.model.rows)
+
+    # ---------- WebSocket ----------
+    def _ws_url(self):
+        host = self.ent_host.text().strip() or DEFAULT_HOST
+        port = int(self.ent_port.text().strip() or DEFAULT_PORT)
+        token = self.ent_token.text().strip() or DEFAULT_TOKEN
+        return f"ws://{host}:{port}{API_WS}?token={token}"
+
+    def _start_websocket(self):
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
+        try:
+            self.ws = QWebSocket()
+            self.ws.errorOccurred.connect(self._ws_error)
+            self.ws.connected.connect(self._ws_connected)
+            self.ws.disconnected.connect(self._ws_disconnected)
+            self.ws.textMessageReceived.connect(self._on_ws_message)
+            self.ws.open(QUrl(self._ws_url()))
+        except Exception:
+            self._ws_disconnected()
+
+    def _ws_connected(self):
+        self.ws_connected = True;
+        self._set_chip(True)
+        if self._pull.isActive(): self._pull.stop()
+
+    def _ws_disconnected(self):
+        self.ws_connected = False
+        if not self._pull.isActive(): self._pull.start(2000)
+
+    def _ws_error(self, err):
+        self._set_chip(False);
+        self._ws_disconnected()
+
+    def _on_ws_message(self, msg: str):
+        try:
+            payload = json.loads(msg);
+            rows = self._extract_rows(payload)
+            if rows is not None: self._rebuild(rows)
+        except Exception:
+            pass
+
+    def _on_reconnect_clicked(self):
+        self.cli = self._client();
+        self._save_settings();
+        self._on_health();
+        self._refresh(True);
+        self._start_websocket()
+
+    # ---------- Barcode ----------
+    def _finalize_scan_if_any(self):
+        if not self._scan_buf: return
+        digits = "".join(ch for ch in self._scan_buf if ch.isdigit());
+        self._scan_buf = ""
+        if not digits: return
+        if len(digits) >= 9:
+            hn9 = digits[-9:];
+            self.ent_hn.setText(hn9);
+            QtWidgets.QApplication.beep()
+            self.lbl_scan_state.setText("Scanner: HN captured");
+            self.lbl_scan_state.setStyleSheet("color:#2563eb;font-weight:600;")
+            self.cb_status.setFocus()
+        else:
+            self.lbl_scan_state.setText("Scanner: Waiting");
+            self.lbl_scan_state.setStyleSheet("color:#16a34a;font-weight:600;")
+
+    def eventFilter(self, obj, event):
+        if event.type() == QtCore.QEvent.KeyPress and self.scan_enabled:
+            key = event.key();
+            text = event.text() or ""
+            if key in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+                self._scan_timer.stop();
+                self._finalize_scan_if_any();
+                return True
+            if text and text.isprintable():
+                if not self._scan_timer.isActive(): self._scan_buf = ""
+                self._scan_buf += text;
+                self._scan_timer.start(self._scan_timeout_ms)
+                return False
+        return super().eventFilter(obj, event)
+
+    # ---------- Table selection ----------
+    def _on_table_select(self):
+        try:
+            row = self.table.currentRow()
+            if row < 0: return
+            pid_item = self.table.item(row, 1);
+            st_item = self.table.item(row, 2);
+            id_item = self.table.item(row, 0)
+            pid = (pid_item.text().strip() if pid_item else "")
+            st = (st_item.text().strip() if st_item else "")
+            hid = (id_item.text().strip() if id_item else "")
+            if pid: self.ent_pid.setText(pid)
+            if st:
+                i = self.cb_status.findText(st)
+                if i >= 0: self.cb_status.setCurrentIndex(i)
+                self._toggle_eta_visibility()
+            if hid.isdigit() and len(hid) == 9: self.ent_hn.setText(hid)
+            self._blink_schedule_row_for_hn(hid, ms=5000)
+            self.rb_edit.setChecked(True);
+            self._update_action_styles()
+        except Exception:
+            pass
+
+    # ---------- Actions ----------
+    def _on_send(self):
+        action = "add" if self.rb_add.isChecked() else ("edit" if self.rb_edit.isChecked() else "delete")
+        pid = self.ent_pid.text().strip() or None
+        or_room = None if pid else self.cb_or.currentText()
+        q = None if pid else self.cb_q.currentText()
+        status = self.cb_status.currentText() if action in ("add", "edit") else None
+
+        hn = self.ent_hn.text().strip()
+        if action in ("add", "edit") and (not hn or len(hn) != 9 or not hn.isdigit()):
+            QtWidgets.QMessageBox.warning(self, "ข้อมูลไม่ครบ", "กรุณากรอก HN 9 หลักให้ถูกต้อง");
+            return
+
+        eta_minutes = None
+        if self.cb_status.currentText() == "กำลังผ่าตัด":
+            eta_val = self.ent_eta.text().strip();
+            eta_minutes = int(eta_val) if eta_val.isdigit() else None
+
+        eff_pid = pid or f"{or_room}-{q}"
+        try:
+            _ = self._client().send_update(action=action, or_room=or_room, queue=q,
+                                           status=status, patient_id=pid, eta_minutes=eta_minutes,
+                                           hn=hn if action != "delete" else None)
+            self._set_chip(True)
+            ts_iso = datetime.now().isoformat()
+            if action == "delete":
+                self.model.delete(eff_pid)
+            else:
+                self.model.add_or_edit(eff_pid, status or "", ts_iso, eta_minutes, hn=hn)
+            self._refresh(True);
+            self._reset_form()
+        except requests.exceptions.RequestException:
+            self._set_chip(False)
+            ts_iso = datetime.now().isoformat()
+            if action == "delete":
+                self.model.delete(eff_pid)
+            else:
+                self.model.add_or_edit(eff_pid, status or "", ts_iso, eta_minutes, hn=hn)
+            self._refresh(False);
+            self._reset_form()
+
+    # ---------- Schedule ----------
+    def _render_schedule_tree(self):
+        """วาด Result Schedule ให้ตรงกับ Registry + เคารพสถานะพับ/ขยายของผู้ใช้"""
+        # 1) เก็บสถานะพับ/ขยายเดิมไว้ก่อนล้าง
+        self._capture_or_expand_state()
+
+        # 2) ล้าง/รีเซ็ต
+        self._clear_sched_pulser()
+        self.tree_sched.clear()
+
+        # 3) คำนวณช่วงเวลา/ตัวกรอง
+        now_code = _now_period(datetime.now())  # "in" | "off"
+        in_monitor = set(self._current_monitor_hn or [])
+
+        groups: dict[str, list[_SchedEntry]] = {}
+
+        def should_show(e: _SchedEntry) -> bool:
+            if now_code == "in":
+                return True
+            # นอกเวลา: แสดง off เสมอ + in เฉพาะที่ยังไม่เสร็จ (ยังเห็น HN ใน monitor)
+            return (e.period == "off") or (e.period == "in" and e.hn and e.hn in in_monitor)
+
+        for e in self.sched_reader.entries:
+            if should_show(e):
+                groups.setdefault(e.or_room or "-", []).append(e)
+
+        order = self.sched_reader.or_rooms or []
+
+        def room_key(x: str):  # เรียงตามลำดับห้องจาก registry
+            return (order.index(x) if x in order else 999, x)
+
+        def row_sort_key(e: _SchedEntry):
+            # คิว 1–9 มาก่อน แล้วคิว 0 ตามเวลา
+            q = int(e.queue or 0)
+            if q > 0:
+                return (0, q, "")
+            return (1, 0, e.time or "99:99")
+
+        # 4) สร้างหัว OR แบบการ์ด (สีตาม OR) + คืนค่าสถานะพับ/ขยาย
+        for orr in sorted(groups.keys(), key=room_key):
+            if not groups[orr]:
+                continue
+
+            parent = QtWidgets.QTreeWidgetItem([f"{orr}"] + [""] * 11)
+            parent.setFirstColumnSpanned(True)
+            self.tree_sched.addTopLevelItem(parent)
+
+            # หัวกลุ่มดูชัด แต่ไม่ selectable
+            self._style_or_group_header(parent, "#eef2ff")
+            parent.setFlags((parent.flags() | QtCore.Qt.ItemIsEnabled) & ~QtCore.Qt.ItemIsSelectable)
+
+            # การ์ดหัว OR ใช้สีเฉพาะของห้องนั้น (แตกต่างครบทุก OR)
+            accent = OR_HEADER_COLORS.get(orr, "#64748b")
+            self.tree_sched.setItemWidget(parent, 0, self._or_card_widget(orr, accent))
+
+            # คืนค่าพับ/ขยายเดิมของหัวนี้
+            self._apply_or_expand_state(parent)
+
+            # 5) แถวลูก (ผู้ป่วย)
+            for e in sorted(groups[orr], key=row_sort_key):
+                row = QtWidgets.QTreeWidgetItem([
+                    e.time or "-", e.hn, e.name or "-", str(e.age or 0),
+                    ", ".join(e.diags) or "-", ", ".join(e.ops) or "-",
+                    e.doctor or "-", e.ward or "-", "", "", str(e.queue or 0), ""
+                ])
+                parent.addChild(row)
+                # Team Scrub widget at col 8
+                try:
+                    self.tree_sched.setItemWidget(row, 8, self._team_widget(e.hn))
+                except Exception:
+                    pass
+
+        # 6) ไม่บังคับ expandAll() เพื่อไม่ให้เด้งกลับ
+        QtCore.QTimer.singleShot(0, self._autofit_schedule_columns)
+        if self.monitor_ready:
+            self._update_schedule_completion_markers()
+
+    def _create_done_button(self) -> QtWidgets.QWidget:
+        wrap = QtWidgets.QWidget()
+        lay = QtWidgets.QHBoxLayout(wrap)
+        lay.setContentsMargins(6, 4, 6, 4)  # มี margin เล็กน้อยให้ header คำนวณกว้างขึ้น
+        lay.setSpacing(0)
+
+        btn = QtWidgets.QPushButton("ผ่าตัดเสร็จแล้ว", wrap)
+        fm = QtGui.QFontMetrics(btn.font())
+        # เผื่อซ้ายขวา 24px ให้สบายตา ไม่โดนตัด
+        min_w = fm.horizontalAdvance("ผ่าตัดเสร็จแล้ว") + 24
+        min_h = max(28, fm.height() + 10)
+
+        btn.setMinimumSize(min_w, min_h)
+        btn.setSizePolicy(QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Fixed)
+
+        btn.setEnabled(False)
+        btn.setCursor(QtCore.Qt.ArrowCursor)
+        btn.setStyleSheet("""
+            QPushButton{
+                background:#10b981;
+                color:#ffffff;
+                border:none;
+                border-radius:12px;
+                padding:4px 12px;
+                font-weight:800;
+            }
+        """)
+
+        lay.addWidget(btn, 0, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        lay.addStretch(1)  # ดันให้ปุ่มชิดซ้าย เหลือที่ว่างทางขวา
+
+        return wrap
+
+    def _update_schedule_completion_markers(self):
+        if not self.monitor_ready:
+            return
+        try:
+            topc = self.tree_sched.topLevelItemCount()
+            for i in range(topc):
+                parent = self.tree_sched.topLevelItem(i)
+                for j in range(parent.childCount()):
+                    item = parent.child(j)
+                    hn = (item.text(1) or "").strip()
+                    completed = (hn and (hn in self._was_in_monitor) and (hn not in self._current_monitor_hn))
+                    self._style_schedule_item(item, completed)
+        except Exception:
+            pass
+        self.tree_sched.viewport().update()
+
+    def _style_schedule_item(self, item: QtWidgets.QTreeWidgetItem, completed: bool):
+        cols = self.tree_sched.columnCount()
+        for c in range(cols):
+            f = self.tree_sched.font()
+            f.setStrikeOut(bool(completed))
+            item.setFont(c, f)
+        if completed:
+            dim_fg = QtGui.QBrush(QtGui.QColor(100, 116, 139))
+            for c in range(cols):
+                item.setForeground(c, dim_fg)
+                bg = QtGui.QColor(148, 163, 184, 40)
+                item.setBackground(c, QtGui.QBrush(bg))
+            item.setFlags(item.flags() & ~QtCore.Qt.ItemIsSelectable & ~QtCore.Qt.ItemIsEnabled)
+            item.setData(2, QtCore.Qt.UserRole, "completed")
+            self.tree_sched.setItemWidget(item, 9, self._create_done_button())
+        else:
+            for c in range(cols):
+                item.setForeground(c, QtGui.QBrush())
+                item.setBackground(c, QtGui.QBrush())
+            item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+            item.setData(2, QtCore.Qt.UserRole, None)
+            self.tree_sched.setItemWidget(item, 9, None)
+
+    def _check_schedule_seq(self):
+        if self.sched_reader.refresh_if_changed():
+            self._render_schedule_tree()
+        # ไม่บังคับ expandAll เพื่อคงสถานะพับ/ขยายของผู้ใช้
+        QtCore.QTimer.singleShot(0, self._autofit_schedule_columns)
+
+
+# ---------- main ----------
+def run_gui_pyside6(host, port, token):
+    from PySide6 import QtWidgets
+    import sys
+    app = QtWidgets.QApplication(sys.argv)
+    ui = Main(host, port, token)
+    ui.show()
+    sys.exit(app.exec())
+    app = QtWidgets.QApplication(sys.argv)
+    ui = Main(host, port, token)
+    ui.show()
+    sys.exit(app.exec())
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="SurgiBot Client (+ETA + HN + Barcode Scan + WebSocket + Tray + Private Schedule Viewer)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--host", default=DEFAULT_HOST);
+    p.add_argument("--port", default=DEFAULT_PORT, type=int)
+    p.add_argument("--token", default=DEFAULT_TOKEN);
+    p.add_argument("--gui", action="store_true")
+    p.add_argument("--ui", choices=["ttk", "pyside6"], default=os.getenv("SURGIBOT_CLIENT_UI", "pyside6"))
+    sub = p.add_subparsers(dest="cmd", required=False)
+    sub.add_parser("health");
+    sub.add_parser("list")
+    addp = sub.add_parser("add");
+    addp.add_argument("--hn", required=True);
+    addp.add_argument("--or", dest="or_room", choices=OR_CHOICES, required=True)
+    addp.add_argument("--queue", choices=QUEUE_CHOICES, required=True);
+    addp.add_argument("--status", choices=STATUS_CHOICES, required=True)
+    addp.add_argument("--eta", dest="eta", type=int)
+    edp = sub.add_parser("edit");
+    g = edp.add_mutually_exclusive_group(required=True);
+    g.add_argument("--patient-id", dest="patient_id")
+    g.add_argument("--or", dest="or_room", choices=OR_CHOICES);
+    edp.add_argument("--queue", choices=QUEUE_CHOICES)
+    edp.add_argument("--status", choices=STATUS_CHOICES);
+    edp.add_argument("--eta", dest="eta", type=int);
+    edp.add_argument("--hn")
+    delp = sub.add_parser("delete");
+    g2 = delp.add_mutually_exclusive_group(required=True);
+    g2.add_argument("--patient-id", dest="patient_id")
+    g2.add_argument("--or", dest="or_room", choices=OR_CHOICES);
+    delp.add_argument("--queue", choices=QUEUE_CHOICES)
+    return p
+
+
+def main():
+    parser = build_parser();
+    args = parser.parse_args()
+    if args.cmd is None:
+        run_gui_pyside6(args.host, args.port, args.token);
+        return
+    cli = SurgiBotClientHTTP(args.host, args.port, args.token)
+    try:
+        if args.cmd == "health":
+            print(json.dumps(cli.health(), ensure_ascii=False, indent=2))
+        elif args.cmd == "list":
+            print(json.dumps(cli.list_items(), ensure_ascii=False, indent=2))
+        elif args.cmd == "add":
+            print(json.dumps(
+                cli.send_update("add", or_room=args.or_room, queue=args.queue, status=args.status, eta_minutes=args.eta,
+                                hn=args.hn), ensure_ascii=False, indent=2))
+        elif args.cmd == "edit":
+            if args.patient_id:
+                print(json.dumps(
+                    cli.send_update("edit", patient_id=args.patient_id, status=args.status, eta_minutes=args.eta,
+                                    hn=args.hn), ensure_ascii=False, indent=2))
+            else:
+                if not args.or_room or not args.queue:
+                    raise SystemExit("--or และ --queue จำเป็นเมื่อไม่ได้ส่ง --patient-id")
+                print(json.dumps(cli.send_update("edit", or_room=args.or_room, queue=args.queue, status=args.status,
+                                                 eta_minutes=args.eta, hn=args.hn), ensure_ascii=False, indent=2))
+        elif args.cmd == "delete":
+            if args.patient_id:
+                print(json.dumps(cli.send_update("delete", patient_id=args.patient_id), ensure_ascii=False, indent=2))
+            else:
+                if not args.or_room or not args.queue:
+                    raise SystemExit("--or และ --queue จำเป็นเมื่อไม่ได้ส่ง --patient-id")
+                print(json.dumps(cli.send_update("delete", or_room=args.or_room, queue=args.queue), ensure_ascii=False,
+                                 indent=2))
+        else:
+            print("Unknown command", file=sys.stderr)
+    except requests.HTTPError as he:
+        print(f"[HTTP ERROR] {he}", file=sys.stderr);
+        sys.exit(1)
+    except SystemExit as se:
+        print(str(se), file=sys.stderr);
+        sys.exit(1)
+    except Exception as e:
+        print(f"[ERROR] {e}", file=sys.stderr);
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

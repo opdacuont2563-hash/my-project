@@ -1,0 +1,392 @@
+ผมอยากจะพัฒนาต่อยอด โปรแกรมนี้ให้เป็นเลิศทางการจัดการระบบห้องผ่าตัดครบวงจรอยากจะให้ Senior programmer ที่เก่งที่สุดช่วยผมเขียน code เพิ่มเติมจาก code หลักให้สมบูรณ์โดยที่ code หลักไม่เสียหายครับ
+ feature ที่ 1 ที่ผมอยากเพิ่มจาก code client นี้คือ
+*** ตารางการผ่าตัดทั้งหมด จริงโดยอยากจะให้แสดงหน้าจอนี้ผ่าน client เชื่อมข้อมูลถึงกันแต่จะไปไม่ไปแสดงที่ server เพราะเราจะไม่เอาขึ้นจอป้องกัน PDPA เราจะเห็นกันเฉพาะเจ้าหน้าที่ห้องผ่าตัดของเราท่านั้นโดยมีรายละเอียดขอมูลที่จะให้กรอกนำไปแสดงใน Result Schedule OR ดังนี้
+สิ่งแรกเลยคือเลือก OR ทำเป็น Select OR1 OR2.....OR6 OR8 ไม่มี OR 8 และทำเผื่ออนาคตด้วยครับ ทำเพิ่ม OR ได้
+ ///ข้อมูลผู้ป่วย///
+- ชื่อ-สกุล ผู้ป่วย
+- อายุ (Age)
+- HN (Hospital Number)
+///ข้อมูลแพทย์ผู้ผ่าตัด/// 
+**เงื่อนไขคือให้เลือกแผนกการผ่าตัดก่อนแล้วให้เปิดการเลือกชื่อแพทย์โดยแยกเป็นแผนกให้เลือกครับเช่น ผมเลือก แผนกศัลยกรรมทั่วไป	Surgery ชื่อแพทย์จะต้องมีแค่รายชื่อแพทย์แผนก แผนกศัลยกรรมทั่วไป	Surgery ให้เลือกเท่านั้นครับ
+- เลือกแผนกการผ่าตัด
+- ชื่อแพทย์ผู้ผ่าตัด
+ตามแผนกต่างๆดังนี้
+แผนกศัลยกรรมทั่วไป	Surgery
+**นพ.สุริยา คุณาชน
+นพ.ธนวัฒน์ พันธุ์พรหม
+พญ.สุภาภรณ์ พิณพาทย์
+พญ.รัฐพร ตั้งเพียร
+พญ.พิชัย สุวัฒนพูนลาภ
+
+แผนกศัลยกรรมกระดูกและข้อ	Orthopedics
+**นพ.ชัชพล องค์โฆษิต
+นพ.ณัฐพงศ์ ศรีโพนทอง
+นพ.อำนาจ อนันต์วัฒนกุล
+นพ.อภิชาติ ลักษณะ
+นพ.กฤษฎา อิ้งอำพร
+นพ.วิษณุ ผูกพันธ์
+
+แผนกศัลยกรรมระบบทางเดินปัสสาวะ	Urology
+**พญ.สายฝน บรรณจิตร์
+แผนกศัลยกรรม โสต ศอ นาสิก	ENT
+**พญ.พิรุณยา แสนวันดี
+พญ.สุทธิพร หมวดไธสง
+นพ.วรวิช พลเวียงธรรม
+
+แผนกศัลยกรรมสูติ-นรีเวช	Obstetrics-Gynecology
+**นพ.สุรจิตต์ นิมิตรวงษ์สกุล
+พญ.ขวัญตา ทุนประเทือง
+พญ.วัชราภรณ์ อนวัชชกุล
+พญ.รุ่งฤดี โขมพัตร
+พญ.ฐิติมน ชัยชนะทรัพย์
+แผนกศัลยกรรมจักษุ	Ophthalmology
+**นพ.สราวุธ สารีย์
+พญ.ดวิษา อังศรีประเสริฐ
+พญ.สาวิตรี ถนอมวงศ์ไทย
+พญ.สีชมพู ตั้งสัตยาธิษฐาน
+พญ.นันท์นภัส ชีวะเกรียงไกร
+แผนกศัลยกรรม Maxillofacial	Maxillofacial
+**นพ.ฉลองรัฐ เดชา
+พญ.อรุณนภา คิสารัง
+
+///ข้อมูลผลการวินิจฉัยและหัตถการ (Diagnosis and Operation )///
+- Diagnosis (วินิจฉัย) เงื่อนไขคือ 1.ทำเป็น select search แบบแม่นยำครับ ค้นหาใกล้เคียงได้ด้วยยิ่งดี
+2. สามารถเลือกหรือเพิ่ม Diagnosis  ได้ โดยแต่ละ Diagnosis  ที่เลือกนั้นเชื่อมระหว่างด้วย with เช่น Fibroadenoma with Toxic Goiter 
+3.คือเมื่อเราเลือกแผนกแล้ว Diagnosis จะต้องเป็นของแผนกนั้นๆด้วยครับ เช่น  ผมเลือก แผนกศัลยกรรมทั่วไป Surgery operation ที่จะให้เลือกก็คือ แผนกศัลยกรรมทั่วไป Surgery ทั้งหมด
+4.คือถ้าไม่มี Diagnosis ที่ต้องการสามารถเพิ่ม Diagnosis ได้และเก็บไว้เพื่อใช้ได้ในครั้งต่อไป
+ //แผนกศัลยกรรมทั่วไป Surgery//
+[
+  "Cholelithiasis",
+  "Acute Cholecystitis",
+  "Chronic Cholecystitis",
+  "Acalculous Cholecystitis",
+  "Gallbladder Empyema",
+  "Gallbladder Mucocele",
+  "Choledocholithiasis",
+  "Ascending Cholangitis",
+  "Gallstone Pancreatitis",
+  "Biliary Stricture",
+  "Bile Duct Injury",
+  "Bile Leak",
+  "Primary Sclerosing Cholangitis",
+  "Hepatocellular Carcinoma",
+  "Cholangiocarcinoma",
+  "Liver Abscess (Pyogenic)",
+  "Liver Abscess (Amebic)",
+  "Liver Hemangioma",
+  "Focal Nodular Hyperplasia",
+  "Hepatic Adenoma",
+  "Cystic Liver Disease",
+  "Traumatic Liver Injury",
+
+  "Acute Pancreatitis",
+  "Severe Acute Pancreatitis",
+  "Chronic Pancreatitis",
+  "Pancreatic Pseudocyst",
+  "Walled-Off Pancreatic Necrosis",
+  "Pancreatic Cancer",
+  "Periampullary Carcinoma",
+
+  "Peptic Ulcer Disease",
+  "Bleeding Peptic Ulcer",
+  "Perforated Peptic Ulcer",
+  "Gastric Outlet Obstruction",
+  "Gastric Cancer",
+  "Gastric GIST",
+  "Gastritis",
+  "Duodenal Ulcer",
+  "Mallory–Weiss Tear",
+
+  "Small Bowel Obstruction",
+  "Adhesive Small Bowel Obstruction",
+  "Strangulated Small Bowel Obstruction",
+  "Small Bowel Ischemia",
+  "Small Bowel Perforation",
+  "Meckel’s Diverticulum",
+  "Crohn’s Disease",
+  "Small Bowel Tumor",
+
+  "Colorectal Cancer",
+  "Colon Cancer",
+  "Rectal Cancer",
+  "Colonic Polyps (Adenoma)",
+  "Diverticulitis",
+  "Diverticular Bleeding",
+  "Large Bowel Obstruction",
+  "Toxic Megacolon",
+  "Sigmoid Volvulus",
+  "Cecal Volvulus",
+  "Ulcerative Colitis",
+  "Lower Gastrointestinal Bleeding",
+  "Ischemic Colitis",
+  "Anastomotic Leak",
+
+  "Hemorrhoids",
+  "Anal Fistula",
+  "Perianal Abscess",
+  "Anal Fissure",
+  "Pilonidal Disease",
+  "Pilonidal Abscess",
+  "Anal Cancer",
+  "Rectal Prolapse",
+
+  "Inguinal Hernia",
+  "Femoral Hernia",
+  "Umbilical Hernia",
+  "Paraumbilical Hernia",
+  "Epigastric Hernia",
+  "Incisional Hernia",
+  "Ventral Hernia",
+  "Parastomal Hernia",
+  "Incarcerated Hernia",
+  "Strangulated Hernia",
+  "Abdominal Wall Hematoma",
+
+  "Breast Lump (NOS)",
+  "Fibroadenoma",
+  "Phyllodes Tumor",
+  "Mastitis",
+  "Breast Abscess",
+  "Duct Ectasia",
+  "Periductal Mastitis",
+  "Intraductal Papilloma",
+  "Breast Cancer",
+
+  "Thyroid Nodule",
+  "Multinodular Goiter",
+  "Hyperthyroidism (Toxic Goiter)",
+  "Thyroiditis",
+  "Thyroid Cancer",
+  "Primary Hyperparathyroidism",
+  "Parathyroid Adenoma",
+  "Adrenal Adenoma",
+  "Pheochromocytoma",
+
+  "Skin Abscess",
+  "Soft Tissue Abscess",
+  "Cellulitis",
+  "Necrotizing Fasciitis",
+  "Wound Dehiscence",
+  "Surgical Site Infection",
+  "Pressure Injury",
+  "Diabetic Foot Infection",
+  "Diabetic Foot Ulcer",
+  "Gangrene",
+  "Partial-Thickness Burn",
+  "Full-Thickness Burn",
+  "Lipoma",
+  "Epidermal Inclusion Cyst",
+  "Sebaceous Cyst",
+  "Soft Tissue Sarcoma",
+  "Basal Cell Carcinoma",
+  "Squamous Cell Carcinoma",
+  "Melanoma",
+
+  "Blunt Abdominal Trauma",
+  "Penetrating Abdominal Trauma",
+  "Hemoperitoneum",
+  "Splenic Injury",
+  "Hepatic Injury",
+  "Pancreatic Injury",
+  "Bowel Injury",
+  "Mesenteric Injury",
+  "Diaphragmatic Injury",
+  "Abdominal Compartment Syndrome",
+
+  "Acute Peritonitis",
+  "Secondary Peritonitis",
+  "Intra-abdominal Abscess",
+  "Postoperative Intra-abdominal Collection",
+  "Enterocutaneous Fistula",
+  "Anastomotic Leak with Peritonitis",
+
+  "Stoma Prolapse",
+  "Stoma Retraction",
+  "Stoma Stenosis",
+  "High Output Stoma",
+  "Peristomal Skin Irritation",
+
+  "Esophageal Cancer",
+  "Achalasia",
+  "Esophageal Perforation",
+  "Esophageal Varices with Bleeding",
+  "Boerhaave Syndrome",
+
+  "Hydrocele",
+  "Epididymal Cyst",
+  "Ureteric Stone with Obstruction",
+  "Pyonephrosis"
+]
+
+- Operation (หัตถการ) เงื่อนไขคือ 1.ทำเป็น select search แบบแม่นยำครับ ค้นหาใกล้เคียงได้ด้วยยิ่งดี
+2. สามารถเลือกหรือเพิ่ม operation ได้ โดยแต่ละ operation ที่เลือกนั้นเชื่อมระหว่างด้วย with เช่น Explore with Appendectomy with repair small bowel 
+3.คือเมื่อเราเลือกแผนกแล้ว operation จะต้องเป็นของแผนกนั้นๆด้วยครับ เช่น  ผมเลือก แผนกศัลยกรรมทั่วไป Surgery operation ที่จะให้เลือกก็คือ แผนกศัลยกรรมทั่วไป Surgery ทั้งหมด
+4.คือถ้าไม่มี operation ที่ต้องการสามารถเพิ่ม Operation ได้และเก็บไว้เพื่อใช้ได้ในครั้งต่อไป
+ //แผนกศัลยกรรมทั่วไป Surgery//
+[
+  "Exploratory Laparotomy",
+  "Diagnostic Laparoscopy",
+  "Abdominal Wound Closure",
+  "Temporary Abdominal Closure",
+  "Retention Sutures",
+  "Wound Exploration",
+  "Wound Suturing",
+  "Debridement",
+  "Fasciotomy",
+  "Split-Thickness Skin Graft (STSG)",
+  "Full-Thickness Skin Graft (FTSG)",
+  "Local Flap Coverage",
+  "Incision and Drainage (I&D)",
+  "Negative-Pressure Wound Therapy (VAC) Application",
+
+  "Appendectomy",
+  "Laparoscopic Appendectomy",
+
+  "Laparoscopic Cholecystectomy (LC)",
+  "Open Cholecystectomy (OC)",
+  "Conversion from LC to OC",
+  "Intraoperative Cholangiogram (IOC)",
+  "Common Bile Duct Exploration",
+  "Choledochotomy",
+  "T-Tube Insertion with Cholangiogram",
+  "Removal of T-Tube",
+  "Choledochoduodenostomy",
+  "Cholecystostomy",
+  "Percutaneous Drainage (PCD) of Hepatobiliary Collection",
+  "Hepatorrhaphy (Liver Repair)",
+  "Liver Wedge Resection",
+  "Liver Segmentectomy",
+
+  "Pancreatic Necrosectomy",
+  "Cystogastrostomy / Cystojejunostomy",
+  "Distal Pancreatectomy",
+  "Pancreaticoduodenectomy (Whipple)",
+
+  "Gastric Ulcer Repair (Graham Patch)",
+  "Gastrojejunostomy",
+  "Subtotal Gastrectomy",
+  "Total Gastrectomy",
+  "Roux-en-Y Reconstruction",
+
+  "Small Bowel Resection (SBR)",
+  "Enterotomy and Stone/FB Extraction",
+  "Enterorrhaphy (Bowel Repair)",
+  "Adhesiolysis (Lysis of Adhesion)",
+  "Ileocecal Resection",
+  "Ileocolic Anastomosis",
+  "End-to-End Anastomosis (EEA)",
+  "Side-to-Side Stapled Anastomosis",
+
+  "Right Hemicolectomy",
+  "Left Hemicolectomy",
+  "Sigmoid Colectomy",
+  "Anterior Resection",
+  "Low Anterior Resection (LAR)",
+  "Abdominoperineal Resection (APR)",
+  "Hartmann’s Procedure",
+  "Subtotal Colectomy",
+  "Total Colectomy",
+  "Total Proctocolectomy with Ileal Pouch–Anal Anastomosis (IPAA)",
+  "Anastomotic Leak Repair / Re-anastomosis",
+
+  "End Colostomy (Hartmann’s End)",
+  "Loop Colostomy",
+  "Ileostomy (End/Loop)",
+  "Stoma Revision",
+  "Stoma Closure (Reversal)",
+
+  "Hemorrhoidectomy",
+  "Lateral Internal Sphincterotomy (LIS)",
+  "Fistulotomy",
+  "Fistulectomy",
+  "Seton Placement",
+  "Anal Dilatation",
+  "Excision of Pilonidal Sinus / Pilonidal Cyst",
+  "Perianal Abscess Drainage",
+  "Proctoscopy",
+  "Flexible Sigmoidoscopy",
+
+  "Colonoscopy",
+  "Polypectomy",
+  "Hemostasis Injection (Adrenaline/Epinephrine)",
+  "Hemoclipping",
+  "Endoscopic Variceal Ligation (EVL)",
+  "Balloon Dilation",
+  "Balloon Extraction (ERCP)",
+  "Endoscopic Retrograde Cholangiopancreatography (ERCP)",
+  "Esophagogastroduodenoscopy (EGD)",
+
+  "Inguinal Hernia Repair (Open Lichtenstein)",
+  "Laparoscopic Inguinal Hernia Repair (TAPP/TEP)",
+  "Femoral Hernia Repair",
+  "Umbilical Hernia Repair",
+  "Epigastric Hernia Repair",
+  "Paraumbilical Hernia Repair",
+  "Incisional/Ventral Hernia Repair (Open)",
+  "Laparoscopic Ventral Hernia Repair (IPOM)",
+  "Bilateral Inguinal Hernia Repair",
+  "Component Separation for Complex Ventral Hernia",
+  "Abdominal Wall Reconstruction",
+
+  "Excision of Breast Mass",
+  "Wide Local Excision (Breast-Conserving Surgery)",
+  "Mastectomy (Simple)",
+  "Modified Radical Mastectomy (MRM)",
+  "Sentinel Lymph Node Biopsy (Breast)",
+  "Axillary Lymph Node Dissection",
+
+  "Thyroid Lobectomy (Hemithyroidectomy)",
+  "Total Thyroidectomy",
+  "Subtotal Thyroidectomy",
+  "Parathyroidectomy",
+  "Excision of Thyroid/Parathyroid Nodule",
+
+  "Hydrocelectomy",
+  "Scrotal Repair",
+
+  "Tracheostomy",
+  "Feeding Gastrostomy",
+  "Percutaneous Endoscopic Gastrostomy (PEG)",
+  "Feeding Jejunostomy",
+  "Feeding Enterostomy",
+
+  "Omentectomy",
+  "Omental Patch (Graham Patch)",
+  "Omental Flap/Graft",
+  "Mesenteric Repair",
+  "Repair of Bowel Perforation",
+  "Repair of Stomach Perforation",
+  "Repair of Serosal Tear",
+  "Repair of Abdominal Wall",
+
+  "Ureterolithotomy",
+  "Double-J Stent (DJ Stent) Insertion",
+
+  "Repair of Artery (Vascular Repair/Ligation)",
+  "Repair of Vein (Venorrhaphy/Ligation)",
+
+  "Removal of Foreign Body (Soft Tissue/GI)",
+  "Removal of Retained Swab/Gauze",
+  "Removal of Clot (Post-MRM Site)",
+  "Percutaneous Abscess Drainage (Intra-abdominal)",
+  "Second-Look Laparotomy"
+]
+
+ข้อมูลเวลาการผ่าตัด
+- ผ่าตัดวันที่ ..............
+- ผ่าตัดเวลา .............น.
+
+Feature "Result Schedule Operating Room"
+จะนำเอาข้อมูลจากการ ลงบันทึกข้อมูลด้านบนนำมาแสดงที่ตารางนี้
+โดยให้เรียงลำดับตารางดังนี้
+*เงื่อนไขการแสดงข้อมูล เราจะแยกแสดงเป็น OR เริ่มตั้งแต่ 1- 8 ไม่มี OR 7 OR1 OR2...OR6 OR8 ให้แสดง OR แต่ละห้องเช่น
+OR 1 
+09.00 569555884 ปริญญา แก้วสุโพธิ์ 16 ปี Hepatic Injury repair Hepatic นพ.พืชัย สุวัฒนพูนลาภ ศัลยกรรมชาย ครับ
+*ให้แสดงเรียงตามนี้ เวลาผ่าตัด ,HN, ชื่อ- สกุล ผุ้ป่วย , อายุ, Diagnosis,operation,แพทย์ผู้ผ่าตัด,หอผู้ป่วย **ที่เพิ่มเติมก็คือ คิว ทำให้สามารถจัดคิวหรือเรียงเคสผ่าตัดได้ เมื่อจัดคิวแล้วให้เรียงคิวตามลำดับ บนสุดของ OR นั้นคือคิวที่ 1 พร้อม Visual สัญญลักษณ์  ให้สดุดตาด้วยครับ
+*เงื่อนไข ตารางนี้เมื่อคลิกเลือกผู้ป่วยฝั่ง Result Schedule Operating Room แล้วข้อมูล HN จะถุกส่งไปที่ฝั่ง Identify patients เพื่อทำการแจ้งเตือนสถานะการผ่าตัด  ต่อไปครับ
+
+
+
+
+
+

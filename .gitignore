@@ -1,0 +1,39 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+.venv/
+env/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+
+# Databases / Media / Secrets
+*.db
+*.mp3
+credentials.json
+statusor68-firebase-adminsdk-fbsvc-02fb0af624.json
+statusor68-firebase-adminsdk-fbsvc-fda2f42279.json
+
+# Build artifacts (สำคัญ)
+build/
+dist/
+*.pkg
+*.zip
+*.msi
+*.exe
+*.dll
+*.pyd
+*.pyz
+*.toc
+base_library.zip
+qt.conf
+# Env & secrets
+.env
+*.env
+data OR/
