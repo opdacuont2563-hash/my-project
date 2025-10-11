@@ -1589,8 +1589,15 @@ class WrapItemDelegate(QtWidgets.QStyledItemDelegate):
         text = index.data(QtCore.Qt.DisplayRole) or ""
         doc = QtGui.QTextDocument(); doc.setDefaultFont(option.font)
         topt = QtGui.QTextOption(); topt.setWrapMode(QtGui.QTextOption.WordWrap); doc.setDefaultTextOption(topt)
-        w = option.rect.width() if option.rect.width()>0 else 360; doc.setTextWidth(w); doc.setPlainText(str(text))
-        s = doc.size(); return QtCore.QSize(int(w), int(s.height()) + 10)
+        # ใช้ความกว้างคอลัมน์จริงของ tree เพื่อลดปัญหาความสูงประเมินต่ำ
+        tree = option.widget if isinstance(option.widget, QtWidgets.QTreeWidget) else None
+        col_w = tree.columnWidth(index.column()) if tree else option.rect.width()
+        # เผื่อระยะขอบนิดหน่อย
+        w = max(120, int(col_w) - 12)
+        doc.setTextWidth(w)
+        doc.setPlainText(str(text))
+        s = doc.size()
+        return QtCore.QSize(w, int(s.height()) + 12)
 
 class SearchSelectAdder(QtWidgets.QWidget):
     """Searchable selector with a multi-select list and change signal."""
