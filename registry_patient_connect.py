@@ -2,7 +2,7 @@
 """
 (ปรับปรุงจาก registry_patient_connect.py — แก้ strike-through logic & ปรับสไตล์ตาราง)
 """
-import os, sys, json, argparse, csv
+import os, sys, json, argparse, csv, base64, secrets, hashlib
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timedelta, time as dtime
@@ -14,6 +14,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QSettings, QUrl, QLocale
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QLinearGradient
 from PySide6.QtWebSockets import QWebSocket
+from PySide6.QtWidgets import QDialog
 
 from icd10_catalog import (
     ALL_OPERATIONS,
@@ -179,6 +180,10 @@ SCRUB_NURSES = [
 
 
 ORG_NAME="ORNBH"; APP_SHARED="SurgiBotShared"; OR_KEY="schedule/or_rooms"; ENTRIES_KEY="schedule/entries"; SEQ_KEY="schedule/seq"
+APP_SETTINGS="RegistryPatientConnect"
+PDPA_ACK_KEY="pdpa/ack"
+SECRET_SALT_KEY="sec/hn_salt"
+FERNET_KEY="sec/fernet_key"  # เผื่อจะต่อยอดเข้ารหัสข้อความในอนาคต
 
 DEPT_DOCTORS = {
     "Surgery | ศัลยกรรมทั่วไป": ["นพ.สุริยา คุณาชน","นพ.ธนวัฒน์ พันธุ์พรหม","พญ.สุภาภรณ์ พิณพาทย์","พญ.รัฐพร ตั้งเพียร","พญ.พิชัย สุวัฒนพูนลาภ"],
@@ -425,6 +430,63 @@ class LocalDBLogger:
               e.dept, e.doctor, " with ".join(e.diags), " with ".join(e.ops), e.ward, e.queue))
         self.conn.commit()
 
+# ---------------------- Security helpers (salt & hash) ----------------------
+def _app_settings() -> QSettings:
+    # ใช้ settings ชุดเดียวกับตัวแอป เพื่อเก็บ salt/ack
+    return QSettings(ORG_NAME, APP_SETTINGS)
+
+def _get_or_create_secret(key: str, nbytes: int = 32) -> str:
+    s = _app_settings()
+    if not s.contains(key):
+        # ใช้ urlsafe token เพื่อ copy/backup ได้ง่าย
+        tok = secrets.token_urlsafe(nbytes)
+        s.setValue(key, tok); s.sync()
+    return str(s.value(key))
+
+def hn_hash(hn: str) -> str:
+    """De-identified hash ของ HN: SHA-256(HN + salt)"""
+    salt = _get_or_create_secret(SECRET_SALT_KEY, 32)
+    x = (str(hn) + salt).encode("utf-8", "ignore")
+    return hashlib.sha256(x).hexdigest()
+
+# (พื้นที่ต่อยอด: ถ้าต้องการเข้ารหัสชื่อ/หมายเลข)
+# from cryptography.fernet import Fernet
+# def _fernet() -> Fernet:
+#     key = _get_or_create_secret(FERNET_KEY, 32)
+#     # Fernet key ต้องเป็น base64 32 bytes → แปลงให้เป็น 32 bytes แล้ว b64
+#     k = hashlib.sha256(key.encode()).digest()
+#     return Fernet(base64.urlsafe_b64encode(k))
+# def enc(txt:str)->str: return _fernet().encrypt(txt.encode()).decode()
+# def dec(tok:str)->str: return _fernet().decrypt(tok.encode()).decode()
+
+# ---------------------- PDPA / Consent ----------------------
+class PDPANoticeDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("แจ้งเตือน PDPA / ข้อกำกับการใช้ข้อมูล")
+        self.setModal(True)
+        lay = QtWidgets.QVBoxLayout(self)
+        text = QtWidgets.QTextEdit(self)
+        text.setReadOnly(True)
+        text.setMinimumHeight(220)
+        text.setStyleSheet("QTextEdit{background:#fff;border:1px solid #e6eaf2;border-radius:12px;padding:10px;}")
+        text.setText(
+            "วัตถุประสงค์การใช้ข้อมูล:\n"
+            "- ใช้เพื่อการลงทะเบียน/บริหารจัดการคิวผ่าตัด และสื่อสารการทำงานในห้องผ่าตัด\n"
+            "- ใช้สถิติภาพรวมแบบไม่ระบุตัวตน (de-identified) เพื่อปรับปรุงคุณภาพบริการ (QI)\n\n"
+            "การคุ้มครองข้อมูลส่วนบุคคล (PDPA):\n"
+            "- เก็บเท่าที่จำเป็น (data minimization)\n"
+            "- มีปุ่ม Export แบบไม่ระบุตัวตน (แฮช HN) สำหรับงานวิเคราะห์\n"
+            "- ห้ามส่งออก/ถ่ายโอนข้อมูลที่ระบุตัวบุคคลโดยไม่ได้รับอนุญาต\n"
+            "- การบันทึก Log จะไม่เก็บข้อมูลที่ระบุตัวบุคคลโดยไม่จำเป็น\n\n"
+            "การดำเนินการต่อถือว่าท่านเข้าใจและยอมรับตามข้างต้น"
+        )
+        chk = QtWidgets.QCheckBox("ฉันอ่านและยอมรับการใช้ข้อมูลตาม PDPA แล้ว")
+        btn = QtWidgets.QPushButton("ตกลง"); btn.setProperty("variant","primary"); btn.setEnabled(False)
+        chk.toggled.connect(lambda b: btn.setEnabled(b))
+        btn.clicked.connect(self.accept)
+        lay.addWidget(text); lay.addWidget(chk); lay.addWidget(btn)
+
 def _fmt_td(td: timedelta) -> str:
     total = int(abs(td.total_seconds())); h = total // 3600; m = (total % 3600) // 60; s = total % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
@@ -569,7 +631,7 @@ class Main(QtWidgets.QWidget):
         self.setWindowTitle("Registry Patient Connect — ORNBH")
         self.resize(1360, 900)
         apply_modern_theme(self)
-        self._build_ui(); self._load_settings(); self._start_timers()
+        self._build_ui(); self._load_settings(); self._pdpa_gate(); self._start_timers()
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -766,16 +828,21 @@ class Main(QtWidgets.QWidget):
         hdr2.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
         hdr2.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
         self.table.verticalHeader().setDefaultSectionSize(34)
-        gm.addWidget(self.table,0,0,1,2)
+        gm.addWidget(self.table,0,0,1,3)
         self.btn_refresh=QtWidgets.QPushButton("รีเฟรช"); self.btn_refresh.setProperty("variant","ghost")
         self.btn_export=QtWidgets.QPushButton("Export CSV"); self.btn_export.setProperty("variant","ghost")
-        gm.addWidget(self.btn_refresh,1,0); gm.addWidget(self.btn_export,1,1)
+        self.btn_export_deid=QtWidgets.QPushButton("Export De-Identified (CSV)"); self.btn_export_deid.setProperty("variant","ghost")
+        gm.addWidget(self.btn_refresh,1,0)
+        gm.addWidget(self.btn_export,1,1)
+        gm.addWidget(self.btn_export_deid,1,2)
+        gm.setColumnStretch(0,0); gm.setColumnStretch(1,0); gm.setColumnStretch(2,1)
         t3.addWidget(mon,1)
         self.tabs.addTab(tab3, "Monitor Realtime")
 
         # signals
         self.btn_refresh.clicked.connect(lambda: self._refresh(True))
         self.btn_export.clicked.connect(self._export_csv)
+        self.btn_export_deid.clicked.connect(self._export_deid_csv)
         self.btn_manage_or.clicked.connect(self._manage_or)
         self.cb_dept.currentTextChanged.connect(self._on_dept_changed)
         self.btn_add.clicked.connect(self._on_add_or_update)
@@ -797,7 +864,7 @@ class Main(QtWidgets.QWidget):
 
     # ---------- settings / timers ----------
     def _load_settings(self):
-        self.cfg = QSettings(ORG_NAME, "RegistryPatientConnect")
+        self.cfg = QSettings(ORG_NAME, APP_SETTINGS)
         self.tabs.setCurrentIndex(0)
     def _save_settings(self): pass
     def closeEvent(self, e):
@@ -811,6 +878,16 @@ class Main(QtWidgets.QWidget):
         self._seq_timer = QtCore.QTimer(self); self._seq_timer.timeout.connect(self._check_seq); self._seq_timer.start(1000)
         QtCore.QTimer.singleShot(200, lambda: self._refresh(True))
         QtCore.QTimer.singleShot(600, self._start_ws)
+
+    # ---------- PDPA first-run gate ----------
+    def _pdpa_gate(self):
+        # เตรียม salt ทันที (ใช้สำหรับ export แบบ de-id)
+        _get_or_create_secret(SECRET_SALT_KEY, 32)
+        # แสดง PDPA แค่ครั้งแรก
+        if not self.cfg.value(PDPA_ACK_KEY, False, type=bool):
+            dlg = PDPANoticeDialog(self)
+            dlg.exec()
+            self.cfg.setValue(PDPA_ACK_KEY, True); self.cfg.sync()
 
     # ---------- helpers ----------
     def _client(self):
@@ -1374,6 +1451,41 @@ class Main(QtWidgets.QWidget):
             with open(path,"w",newline="",encoding="utf-8-sig") as f:
                 w=csv.writer(f); w.writerow(["ID","Patient ID","Status","Timestamp","ETA(min)"])
                 for r in self.rows_cache: w.writerow([r.get("id",""), r.get("patient_id",""), r.get("status",""), r.get("timestamp",""), r.get("eta_minutes","")])
+            QtWidgets.QMessageBox.information(self,"ส่งออกแล้ว",path)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self,"ผิดพลาด",str(e))
+
+    def _export_deid_csv(self):
+        """
+        ส่งออกข้อมูลสำหรับวิเคราะห์แบบไม่ระบุตัวตน (de-identified)
+        แหล่งข้อมูล: self.sched.entries (ตาราง Result Schedule ภายในเครื่อง)
+        ฟิลด์สำคัญ: hn_hash, dept, or, queue, period, scheduled date/time, time_start, time_end, diags, ops, ward
+        """
+        path,_=QtWidgets.QFileDialog.getSaveFileName(self,"Export De-Identified CSV","cases_deid.csv","CSV (*.csv)")
+        if not path: return
+        try:
+            rows=[]
+            for e in self.sched.entries:
+                rows.append({
+                    "hn_hash": hn_hash(e.hn or ""),
+                    "dept": e.dept or "",
+                    "or": e.or_room or "",
+                    "queue": int(e.queue or 0),
+                    "period": e.period or "",
+                    "scheduled_date": str(e.date or ""),
+                    "scheduled_time": e.time or "",
+                    "time_start": e.time_start or "",
+                    "time_end": e.time_end or "",
+                    "diag": " | ".join(e.diags or []),
+                    "op": " | ".join(e.ops or []),
+                    "ward": e.ward or "",
+                    "doctor": e.doctor or "",
+                    # หมายเหตุ: ไม่ส่งออก HN/ชื่อ
+                })
+            with open(path,"w",newline="",encoding="utf-8-sig") as f:
+                cols=["hn_hash","dept","or","queue","period","scheduled_date","scheduled_time","time_start","time_end","diag","op","ward","doctor"]
+                w=csv.DictWriter(f, fieldnames=cols)
+                w.writeheader(); w.writerows(rows)
             QtWidgets.QMessageBox.information(self,"ส่งออกแล้ว",path)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self,"ผิดพลาด",str(e))
