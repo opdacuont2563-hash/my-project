@@ -131,7 +131,7 @@ class Card(QtWidgets.QFrame):
 # ---------------------- Config ----------------------
 DEFAULT_HOST = os.getenv("SURGIBOT_CLIENT_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.getenv("SURGIBOT_CLIENT_PORT", "8088"))
-DEFAULT_TOKEN = os.getenv("SURGIBOT_SECRET", "uTCoBelMyNfSSNmUulT_Kz6zrrCVkvD578MxEuLKZoaaXX0pVlpAD8toYHBxsFxI")
+DEFAULT_TOKEN = os.getenv("SURGIBOT_SECRET", "8HDYAANLgTyjbBK4JPGx1ooZbVC86_OMJ9uEXBm3EZTidUVyzhGiReaksGA0ites")
 
 API_HEALTH = "/api/health"; API_LIST="/api/list"; API_LIST_FULL="/api/list_full"; API_WS="/api/ws"
 
