@@ -1465,116 +1465,111 @@ class Main(QtWidgets.QWidget):
         return nurse_ok and time_ok
 
     def _render_tree2(self):
-        self.tree2.clear()
+        hbar = self.tree2.horizontalScrollBar()
+        old_hval = hbar.value()
+        self.tree2.setUpdatesEnabled(False)
 
-        # เลือก entries ที่ต้องแสดงตามกติกา
-        now_code = _now_period(datetime.now())  # "in" / "off"
-        in_monitor = self._monitor_hn_set()
+        try:
+            self.tree2.clear()
 
-        def should_show(entry: ScheduleEntry) -> bool:
-            if now_code == "in":
-                return True  # ในเวลาราชการ แสดงทั้งหมด
-            # นอกเวลาราชการ: แสดงเฉพาะ off-period และ in-period ที่ยังไม่เสร็จ (HN ยังอยู่ใน monitor)
-            return (entry.period == "off") or (entry.period == "in" and entry.hn in in_monitor)
+            # เลือก entries ที่ต้องแสดงตามกติกา
+            now_code = _now_period(datetime.now())  # "in" / "off"
+            in_monitor = self._monitor_hn_set()
 
-        entries_to_show: List[Tuple[int, ScheduleEntry]] = [
-            (idx, entry) for idx, entry in enumerate(self.sched.entries) if should_show(entry)
-        ]
+            def should_show(entry: ScheduleEntry) -> bool:
+                if now_code == "in":
+                    return True  # ในเวลาราชการ แสดงทั้งหมด
+                # นอกเวลาราชการ: แสดงเฉพาะ off-period และ in-period ที่ยังไม่เสร็จ (HN ยังอยู่ใน monitor)
+                return (entry.period == "off") or (entry.period == "in" and entry.hn in in_monitor)
 
-        # อัปเดตหัวการ์ด/แบนเนอร์ทุกครั้งที่เรนเดอร์
-        self._set_result_title()
+            entries_to_show: List[Tuple[int, ScheduleEntry]] = [
+                (idx, entry) for idx, entry in enumerate(self.sched.entries) if should_show(entry)
+            ]
 
-        # เคสไม่มีข้อมูลให้คืนค่าอย่างนุ่มนวล
-        if not entries_to_show:
+            # อัปเดตหัวการ์ด/แบนเนอร์ทุกครั้งที่เรนเดอร์
+            self._set_result_title()
+
+            # เคสไม่มีข้อมูลให้คืนค่าอย่างนุ่มนวล
+            if not entries_to_show:
+                return
+
+            # จัดกลุ่มตาม OR
+            groups: Dict[str, List[Tuple[int, ScheduleEntry]]] = {}
+            for idx, entry in entries_to_show:
+                groups.setdefault(entry.or_room or "-", []).append((idx, entry))
+
+            order=self.sched.or_rooms
+
+            def time_key(se:Tuple[int,ScheduleEntry]):
+                entry = se[1]
+                return entry.time or "99:99"
+
+            for orr in sorted(groups.keys(), key=lambda x: (order.index(x) if x in order else 999, x)):
+                parent=QtWidgets.QTreeWidgetItem(["", orr])
+                parent.setFirstColumnSpanned(True)
+                bg_brush = QtGui.QBrush(QtGui.QColor("#f6f9ff"))
+                parent.setBackground(0, bg_brush)
+                parent.setBackground(1, bg_brush)
+                pfont = parent.font(1)
+                pfont.setBold(True)
+                parent.setFont(1, pfont)
+                for c in range(self.tree2.columnCount()):
+                    parent.setData(c, QtCore.Qt.UserRole + 99, "grp")
+                self.tree2.addTopLevelItem(parent)
+
+                # คิว 1–9 มาก่อน (เรียงตามเลขคิว), คิว 0 ตามเวลา
+                rows_sorted = sorted(
+                    groups[orr],
+                    key=lambda se: (0, int(se[1].queue)) if int(se[1].queue or 0) > 0 else (1, time_key(se))
+                )
+
+                for idx, entry in rows_sorted:
+                    diag_txt = " with ".join(entry.diags) if entry.diags else "-"
+                    op_txt   = " with ".join(entry.ops)   if entry.ops   else "-"
+                    row=QtWidgets.QTreeWidgetItem([
+                        _period_label(entry.period),                # 0
+                        entry.time or "-",                          # 1
+                        entry.hn,                                   # 2
+                        entry.name or "-",                          # 3
+                        str(entry.age or 0),                        # 4
+                        diag_txt,                                   # 5
+                        op_txt,                                     # 6
+                        entry.doctor or "-",                        # 7
+                        entry.ward or "-",                          # 8
+                        entry.case_size or "-",                     # 9
+                        entry.dept or "-",                          # 10
+                        entry.assist1 or "-",                       # 11
+                        entry.assist2 or "-",                       # 12
+                        entry.scrub or "-",                         # 13
+                        entry.circulate or "-",                     # 14
+                        entry.time_start or "-",                    # 15
+                        entry.time_end or "-",                      # 16
+                        "",                                        # 17 (คิว: widget)
+                        entry.urgency or "Elective",                # 18
+                    ])
+                    row.setData(0, QtCore.Qt.UserRole, entry.uid())
+                    row.setData(0, QtCore.Qt.UserRole+1, idx)
+                    parent.addChild(row)
+
+                    qs = QueueSelectWidget(int(entry.queue or 0))
+                    uid = entry.uid()
+                    qs.changed.connect(lambda new_q, u=uid: self._apply_queue_select(u, int(new_q)))
+                    self.tree2.setItemWidget(row, 17, qs)
+
+                    # ขีดฆ่าเมื่อ "เสร็จแล้ว"
+                    # ปรับ: จะขีดเฉพาะเมื่อ HN เคยถูกเห็นใน Monitor แต่ขณะนี้ไม่อยู่ใน Monitor อีกต่อไป
+                    if (
+                        entry.hn
+                        and (entry.hn not in in_monitor)
+                        and (entry.hn in self._historical_monitor_seen)
+                        and self._is_entry_completed(entry)
+                    ):
+                        _apply_done_style(row, row.columnCount())
+
             self.tree2.expandAll()
-            self.tree2.header().setSectionResizeMode(17, QtWidgets.QHeaderView.ResizeToContents)
-            self.tree2.setColumnWidth(17, 160)
-            self.tree2.header().setSectionResizeMode(18, QtWidgets.QHeaderView.ResizeToContents)
-            self.tree2.setColumnWidth(18, 140)
-            self.tree2.resizeColumnToContents(5)
-            self.tree2.resizeColumnToContents(6)
-            return
-
-        # จัดกลุ่มตาม OR
-        groups: Dict[str, List[Tuple[int, ScheduleEntry]]] = {}
-        for idx, entry in entries_to_show:
-            groups.setdefault(entry.or_room or "-", []).append((idx, entry))
-
-        order=self.sched.or_rooms
-
-        def time_key(se:Tuple[int,ScheduleEntry]):
-            entry = se[1]
-            return entry.time or "99:99"
-
-        for orr in sorted(groups.keys(), key=lambda x: (order.index(x) if x in order else 999, x)):
-            parent=QtWidgets.QTreeWidgetItem(["", orr])
-            parent.setFirstColumnSpanned(True)
-            bg_brush = QtGui.QBrush(QtGui.QColor("#f6f9ff"))
-            parent.setBackground(0, bg_brush)
-            parent.setBackground(1, bg_brush)
-            pfont = parent.font(1)
-            pfont.setBold(True)
-            parent.setFont(1, pfont)
-            for c in range(self.tree2.columnCount()):
-                parent.setData(c, QtCore.Qt.UserRole + 99, "grp")
-            self.tree2.addTopLevelItem(parent)
-
-            # คิว 1–9 มาก่อน (เรียงตามเลขคิว), คิว 0 ตามเวลา
-            rows_sorted = sorted(
-                groups[orr],
-                key=lambda se: (0, int(se[1].queue)) if int(se[1].queue or 0) > 0 else (1, time_key(se))
-            )
-
-            for idx, entry in rows_sorted:
-                diag_txt = " with ".join(entry.diags) if entry.diags else "-"
-                op_txt   = " with ".join(entry.ops)   if entry.ops   else "-"
-                row=QtWidgets.QTreeWidgetItem([
-                    _period_label(entry.period),                # 0
-                    entry.time or "-",                          # 1
-                    entry.hn,                                   # 2
-                    entry.name or "-",                          # 3
-                    str(entry.age or 0),                        # 4
-                    diag_txt,                                   # 5
-                    op_txt,                                     # 6
-                    entry.doctor or "-",                        # 7
-                    entry.ward or "-",                          # 8
-                    entry.case_size or "-",                     # 9
-                    entry.dept or "-",                          # 10
-                    entry.assist1 or "-",                       # 11
-                    entry.assist2 or "-",                       # 12
-                    entry.scrub or "-",                         # 13
-                    entry.circulate or "-",                     # 14
-                    entry.time_start or "-",                    # 15
-                    entry.time_end or "-",                      # 16
-                    "",                                        # 17 (คิว: widget)
-                    entry.urgency or "Elective",                # 18
-                ])
-                row.setData(0, QtCore.Qt.UserRole, entry.uid())
-                row.setData(0, QtCore.Qt.UserRole+1, idx)
-                parent.addChild(row)
-
-                qs = QueueSelectWidget(int(entry.queue or 0))
-                uid = entry.uid()
-                qs.changed.connect(lambda new_q, u=uid: self._apply_queue_select(u, int(new_q)))
-                self.tree2.setItemWidget(row, 17, qs)
-
-                # ขีดฆ่าเมื่อ "เสร็จแล้ว"
-                # ปรับ: จะขีดเฉพาะเมื่อ HN เคยถูกเห็นใน Monitor แต่ขณะนี้ไม่อยู่ใน Monitor อีกต่อไป
-                if (
-                    entry.hn
-                    and (entry.hn not in in_monitor)
-                    and (entry.hn in self._historical_monitor_seen)
-                    and self._is_entry_completed(entry)
-                ):
-                    _apply_done_style(row, row.columnCount())
-
-        self.tree2.expandAll()
-        self.tree2.header().setSectionResizeMode(17, QtWidgets.QHeaderView.ResizeToContents)
-        self.tree2.setColumnWidth(17, 160)
-        self.tree2.header().setSectionResizeMode(18, QtWidgets.QHeaderView.ResizeToContents)
-        self.tree2.setColumnWidth(18, 140)
-        self.tree2.resizeColumnToContents(5)
-        self.tree2.resizeColumnToContents(6)
+        finally:
+            self.tree2.setUpdatesEnabled(True)
+            QtCore.QTimer.singleShot(0, lambda: hbar.setValue(min(old_hval, hbar.maximum())))
 
     def _apply_queue_select(self, uid: str, new_q: int):
         target=None; target_idx=None
@@ -1592,12 +1587,6 @@ class Main(QtWidgets.QWidget):
         self._set_result_title()
         self._render_tree2()
         self._flash_row_by_uid(uid)
-        self.tree2.header().setSectionResizeMode(17, QtWidgets.QHeaderView.ResizeToContents)
-        self.tree2.setColumnWidth(17, 160)
-        self.tree2.header().setSectionResizeMode(18, QtWidgets.QHeaderView.ResizeToContents)
-        self.tree2.setColumnWidth(18, 140)
-        self.tree2.resizeColumnToContents(5)
-        self.tree2.resizeColumnToContents(6)
 
     def _find_item_by_uid(self, uid:str):
         root = self.tree2.invisibleRootItem()
@@ -1626,9 +1615,24 @@ class Main(QtWidgets.QWidget):
         if not uid: return
         it = self._find_item_by_uid(uid)
         if not it: return
-        self.tree2.scrollToItem(it, QtWidgets.QAbstractItemView.PositionAtCenter)
+        hbar = self.tree2.horizontalScrollBar()
+        old_hval = hbar.value()
+
+        rect = self.tree2.visualItemRect(it)
+        if not rect.isValid():
+            index = self.tree2.indexFromItem(it)
+            if index.isValid():
+                self.tree2.scrollTo(index, QtWidgets.QAbstractItemView.PositionAtCenter)
+                rect = self.tree2.visualItemRect(it)
+
+        if rect.isValid():
+            vbar = self.tree2.verticalScrollBar()
+            target = rect.y() + vbar.value() - (self.tree2.viewport().height() // 2)
+            vbar.setValue(max(0, min(target, vbar.maximum())))
+
         self.tree2.setCurrentItem(it)
         self._flash_row_by_uid(uid)
+        QtCore.QTimer.singleShot(0, lambda: hbar.setValue(min(old_hval, hbar.maximum())))
 
     # ---------- Result context menu / Double-click ----------
     def _result_ctx_menu(self, pos: QtCore.QPoint):
