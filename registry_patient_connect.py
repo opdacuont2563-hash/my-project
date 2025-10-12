@@ -135,6 +135,40 @@ class Card(QtWidgets.QFrame):
         self.grid.setHorizontalSpacing(14); self.grid.setVerticalSpacing(12)
         v.addWidget(self.body); add_shadow(self)
 
+class InfoBanner(QtWidgets.QFrame):
+    def __init__(self, title:str="", subtitle:str=""):
+        super().__init__()
+        self.setObjectName("InfoBanner")
+        self.setStyleSheet("""
+        QFrame#InfoBanner{
+            background:#eaf6ff;
+            border:1px solid #cfe4ff;
+            border-radius:14px;
+        }
+        QLabel[role='title']{
+            font-weight:900; font-size:13.5pt; color:#0f172a;
+        }
+        QLabel[role='sub']{
+            color:#64748b; font-size:10pt;
+        }
+        QLabel[role='icon']{
+            font-size:16pt; padding-right:6px;
+        }
+        """)
+        lay = QtWidgets.QVBoxLayout(self); lay.setContentsMargins(14,10,14,10); lay.setSpacing(4)
+
+        top = QtWidgets.QHBoxLayout(); top.setSpacing(8)
+        self.icon = QtWidgets.QLabel("📁"); self.icon.setProperty("role","icon")
+        self.title_lbl = QtWidgets.QLabel(title); self.title_lbl.setProperty("role","title")
+        top.addWidget(self.icon, 0); top.addWidget(self.title_lbl, 1); top.addStretch(1)
+
+        self.sub_lbl = QtWidgets.QLabel(subtitle); self.sub_lbl.setProperty("role","sub")
+
+        lay.addLayout(top); lay.addWidget(self.sub_lbl)
+
+    def set_title(self, text:str): self.title_lbl.setText(text or "")
+    def set_subtitle(self, text:str): self.sub_lbl.setText(text or "")
+
 # ---------------------- Config ----------------------
 DEFAULT_HOST = os.getenv("SURGIBOT_CLIENT_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.getenv("SURGIBOT_CLIENT_PORT", "8088"))
@@ -792,7 +826,11 @@ class Main(QtWidgets.QWidget):
 
         # TAB 2 — Result Schedule
         tab2 = QtWidgets.QWidget(); t2 = QtWidgets.QVBoxLayout(tab2); t2.setSpacing(12)
+        self.result_banner = InfoBanner("", "ห้องผ่าตัดโรงพยาบาลหนองบัวลำภู")
+        add_shadow(self.result_banner, blur=30, x=0, y=6, color="#30000000")
+        t2.addWidget(self.result_banner)
         self.card_result = Card("ตารางการผ่าตัด ประจำวัน", "ห้องผ่าตัดโรงพยาบาลหนองบัวลำภู")
+        self.card_result.title_lbl.hide()
         gr2 = self.card_result.grid
         self.tree2 = QtWidgets.QTreeWidget()
         # เพิ่มคอลัมน์ให้ครอบคลุมข้อมูลจากแท็บ 1 และเปิดสกรอลล์แนวนอน
@@ -1290,10 +1328,7 @@ class Main(QtWidgets.QWidget):
             self.toast.show_toast("อัปเดตรายการสำเร็จ")
             self._set_add_mode()
 
-        now = datetime.now()
-        self.card_result.title_lbl.setText(
-            f"ตารางการผ่าตัด ประจำวัน ({now:%d/%m/%Y}) เวลา {now:%H:%M} น. ห้องผ่าตัดโรงพยาบาลหนองบัวลำภู"
-        )
+        self._set_result_title()
         self._render_tree2()
 
         # เด้งไปแท็บ Result และโฟกัส/ไฮไลต์ชื่อผู้ป่วย
@@ -1339,11 +1374,8 @@ class Main(QtWidgets.QWidget):
             (idx, entry) for idx, entry in enumerate(self.sched.entries) if should_show(entry)
         ]
 
-        # อัปเดตหัวการ์ดเป็นรูปแบบที่ขอทุกครั้งที่เรนเดอร์
-        now = datetime.now()
-        self.card_result.title_lbl.setText(
-            f"ตารางการผ่าตัด ประจำวัน ({now:%d/%m/%Y}) เวลา {now:%H:%M} น. ห้องผ่าตัดโรงพยาบาลหนองบัวลำภู"
-        )
+        # อัปเดตหัวการ์ด/แบนเนอร์ทุกครั้งที่เรนเดอร์
+        self._set_result_title()
 
         # เคสไม่มีข้อมูลให้คืนค่าอย่างนุ่มนวล
         if not entries_to_show:
@@ -1368,13 +1400,14 @@ class Main(QtWidgets.QWidget):
         for orr in sorted(groups.keys(), key=lambda x: (order.index(x) if x in order else 999, x)):
             parent=QtWidgets.QTreeWidgetItem(["", orr])
             parent.setFirstColumnSpanned(True)
-            # style parent group ให้โทนอ่อนสะอาด
             bg_brush = QtGui.QBrush(QtGui.QColor("#f6f9ff"))
-            for col in range(self.tree2.columnCount()):
-                parent.setBackground(col, bg_brush)
+            parent.setBackground(0, bg_brush)
+            parent.setBackground(1, bg_brush)
             pfont = parent.font(1)
             pfont.setBold(True)
             parent.setFont(1, pfont)
+            for c in range(self.tree2.columnCount()):
+                parent.setData(c, QtCore.Qt.UserRole + 99, "grp")
             self.tree2.addTopLevelItem(parent)
 
             # คิว 1–9 มาก่อน (เรียงตามเลขคิว), คิว 0 ตามเวลา
@@ -1444,10 +1477,7 @@ class Main(QtWidgets.QWidget):
         try: QtWidgets.QApplication.beep()
         except Exception: pass
         self._notify("อัปเดตคิวสำเร็จ", f"OR {target.or_room} • HN {target.hn} → คิว {new_q or 'ตามเวลา'}")
-        now = datetime.now()
-        self.card_result.title_lbl.setText(
-            f"ตารางการผ่าตัด ประจำวัน ({now:%d/%m/%Y}) เวลา {now:%H:%M} น. ห้องผ่าตัดโรงพยาบาลหนองบัวลำภู"
-        )
+        self._set_result_title()
         self._render_tree2()
         self._flash_row_by_uid(uid)
         self.tree2.header().setSectionResizeMode(17, QtWidgets.QHeaderView.ResizeToContents)
@@ -1625,6 +1655,12 @@ class Main(QtWidgets.QWidget):
     def _notify(self, title:str, msg:str):
         try: self.tray.showMessage(title, msg, QtWidgets.QSystemTrayIcon.Information, 3000)
         except Exception: pass
+
+    def _set_result_title(self):
+        now = datetime.now()
+        txt = f"ตารางการผ่าตัด ประจำวัน ({now:%d/%m/%Y}) เวลา {now:%H:%M} น. ห้องผ่าตัดโรงพยาบาลหนองบัวลำภู"
+        self.result_banner.set_title(txt)
+        self.card_result.title_lbl.setText(txt)
 
     # ---------- seq watcher ----------
     def _check_seq(self):
