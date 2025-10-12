@@ -723,6 +723,7 @@ class Main(QtWidgets.QWidget):
         self._current_monitor_hn: set[str] = set()
         self._sched_history_by_hn: dict[str, list[_SchedEntry]] = {}
         self._history_alert_counts: dict[str, int] = {}
+        self._active_history_alerts: list[QtWidgets.QMessageBox] = []
 
         self.setWindowTitle("SurgiBot Client — Modern (PySide6)")
         self.resize(1440, 900)
@@ -943,6 +944,10 @@ class Main(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def _acknowledge_history_alert(self, hn: str, expected: int):
+        actual_total = len(self._sched_history_by_hn.get(hn, []))
+        self._history_alert_counts[hn] = max(actual_total, expected)
+
     def _maybe_show_repeat_history(self, hn: str, current: _SchedEntry | None = None):
         if not hn:
             return
@@ -979,8 +984,38 @@ class Main(QtWidgets.QWidget):
             current_index = len(history) - 1
             current = history[current_index]
 
-        latest_entry = history[-1]
-        previous_entry = history[current_index - 1] if current_index > 0 else None
+        def _entry_day(entry: _SchedEntry):
+            if entry.date_obj:
+                return entry.date_obj
+            if entry.date:
+                parsed = _parse_date(entry.date)
+                if parsed:
+                    return parsed
+            return None
+
+        current_day = _entry_day(current) or datetime.now().date()
+
+        past_entries = history[:current_index]
+        future_entries = history[current_index + 1:]
+
+        latest_past_entry = None
+        for entry in reversed(past_entries):
+            entry_day = _entry_day(entry)
+            if entry_day is None:
+                if latest_past_entry is None:
+                    latest_past_entry = entry
+                continue
+            if entry_day < current_day:
+                latest_past_entry = entry
+                break
+
+        if latest_past_entry is None:
+            for entry in reversed(past_entries):
+                if _entry_day(entry) is None:
+                    latest_past_entry = entry
+                    break
+
+        next_entry = future_entries[0] if future_entries else None
 
         def _format_line(idx: int, entry: _SchedEntry, mark_current: bool, mark_latest: bool) -> str:
             date_txt = _fmt_date(entry)
@@ -990,7 +1025,7 @@ class Main(QtWidgets.QWidget):
             if mark_current:
                 tags.append("วันนี้")
             if mark_latest:
-                tags.append("ล่าสุด")
+                tags.append("ล่าสุดก่อนหน้า")
             tag_txt = f" [{' / '.join(tags)}]" if tags else ""
             return f"{idx}. {date_txt} {time_txt} • {ops_txt}{tag_txt}"
 
@@ -1001,7 +1036,7 @@ class Main(QtWidgets.QWidget):
                     idx,
                     entry,
                     mark_current=(entry is current),
-                    mark_latest=(entry is latest_entry),
+                    mark_latest=(entry is latest_past_entry),
                 )
             )
 
@@ -1013,14 +1048,14 @@ class Main(QtWidgets.QWidget):
             f"หัตถการ: {_fmt_ops(current)}",
         ]
 
-        if previous_entry is not None:
+        if latest_past_entry is not None:
             summary_parts.append(
-                f"ครั้งล่าสุดก่อนหน้า: {_fmt_date(previous_entry)} {previous_entry.time or '-'}"
+                f"ครั้งล่าสุดก่อนหน้า (ไม่รวมวันนี้): {_fmt_date(latest_past_entry)} {latest_past_entry.time or '-'}"
             )
 
-        if latest_entry is not current:
+        if next_entry is not None:
             summary_parts.append(
-                f"กำหนดครั้งถัดไป: {_fmt_date(latest_entry)} {latest_entry.time or '-'}"
+                f"รอบถัดไป: {_fmt_date(next_entry)} {next_entry.time or '-'}"
             )
 
         message_text = "\n".join(part for part in summary_parts if part is not None)
@@ -1031,10 +1066,18 @@ class Main(QtWidgets.QWidget):
         box.setTextFormat(QtCore.Qt.PlainText)
         box.setText(message_text)
         box.setStandardButtons(QtWidgets.QMessageBox.Ok)
-        box.exec()
 
-        actual_total = len(self._sched_history_by_hn.get(hn, []))
-        self._history_alert_counts[hn] = max(actual_total, len(history))
+        self._active_history_alerts.append(box)
+
+        def _on_finished(result, *, hn=hn, expected=len(history), ref=box):
+            if result == QtWidgets.QMessageBox.Ok:
+                self._acknowledge_history_alert(hn, expected)
+            if ref in self._active_history_alerts:
+                self._active_history_alerts.remove(ref)
+            ref.deleteLater()
+
+        box.finished.connect(_on_finished)
+        box.open()
 
     def _make_form_label(self, text: str) -> QtWidgets.QLabel:
         lbl = QtWidgets.QLabel(text)
