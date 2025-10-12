@@ -813,16 +813,70 @@ class Main(QtWidgets.QWidget):
         self.tree2.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.tree2.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
         self.tree2.setStyleSheet("""
-            QTreeWidget{ background:#ffffff; border-radius:16px; gridline-color:#eef2ff; }
-            QTreeWidget::item{ margin:2px 4px; }
-            QTreeWidget::item:alternate{ background:#f8fbff; }
-            QTreeWidget::item:selected{ background:rgba(37,99,235,0.16); border-radius:10px; }
-            QTreeWidget::item:hover{ background:rgba(2,132,199,0.08); }
-            QHeaderView::section{ background:#0f2167; color:#ffffff; border:0; padding:12px 16px; font-weight:900; letter-spacing:.2px; }
+            /* ตัวตาราง */
+            QTreeWidget{
+                background:#ffffff;
+                border:1px solid #dfe6f0;
+                border-radius:12px;
+                gridline-color:#e8edf5;
+            }
+
+            /* Header โปร่งใสเพื่อให้มุมบนโค้งจาก section แรก/สุดท้ายทำงาน */
+            QHeaderView{
+                background:transparent;
+                border:none;
+                margin:0;
+                padding:0;
+            }
+
+            /* หัวคอลัมน์: โทนขาวฟ้าอ่อน ขอบชัด ตัวหนา */
+            QHeaderView::section{
+                background:#f6f9ff;
+                color:#0f172a;
+                font-weight:900;
+                letter-spacing:.2px;
+                padding:12px 14px;
+                border-top:1px solid #dfe6f0;
+                border-bottom:1px solid #dfe6f0;
+                border-right:1px solid #dfe6f0;
+            }
+
+            /* มุมบนซ้าย/ขวาโค้ง */
+            QHeaderView::section:first{
+                border-top-left-radius:12px;
+                border-left:1px solid #dfe6f0;
+            }
+            QHeaderView::section:last{
+                border-top-right-radius:12px;
+                border-right:1px solid #dfe6f0;
+            }
+
+            /* Hover/Pressed ลดเงาเล็กน้อย */
+            QHeaderView::section:hover{
+                background:#eef4ff;
+            }
+            QHeaderView::section:pressed{
+                background:#e7efff;
+            }
+
+            /* ไอเท็มในตาราง */
+            QTreeWidget::item{
+                height:36px;
+            }
+            QTreeWidget::item:alternate{
+                background:#fbfdff;
+            }
+            QTreeWidget::item:selected{
+                background:rgba(37,99,235,0.12);
+                border-radius:8px;
+            }
+            QTreeWidget::item:hover{
+                background:rgba(2,132,199,0.06);
+            }
         """)
         hdr=self.tree2.header(); hdr.setStretchLastSection(False)
         hdr.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        hdr.setFixedHeight(40)
+        hdr.setFixedHeight(42)
         # ให้คอลัมน์ยืดบางส่วน และเลื่อนแนวนอนได้เมื่อกว้างเกิน
         for i in (0,1,2,3,4,7,8,9,10,11,12,13,14,15,16,17):
             hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
@@ -1314,12 +1368,13 @@ class Main(QtWidgets.QWidget):
         for orr in sorted(groups.keys(), key=lambda x: (order.index(x) if x in order else 999, x)):
             parent=QtWidgets.QTreeWidgetItem(["", orr])
             parent.setFirstColumnSpanned(True)
-            # style parent group
+            # style parent group ให้โทนอ่อนสะอาด
+            bg_brush = QtGui.QBrush(QtGui.QColor("#f6f9ff"))
+            for col in range(self.tree2.columnCount()):
+                parent.setBackground(col, bg_brush)
             pfont = parent.font(1)
             pfont.setBold(True)
             parent.setFont(1, pfont)
-            parent.setBackground(0, QtGui.QBrush(QtGui.QColor("#f1f5f9")))
-            parent.setBackground(1, QtGui.QBrush(QtGui.QColor("#f1f5f9")))
             self.tree2.addTopLevelItem(parent)
 
             # คิว 1–9 มาก่อน (เรียงตามเลขคิว), คิว 0 ตามเวลา
