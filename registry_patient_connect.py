@@ -136,38 +136,66 @@ class Card(QtWidgets.QFrame):
         v.addWidget(self.body); add_shadow(self)
 
 class InfoBanner(QtWidgets.QFrame):
-    def __init__(self, title:str="", subtitle:str=""):
+    def __init__(self, title: str = "", subtitle: str = "", variant: str = "blue", icon: str = "📁"):
         super().__init__()
         self.setObjectName("InfoBanner")
-        self.setStyleSheet("""
-        QFrame#InfoBanner{
-            background:#eaf6ff;
-            border:1px solid #cfe4ff;
+        self._variants = {
+            "blue": {"bg": "#eaf6ff", "bd": "#cfe4ff", "accent": "#3b82f6"},
+            "violet": {"bg": "#f4efff", "bd": "#e0d4ff", "accent": "#7c3aed"},
+            "green": {"bg": "#eafaf3", "bd": "#cfeedd", "accent": "#10b981"},
+        }
+        pal = self._variants.get(variant, self._variants["blue"])
+
+        self.setStyleSheet(
+            f"""
+        QFrame#InfoBanner {{
+            background:{pal['bg']};
+            border:1px solid {pal['bd']};
             border-radius:14px;
-        }
-        QLabel[role='title']{
-            font-weight:900; font-size:13.5pt; color:#0f172a;
-        }
-        QLabel[role='sub']{
-            color:#64748b; font-size:10pt;
-        }
-        QLabel[role='icon']{
-            font-size:16pt; padding-right:6px;
-        }
-        """)
-        lay = QtWidgets.QVBoxLayout(self); lay.setContentsMargins(14,10,14,10); lay.setSpacing(4)
+        }}
+        QLabel[role='title']{{ font-weight:900; font-size:14pt; color:#0f172a; letter-spacing:.2px; }}
+        QLabel[role='sub']  {{ color:#64748b; font-size:10pt; }}
+        """
+        )
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(12)
 
-        top = QtWidgets.QHBoxLayout(); top.setSpacing(8)
-        self.icon = QtWidgets.QLabel("📁"); self.icon.setProperty("role","icon")
-        self.title_lbl = QtWidgets.QLabel(title); self.title_lbl.setProperty("role","title")
-        top.addWidget(self.icon, 0); top.addWidget(self.title_lbl, 1); top.addStretch(1)
+        accent = QtWidgets.QFrame()
+        accent.setFixedWidth(8)
+        accent.setStyleSheet(f"QFrame{{background:{pal['accent']}; border-radius:8px;}}")
+        lay.addWidget(accent, 0)
 
-        self.sub_lbl = QtWidgets.QLabel(subtitle); self.sub_lbl.setProperty("role","sub")
+        inner = QtWidgets.QVBoxLayout()
+        inner.setSpacing(4)
+        top = QtWidgets.QHBoxLayout()
+        top.setSpacing(8)
 
-        lay.addLayout(top); lay.addWidget(self.sub_lbl)
+        self.icon_lbl = QtWidgets.QLabel(icon)
+        self.icon_lbl.setStyleSheet("font-size:16pt;")
+        self.title_lbl = QtWidgets.QLabel(title)
+        self.title_lbl.setProperty("role", "title")
+        top.addWidget(self.icon_lbl, 0)
+        top.addWidget(self.title_lbl, 1)
+        top.addStretch(1)
 
-    def set_title(self, text:str): self.title_lbl.setText(text or "")
-    def set_subtitle(self, text:str): self.sub_lbl.setText(text or "")
+        self.sub_lbl = QtWidgets.QLabel(subtitle)
+        self.sub_lbl.setProperty("role", "sub")
+
+        inner.addLayout(top)
+        inner.addWidget(self.sub_lbl)
+        lay.addLayout(inner, 1)
+
+        add_shadow(self, blur=30, x=0, y=6, color="#2a000000")
+
+    def set_title(self, text: str):
+        self.title_lbl.setText(text or "")
+
+    def set_subtitle(self, text: str):
+        self.sub_lbl.setText(text or "")
+
+    def set_icon(self, text: str):
+        self.icon_lbl.setText(text or "📁")
 
 # ---------------------- Config ----------------------
 DEFAULT_HOST = os.getenv("SURGIBOT_CLIENT_HOST", "127.0.0.1")
@@ -743,7 +771,15 @@ class Main(QtWidgets.QWidget):
         # TAB 1 — ลงทะเบียน (ห่อด้วย ScrollArea เพื่อป้องกันคอนโทรลหด)
         tab1_inner = QtWidgets.QWidget()
         t1 = QtWidgets.QVBoxLayout(tab1_inner); t1.setSpacing(12); t1.setContentsMargins(0,0,0,0)
+        t1_banner = InfoBanner(
+            title="ลงทะเบียนผู้ป่วย (Schedule — Private)",
+            subtitle="ข้อมูลเก็บในเครื่อง และแชร์ให้โปรแกรมหลักแบบเรียลไทม์",
+            variant="blue",
+            icon="📝",
+        )
+        t1.addWidget(t1_banner)
         form = Card("ลงทะเบียนผู้ป่วย (Schedule — Private)", "ข้อมูลเก็บในเครื่อง และแชร์ให้โปรแกรมหลักแบบเรียลไทม์")
+        form.title_lbl.hide()
         g=form.grid; r=0
         g.setColumnStretch(0, 0); g.setColumnStretch(1, 2); g.setColumnStretch(2, 0); g.setColumnStretch(3, 1)
         g.setColumnStretch(4, 0); g.setColumnStretch(5, 2)
@@ -883,7 +919,6 @@ class Main(QtWidgets.QWidget):
         # TAB 2 — Result Schedule
         tab2 = QtWidgets.QWidget(); t2 = QtWidgets.QVBoxLayout(tab2); t2.setSpacing(12)
         self.result_banner = InfoBanner("", "ห้องผ่าตัดโรงพยาบาลหนองบัวลำภู")
-        add_shadow(self.result_banner, blur=30, x=0, y=6, color="#30000000")
         t2.addWidget(self.result_banner)
         self.card_result = Card("ตารางการผ่าตัด ประจำวัน", "ห้องผ่าตัดโรงพยาบาลหนองบัวลำภู")
         self.card_result.title_lbl.hide()
@@ -988,7 +1023,14 @@ class Main(QtWidgets.QWidget):
         self.tabs.addTab(tab2, "Result Schedule")
 
         # TAB 3 — Monitor
-        tab3 = QtWidgets.QWidget(); t3 = QtWidgets.QVBoxLayout(tab3); t3.setSpacing(12)
+        tab3 = QtWidgets.QWidget(); t3 = QtWidgets.QVBoxLayout(tab3); t3.setSpacing(12); t3.setContentsMargins(0,0,0,0)
+        t3_banner = InfoBanner(
+            title="Result (Monitor) — จากเซิร์ฟเวอร์",
+            subtitle="",
+            variant="violet",
+            icon="🗓️",
+        )
+        t3.addWidget(t3_banner)
         server_bar = QtWidgets.QFrame(); server_bar.setStyleSheet("QFrame{background:#fff;border:1px solid #e6eaf2;border-radius:14px;padding:8px;}"); add_shadow(server_bar)
         hb = QtWidgets.QHBoxLayout(server_bar); hb.setContentsMargins(8,8,8,8)
         self.ent_host = QtWidgets.QLineEdit("127.0.0.1"); self.ent_host.setMaximumWidth(180); self.ent_host.setEchoMode(QtWidgets.QLineEdit.Password)
