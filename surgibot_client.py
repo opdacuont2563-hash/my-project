@@ -100,7 +100,8 @@ class _SchedEntry:
         self.time = str(d.get("time","") or "")
         self.hn = str(d.get("hn","") or "")
         self.name = str(d.get("name","") or "")
-        self.age = int(d.get("age") or 0)
+        age_val = d.get("age")
+        self.age = str(age_val) if age_val not in (None, "") else ""
         self.dept = str(d.get("dept","") or "")
         self.doctor = str(d.get("doctor","") or "")
         self.diags = d.get("diags") or []
@@ -108,6 +109,14 @@ class _SchedEntry:
         self.ward = str(d.get("ward","") or "")
         self.queue = int(d.get("queue") or 1)
         self.period = str(d.get("period") or "in")
+        self.case_size = str(d.get("case_size", "") or "")
+        self.urgency = str(d.get("urgency", "Elective") or "Elective")
+        self.assist1 = str(d.get("assist1", "") or "")
+        self.assist2 = str(d.get("assist2", "") or "")
+        self.scrub = str(d.get("scrub", "") or "")
+        self.circulate = str(d.get("circulate", "") or "")
+        self.time_start = str(d.get("time_start", "") or "")
+        self.time_end = str(d.get("time_end", "") or "")
 class SharedScheduleReader:
     def __init__(self):
         self.s = QSettings(ORG_NAME, APP_SHARED)
@@ -457,74 +466,16 @@ class ElideDelegate(QtWidgets.QStyledItemDelegate):
 
 # ---------- Schedule delegate (wrap + watermark + column lines) ----------
 class ScheduleDelegate(QtWidgets.QStyledItemDelegate):
-    WRAP_COLS = {2, 4, 5, 6, 7}
-    WATERMARK = "ผ่าตัดเสร็จและส่งกลับตึกเรียบร้อยแล้ว"
     def __init__(self, tree: QtWidgets.QTreeWidget):
         super().__init__(tree)
         self._tree = tree
 
-    def _draw_wrapped_text(self, painter, option, index):
-        opt = QtWidgets.QStyleOptionViewItem(option)
-        self.initStyleOption(opt, index)
-
-        view = opt.widget
-        col_w = max(10, view.columnWidth(index.column()) - 12)
-
-        doc = QtGui.QTextDocument()
-        doc.setDefaultFont(opt.font)
-        doc.setTextWidth(col_w)
-        doc.setPlainText(opt.text)
-
-        painter.save()
-        # FIX: clear text before style painting to avoid double text
-        opt_no_text = QtWidgets.QStyleOptionViewItem(opt)
-        opt_no_text.text = ""
-        style = opt.widget.style() if isinstance(opt.widget, QtWidgets.QWidget) else QtWidgets.QApplication.style()
-        style.drawControl(QtWidgets.QStyle.CE_ItemViewItem, opt_no_text, painter, opt.widget)
-
-        painter.translate(opt.rect.topLeft())
-        clip = QtCore.QRectF(0, 0, col_w, opt.rect.height())
-        doc.drawContents(painter, clip)
-        painter.restore()
-
-    def sizeHint(self, option, index):
-        if index.column() in self.WRAP_COLS and index.model():
-            view = option.widget
-            col_w = max(10, view.columnWidth(index.column()) - 12)
-            fm = option.fontMetrics
-            doc = QtGui.QTextDocument()
-            doc.setDefaultFont(option.font)
-            doc.setTextWidth(col_w)
-            doc.setPlainText(index.data())
-            h = int(doc.size().height()) + 8
-            h = max(h, max(34, fm.height() + 12))
-            return QtCore.QSize(col_w, h)
-        return super().sizeHint(option, index)
-
     def paint(self, painter, option, index):
-        item = self._tree.itemFromIndex(index)
-        is_child = bool(item and item.parent() is not None)
-
-        if index.column() in self.WRAP_COLS and is_child:
-            self._draw_wrapped_text(painter, option, index)  # do not call super() here
-        else:
-            super().paint(painter, option, index)
+        super().paint(painter, option, index)
 
         try:
-            is_completed = (index.data(QtCore.Qt.UserRole) == "completed")
-            if is_completed and index.column() == 2:
-                painter.save()
-                painter.setRenderHint(QPainter.Antialiasing, True)
-                r = option.rect
-                f = option.font; f.setBold(True)
-                painter.setFont(f)
-                painter.setPen(QtGui.QColor(100, 116, 139, 120))
-                painter.drawText(r, QtCore.Qt.AlignCenter, self.WATERMARK)
-                painter.restore()
-        except Exception:
-            pass
-
-        try:
+            item = self._tree.itemFromIndex(index)
+            is_child = bool(item and item.parent() is not None)
             if is_child and index.column() < (self._tree.columnCount() - 1):
                 painter.save()
                 painter.setPen(QtGui.QPen(QtGui.QColor("#eef2f7")))
@@ -960,7 +911,7 @@ class Main(QtWidgets.QWidget):
         if hdr is None:
             return
         hdr.setStretchLastSection(False)
-        for c in (0, 1, 3, 8, 9):
+        for c in (0, 1, 3, 8, 18):
             try:
                 tree.resizeColumnToContents(c)
             except Exception:
@@ -1184,16 +1135,38 @@ QCheckBox { color:#0f172a; }
         )
         gs = self.card_sched.grid(); gs.setContentsMargins(0,0,0,0)
         self.tree_sched = QtWidgets.QTreeWidget()
-        self.tree_sched.setColumnCount(10)
-        self.tree_sched.setHeaderLabels(["OR/เวลา", "HN", "ชื่อ-สกุล", "อายุ", "Diagnosis", "Operation", "แพทย์", "Ward", "คิว", "สถานะ"])
-        self.tree_sched.setWordWrap(True); self.tree_sched.setUniformRowHeights(False)
-        hdr = self.tree_sched.header(); hdr.setStretchLastSection(False)
-        hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
-        for i in range(1, 10):
-            mode = QtWidgets.QHeaderView.Stretch if i in (4, 5) else QtWidgets.QHeaderView.ResizeToContents
-            hdr.setSectionResizeMode(i, mode)
+        self.tree_sched.setColumnCount(19)
+        self.tree_sched.setHeaderLabels([
+            "ช่วงเวลา",
+            "OR/เวลา",
+            "HN",
+            "ชื่อ-สกุล",
+            "อายุ",
+            "Diagnosis",
+            "Operation",
+            "แพทย์",
+            "Ward",
+            "ขนาดเคส",
+            "แผนก",
+            "Assist1",
+            "Assist2",
+            "Scrub",
+            "Circulate",
+            "เริ่ม",
+            "จบ",
+            "คิว",
+            "ประเภทเคส",
+        ])
+        self.tree_sched.setUniformRowHeights(False)
+        hdr = self.tree_sched.header()
+        hdr.setStretchLastSection(False)
+        for i in range(19):
+            hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
+        self.tree_sched.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.tree_sched.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
         self.tree_sched.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self.tree_sched.setTextElideMode(QtCore.Qt.ElideNone)
+        self.tree_sched.setWordWrap(False)
         self.tree_sched.setObjectName("ScheduleTree")
         self.tree_sched.setAlternatingRowColors(True)
         self.tree_sched.setStyleSheet("""
@@ -1209,19 +1182,6 @@ QCheckBox { color:#0f172a; }
         QTreeWidget#ScheduleTree::item { padding:6px 8px; border-bottom:1px solid #e9edf3; }
         QTreeWidget#ScheduleTree::item:selected { background:#e0f2fe; color:#0f172a; }
         """)
-        self.tree_sched.setUniformRowHeights(False); self.tree_sched.setWordWrap(True)
-        m = QtWidgets.QHeaderView
-        hdr.setStretchLastSection(False)
-        hdr.setSectionResizeMode(0, m.ResizeToContents)
-        hdr.setSectionResizeMode(1, m.ResizeToContents)
-        hdr.setSectionResizeMode(2, m.Stretch)
-        hdr.setSectionResizeMode(3, m.ResizeToContents)
-        hdr.setSectionResizeMode(4, m.Stretch)
-        hdr.setSectionResizeMode(5, m.Stretch)
-        hdr.setSectionResizeMode(6, m.Stretch)
-        hdr.setSectionResizeMode(7, m.Stretch)
-        hdr.setSectionResizeMode(8, m.ResizeToContents)
-        hdr.setSectionResizeMode(9, m.ResizeToContents)
         self.tree_sched.setItemDelegate(ScheduleDelegate(self.tree_sched))
         gs.addWidget(self.tree_sched, 0, 0, 1, 1)
         self.tree_sched.itemClicked.connect(self._on_sched_item_clicked)
@@ -1562,7 +1522,7 @@ QCheckBox { color:#0f172a; }
             # เวลาแสดงผล
             self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(self._render_time_cell(r)))
 
-        # 4) วาดตาราง Schedule + อัปเดต marker (เส้นขีด/ปุ่ม “ผ่าตัดเสร็จแล้ว”)
+        # 4) วาดตาราง Schedule
         self._render_schedule_tree()
         self._update_schedule_completion_markers()
 
@@ -1789,7 +1749,7 @@ QCheckBox { color:#0f172a; }
             if not groups[orr]:
                 continue
 
-            parent = QtWidgets.QTreeWidgetItem([f"{orr}"] + [""] * 9)
+            parent = QtWidgets.QTreeWidgetItem([f"{orr}"] + [""] * 18)
             parent.setFirstColumnSpanned(True)
             self.tree_sched.addTopLevelItem(parent)
 
@@ -1807,9 +1767,25 @@ QCheckBox { color:#0f172a; }
             # 5) แถวลูก (ผู้ป่วย)
             for e in sorted(groups[orr], key=row_sort_key):
                 row = QtWidgets.QTreeWidgetItem([
-                    e.time or "-", e.hn, e.name or "-", str(e.age or 0),
-                    ", ".join(e.diags) or "-", ", ".join(e.ops) or "-",
-                    e.doctor or "-", e.ward or "-", str(e.queue or 0), ""
+                    _period_label(e.period),
+                    (e.time or "-"),
+                    e.hn,
+                    (e.name or "-"),
+                    (str(e.age) if e.age not in (None, "") else "-"),
+                    (", ".join(e.diags) if getattr(e, "diags", None) else "-"),
+                    (", ".join(e.ops) if getattr(e, "ops", None) else "-"),
+                    (e.doctor or "-"),
+                    (e.ward or "-"),
+                    (e.case_size or "-"),
+                    (e.dept or "-"),
+                    (e.assist1 or "-"),
+                    (e.assist2 or "-"),
+                    (e.scrub or "-"),
+                    (e.circulate or "-"),
+                    (e.time_start or "-"),
+                    (e.time_end or "-"),
+                    (str(e.queue) if str(getattr(e, "queue", "0")).isdigit() and int(getattr(e, "queue", "0")) > 0 else "ตามเวลา"),
+                    (e.urgency or "Elective"),
                 ])
                 parent.addChild(row)
 
@@ -1817,82 +1793,18 @@ QCheckBox { color:#0f172a; }
         QtCore.QTimer.singleShot(0, self._autofit_schedule_columns)
         if self.monitor_ready:
             self._update_schedule_completion_markers()
-
-    def _create_done_button(self) -> QtWidgets.QWidget:
-        wrap = QtWidgets.QWidget()
-        lay = QtWidgets.QHBoxLayout(wrap)
-        lay.setContentsMargins(6, 4, 6, 4)  # มี margin เล็กน้อยให้ header คำนวณกว้างขึ้น
-        lay.setSpacing(0)
-
-        btn = QtWidgets.QPushButton("ผ่าตัดเสร็จแล้ว", wrap)
-        fm = QtGui.QFontMetrics(btn.font())
-        # เผื่อซ้ายขวา 24px ให้สบายตา ไม่โดนตัด
-        min_w = fm.horizontalAdvance("ผ่าตัดเสร็จแล้ว") + 24
-        min_h = max(28, fm.height() + 10)
-
-        btn.setMinimumSize(min_w, min_h)
-        btn.setSizePolicy(QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Fixed)
-
-        btn.setEnabled(False)
-        btn.setCursor(QtCore.Qt.ArrowCursor)
-        btn.setStyleSheet("""
-            QPushButton{
-                background:#10b981;
-                color:#ffffff;
-                border:none;
-                border-radius:12px;
-                padding:4px 12px;
-                font-weight:800;
-            }
-        """)
-
-        lay.addWidget(btn, 0, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        lay.addStretch(1)  # ดันให้ปุ่มชิดซ้าย เหลือที่ว่างทางขวา
-
-        return wrap
-
     def _update_schedule_completion_markers(self):
-        if not self.monitor_ready:
-            return
-        try:
-            topc = self.tree_sched.topLevelItemCount()
-            for i in range(topc):
-                parent = self.tree_sched.topLevelItem(i)
-                for j in range(parent.childCount()):
-                    item = parent.child(j)
-                    hn = (item.text(1) or "").strip()
-                    completed = (hn and (hn in self._was_in_monitor) and (hn not in self._current_monitor_hn))
-                    self._style_schedule_item(item, completed)
-        except Exception:
-            pass
-        self.tree_sched.viewport().update()
+        return
 
     def _style_schedule_item(self, item: QtWidgets.QTreeWidgetItem, completed: bool):
         cols = self.tree_sched.columnCount()
         for c in range(cols):
+            item.setForeground(c, QtGui.QBrush())
+            item.setBackground(c, QtGui.QBrush())
             f = self.tree_sched.font()
-            f.setStrikeOut(bool(completed))
+            f.setStrikeOut(False)
             item.setFont(c, f)
-
-        if completed:
-            dim_fg = QtGui.QBrush(QtGui.QColor(100, 116, 139))
-            for c in range(cols):
-                item.setForeground(c, dim_fg)
-                bg = QtGui.QColor(148, 163, 184, 40)
-                item.setBackground(c, QtGui.QBrush(bg))
-            # ไม่ให้เลือก/คลิก
-            item.setFlags(item.flags() & ~QtCore.Qt.ItemIsSelectable & ~QtCore.Qt.ItemIsEnabled)
-            # สำหรับ watermark ของ delegate (ใช้ UserRole บนคอลัมน์ชื่อ-สกุล)
-            item.setData(2, QtCore.Qt.UserRole, "completed")
-            # วางปุ่ม "ผ่าตัดเสร็จแล้ว" ในคอลัมน์สุดท้าย
-            self.tree_sched.setItemWidget(item, 9, self._create_done_button())
-        else:
-            for c in range(cols):
-                item.setForeground(c, QtGui.QBrush())
-                item.setBackground(c, QtGui.QBrush())
-            item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
-            item.setData(2, QtCore.Qt.UserRole, None)
-            self.tree_sched.setItemWidget(item, 9, None)
+        item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
 
     def _check_schedule_seq(self):
         if self.sched_reader.refresh_if_changed():
