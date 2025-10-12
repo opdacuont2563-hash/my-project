@@ -11,7 +11,7 @@ import os, sys, json, argparse
 import math
 from pathlib import Path
 from typing import Union, List, Dict
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta, time as dtime, date as ddate
 
 import requests
 from requests.adapters import HTTPAdapter, Retry
@@ -97,6 +97,7 @@ class _SchedEntry:
     def __init__(self, d: Dict):
         self.or_room = str(d.get("or","") or "")
         self.date = str(d.get("date","") or "")
+        self.date_obj = _parse_date(self.date)
         self.time = str(d.get("time","") or "")
         self.hn = str(d.get("hn","") or "")
         self.name = str(d.get("name","") or "")
@@ -158,6 +159,40 @@ def _parse_iso(ts: str):
         return datetime.fromisoformat(ts.replace("Z",""))
     except Exception:
         return None
+
+def _parse_date(date_str: str):
+    if not isinstance(date_str, str):
+        return None
+    txt = date_str.strip()
+    if not txt:
+        return None
+    cleaned = txt.replace("Z", "")
+    try:
+        return datetime.fromisoformat(cleaned).date()
+    except ValueError:
+        pass
+    formats = (
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%Y/%m/%d %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(cleaned, fmt).date()
+        except ValueError:
+            continue
+    if cleaned.startswith(datetime.now().date().isoformat()):
+        return datetime.now().date()
+    return None
 
 # ---------- HTTP ----------
 class SurgiBotClientHTTP:
@@ -686,6 +721,8 @@ class Main(QtWidgets.QWidget):
         self.monitor_ready = False
         self._was_in_monitor: set[str] = set()
         self._current_monitor_hn: set[str] = set()
+        self._sched_history_by_hn: dict[str, list[_SchedEntry]] = {}
+        self._history_alert_counts: dict[str, int] = {}
 
         self.setWindowTitle("SurgiBot Client — Modern (PySide6)")
         self.resize(1440, 900)
@@ -875,19 +912,26 @@ class Main(QtWidgets.QWidget):
             if not (item.flags() & QtCore.Qt.ItemIsEnabled):
                 return
 
-            hn = (item.text(1) or "").strip()
-            if hn and hn.isdigit() and len(hn) == 9: self.ent_hn.setText(hn)
+            hn = (item.text(2) or "").strip()
+            if hn and hn.isdigit() and len(hn) == 9:
+                self.ent_hn.setText(hn)
+                self._maybe_show_repeat_history(hn)
 
             or_room = (item.parent().text(0) or "").strip()
             if or_room:
                 i = self.cb_or.findText(or_room)
                 if i >= 0: self.cb_or.setCurrentIndex(i)
 
-            q_raw = (item.text(8) or "").strip()
-            if q_raw:
-                q_label = q_raw if q_raw.startswith("0-") else f"0-{q_raw}"
+            q_raw = (item.text(17) or "").strip()
+            if q_raw.startswith("0-"):
+                qi = self.cb_q.findText(q_raw)
+                if qi >= 0:
+                    self.cb_q.setCurrentIndex(qi)
+            elif q_raw.isdigit():
+                q_label = f"0-{q_raw}"
                 qi = self.cb_q.findText(q_label)
-                if qi >= 0: self.cb_q.setCurrentIndex(qi)
+                if qi >= 0:
+                    self.cb_q.setCurrentIndex(qi)
 
             if self._is_hn_in_monitor(hn): self.rb_edit.setChecked(True)
             else: self.rb_add.setChecked(True)
@@ -896,6 +940,49 @@ class Main(QtWidgets.QWidget):
             self.cb_status.setFocus()
         except Exception:
             pass
+
+    def _maybe_show_repeat_history(self, hn: str):
+        if not hn:
+            return
+        history = self._sched_history_by_hn.get(hn)
+        if not history or len(history) <= 1:
+            return
+        seen_count = self._history_alert_counts.get(hn, 0)
+        if seen_count == len(history):
+            return
+
+        def _fmt_date(entry: _SchedEntry) -> str:
+            if entry.date_obj:
+                return entry.date_obj.isoformat()
+            return entry.date or "-"
+
+        def _fmt_ops(entry: _SchedEntry) -> str:
+            ops = getattr(entry, "ops", None)
+            if ops:
+                return ", ".join(ops)
+            return "-"
+
+        lines = []
+        for idx, entry in enumerate(history, 1):
+            date_txt = _fmt_date(entry)
+            time_txt = entry.time or "-"
+            ops_txt = _fmt_ops(entry)
+            lines.append(f"{idx}. {date_txt} {time_txt} • {ops_txt}")
+
+        latest = history[-1]
+        latest_date = _fmt_date(latest)
+        latest_time = latest.time or "-"
+
+        message = "\n".join(lines)
+        QtWidgets.QMessageBox.information(
+            self,
+            "ประวัติการผ่าตัด",
+            (
+                f"HN {hn} มีประวัติการผ่าตัด {len(history)} ครั้ง\n"
+                f"{message}\n\nครั้งล่าสุด: {latest_date} {latest_time}"
+            ),
+        )
+        self._history_alert_counts[hn] = len(history)
 
     def _make_form_label(self, text: str) -> QtWidgets.QLabel:
         lbl = QtWidgets.QLabel(text)
@@ -1720,9 +1807,33 @@ QCheckBox { color:#0f172a; }
         now_code = _now_period(datetime.now())  # "in" | "off"
         in_monitor = set(self._current_monitor_hn or [])
 
+        today = datetime.now().date()
+        self._sched_history_by_hn = {}
+
+        def _is_today(entry: _SchedEntry) -> bool:
+            if entry.date_obj:
+                return entry.date_obj == today
+            if entry.date:
+                return entry.date.strip().startswith(today.isoformat())
+            return True
+
+        for entry in self.sched_reader.entries:
+            hn_key = (entry.hn or "").strip()
+            if hn_key:
+                self._sched_history_by_hn.setdefault(hn_key, []).append(entry)
+
+        for hist in self._sched_history_by_hn.values():
+            hist.sort(key=lambda ent: ((ent.date_obj or ddate.min), ent.time or ""))
+        self._history_alert_counts = {
+            hn: self._history_alert_counts.get(hn, 0)
+            for hn in self._sched_history_by_hn.keys()
+        }
+
         groups: dict[str, list[_SchedEntry]] = {}
 
         def should_show(e: _SchedEntry) -> bool:
+            if not _is_today(e):
+                return False
             if now_code == "in":
                 return True
             # นอกเวลา: แสดง off เสมอ + in เฉพาะที่ยังไม่เสร็จ (ยังเห็น HN ใน monitor)
