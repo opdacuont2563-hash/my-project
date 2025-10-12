@@ -801,11 +801,15 @@ class Main(QtWidgets.QWidget):
             "ช่วงเวลา","OR/เวลา","HN","ชื่อ-สกุล","อายุ","Diagnosis","Operation","แพทย์",
             "Ward","ขนาดเคส","แผนก","Assist1","Assist2","Scrub","Circulate","เริ่ม","จบ","คิว"
         ])
-        self.tree2.setTextElideMode(QtCore.Qt.ElideNone); self.tree2.setWordWrap(True); self.tree2.setUniformRowHeights(False)
+        # ไม่พับบรรทัดและไม่ตัดข้อความเป็น "..." เพื่อให้อ่านได้เต็มโดยเลื่อนแนวนอน
+        self.tree2.setWordWrap(False)
+        self.tree2.setTextElideMode(QtCore.Qt.ElideNone)
+        self.tree2.setUniformRowHeights(True)
         self.tree2.setAlternatingRowColors(True)
         self.tree2.setRootIsDecorated(False)
         self.tree2.setIndentation(12)
         self.tree2.setMouseTracking(True)
+        # เปิดสกรอลล์บาร์แนวนอนเสมอเมื่อคอลัมน์กว้าง
         self.tree2.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.tree2.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
         self.tree2.setStyleSheet("""
@@ -814,7 +818,7 @@ class Main(QtWidgets.QWidget):
             QTreeWidget::item:alternate{ background:#f8fbff; }
             QTreeWidget::item:selected{ background:rgba(37,99,235,0.16); border-radius:10px; }
             QTreeWidget::item:hover{ background:rgba(2,132,199,0.08); }
-            QHeaderView::section{ background:#f8fafc; border-bottom:1px solid #e6eaf2; padding:10px 14px; font-weight:900; color:#0f172a; }
+            QHeaderView::section{ background:#0f2167; color:#ffffff; border:0; padding:12px 16px; font-weight:900; letter-spacing:.2px; }
         """)
         hdr=self.tree2.header(); hdr.setStretchLastSection(False)
         hdr.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
@@ -822,12 +826,9 @@ class Main(QtWidgets.QWidget):
         # ให้คอลัมน์ยืดบางส่วน และเลื่อนแนวนอนได้เมื่อกว้างเกิน
         for i in (0,1,2,3,4,7,8,9,10,11,12,13,14,15,16,17):
             hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(5, QtWidgets.QHeaderView.Stretch)   # Diagnosis
-        hdr.setSectionResizeMode(6, QtWidgets.QHeaderView.Stretch)   # Operation
+        hdr.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeToContents)   # Diagnosis
+        hdr.setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeToContents)   # Operation
         self.tree2.setColumnWidth(17, 160)
-        self.wrap_delegate = WrapItemDelegate(self.tree2)
-        for col in (5,6,7):
-            self.tree2.setItemDelegateForColumn(col, self.wrap_delegate)
         self.tree2.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.tree2.customContextMenuRequested.connect(self._result_ctx_menu)
         gr2.addWidget(self.tree2,0,0,1,1)
@@ -1295,6 +1296,8 @@ class Main(QtWidgets.QWidget):
             self.tree2.expandAll()
             self.tree2.header().setSectionResizeMode(17, QtWidgets.QHeaderView.ResizeToContents)
             self.tree2.setColumnWidth(17, 160)
+            self.tree2.resizeColumnToContents(5)
+            self.tree2.resizeColumnToContents(6)
             return
 
         # จัดกลุ่มตาม OR
@@ -1370,6 +1373,8 @@ class Main(QtWidgets.QWidget):
         self.tree2.expandAll()
         self.tree2.header().setSectionResizeMode(17, QtWidgets.QHeaderView.ResizeToContents)
         self.tree2.setColumnWidth(17, 160)
+        self.tree2.resizeColumnToContents(5)
+        self.tree2.resizeColumnToContents(6)
 
     def _apply_queue_select(self, uid: str, new_q: int):
         target=None; target_idx=None
@@ -1392,6 +1397,8 @@ class Main(QtWidgets.QWidget):
         self._flash_row_by_uid(uid)
         self.tree2.header().setSectionResizeMode(17, QtWidgets.QHeaderView.ResizeToContents)
         self.tree2.setColumnWidth(17, 160)
+        self.tree2.resizeColumnToContents(5)
+        self.tree2.resizeColumnToContents(6)
 
     def _find_item_by_uid(self, uid:str):
         root = self.tree2.invisibleRootItem()
