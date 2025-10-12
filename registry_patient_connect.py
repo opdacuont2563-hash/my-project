@@ -334,6 +334,7 @@ class ScheduleEntry(QtCore.QObject):
         case_size="",
         queue=0,
         period="in",
+        urgency="Elective",
         assist1="",
         assist2="",
         scrub="",
@@ -356,6 +357,7 @@ class ScheduleEntry(QtCore.QObject):
         self.case_size = (case_size or "").strip()  # Minor/Major
         self.queue = int(queue) if str(queue).isdigit() else 0
         self.period = period  # "in" | "off"
+        self.urgency = (urgency or "Elective")
         self.assist1 = assist1
         self.assist2 = assist2
         self.scrub = scrub
@@ -379,6 +381,7 @@ class ScheduleEntry(QtCore.QObject):
             "case_size": self.case_size,
             "queue": self.queue,
             "period": self.period,
+            "urgency": self.urgency,
             "assist1": self.assist1,
             "assist2": self.assist2,
             "scrub": self.scrub,
@@ -408,6 +411,7 @@ class ScheduleEntry(QtCore.QObject):
             d.get("case_size",""),
             d.get("queue",0),
             d.get("period","in"),
+            d.get("urgency","Elective"),
             d.get("assist1",""),
             d.get("assist2",""),
             d.get("scrub",""),
@@ -452,29 +456,79 @@ class SharedScheduleModel:
     def seq(self)->int: return int(self.s.value(SEQ_KEY, 0))
 
 class LocalDBLogger:
-    def __init__(self, path="schedule.db"):
+    def __init__(self, elective_path="schedule_elective.db", emergency_path="schedule_emergency.db"):
         import sqlite3
         self.sqlite3 = sqlite3
-        self.conn = sqlite3.connect(path); self._init()
-    def _init(self):
-        cur = self.conn.cursor()
+        self.conn_e = sqlite3.connect(elective_path)
+        self.conn_x = sqlite3.connect(emergency_path)
+        self._init(self.conn_e)
+        self._init(self.conn_x)
+
+    def _init(self, conn):
+        cur = conn.cursor()
         cur.execute("""
             CREATE TABLE IF NOT EXISTS schedule(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT, period TEXT, or_room TEXT, date TEXT, time TEXT,
-                hn TEXT, name TEXT, age INTEGER, dept TEXT, doctor TEXT,
-                diagnosis TEXT, operation TEXT, ward TEXT, queue INTEGER
+                timestamp TEXT,
+                urgency TEXT,
+                period TEXT,
+                or_room TEXT,
+                date TEXT,
+                time TEXT,
+                hn TEXT,
+                name TEXT,
+                age INTEGER,
+                dept TEXT,
+                doctor TEXT,
+                diagnosis TEXT,
+                operation TEXT,
+                ward TEXT,
+                queue INTEGER,
+                time_start TEXT,
+                time_end TEXT,
+                case_size TEXT
             )
-        """); self.conn.commit()
+        """)
+        conn.commit()
+
     def append_entry(self, e: 'ScheduleEntry'):
-        cur = self.conn.cursor()
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cur.execute("""
-            INSERT INTO schedule(timestamp,period,or_room,date,time,hn,name,age,dept,doctor,diagnosis,operation,ward,queue)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (ts, ("ในเวลาราชการ" if e.period=="in" else "นอกเวลาราชการ"), e.or_room, str(e.date), e.time, e.hn, e.name, e.age,
-              e.dept, e.doctor, " with ".join(e.diags), " with ".join(e.ops), e.ward, e.queue))
-        self.conn.commit()
+        row = (
+            ts,
+            e.urgency,
+            e.period,
+            e.or_room,
+            str(e.date),
+            e.time,
+            e.hn,
+            e.name,
+            int(e.age or 0),
+            e.dept,
+            e.doctor,
+            " with ".join(e.diags),
+            " with ".join(e.ops),
+            e.ward,
+            int(e.queue or 0),
+            e.time_start or "",
+            e.time_end or "",
+            e.case_size or "",
+        )
+
+        conn = self.conn_x if str(e.urgency).lower() == "emergency" else self.conn_e
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO schedule(
+                timestamp, urgency, period, or_room, date, time,
+                hn, name, age, dept, doctor,
+                diagnosis, operation, ward, queue,
+                time_start, time_end, case_size
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            row,
+        )
+        conn.commit()
 
 # ---------------------- Security helpers (salt & hash) ----------------------
 def _app_settings() -> QSettings:
@@ -726,11 +780,13 @@ class Main(QtWidgets.QWidget):
         self.cb_case.setMinimumWidth(120)
         g.addWidget(self.cb_case, r,5)
         r+=1
-        g.addWidget(QtWidgets.QLabel("ช่วงเวลา"), r,0)
-        self.rb_in  = QtWidgets.QRadioButton("ในเวลาราชการ (08:30-16:30)")
-        self.rb_off = QtWidgets.QRadioButton("นอกเวลาราชการ (16:30-08:30)")
-        pr = QtWidgets.QHBoxLayout(); pr.setSpacing(10); pr.addWidget(self.rb_in); pr.addWidget(self.rb_off); pr.addStretch(1)
-        g.addLayout(pr, r,1,1,5)
+        g.addWidget(QtWidgets.QLabel("ความเร่งด่วน"), r,0)
+        self.cb_urgency = NoWheelComboBox(); self.cb_urgency.addItems(["Elective","Emergency"])
+        self.cb_urgency.setMinimumWidth(180)
+        g.addWidget(self.cb_urgency, r,1)
+        self.lbl_period_info = QtWidgets.QLabel("")
+        self.lbl_period_info.setProperty("hint", "1")
+        g.addWidget(self.lbl_period_info, r,2,1,4)
         r+=1
         g.addWidget(QtWidgets.QLabel("วันที่"), r,0)
         self.date=QtWidgets.QDateEdit(QtCore.QDate.currentDate()); self.date.setCalendarPopup(True); self.date.setDisplayFormat("dd/MM/yyyy"); self.date.setLocale(QLocale("en_US"))
@@ -834,10 +890,10 @@ class Main(QtWidgets.QWidget):
         gr2 = self.card_result.grid
         self.tree2 = QtWidgets.QTreeWidget()
         # เพิ่มคอลัมน์ให้ครอบคลุมข้อมูลจากแท็บ 1 และเปิดสกรอลล์แนวนอน
-        self.tree2.setColumnCount(18)
+        self.tree2.setColumnCount(19)
         self.tree2.setHeaderLabels([
             "ช่วงเวลา","OR/เวลา","HN","ชื่อ-สกุล","อายุ","Diagnosis","Operation","แพทย์",
-            "Ward","ขนาดเคส","แผนก","Assist1","Assist2","Scrub","Circulate","เริ่ม","จบ","คิว"
+            "Ward","ขนาดเคส","แผนก","Assist1","Assist2","Scrub","Circulate","เริ่ม","จบ","คิว","ประเภทเคส"
         ])
         # ไม่พับบรรทัดและไม่ตัดข้อความเป็น "..." เพื่อให้อ่านได้เต็มโดยเลื่อนแนวนอน
         self.tree2.setWordWrap(False)
@@ -916,11 +972,15 @@ class Main(QtWidgets.QWidget):
         hdr.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         hdr.setFixedHeight(42)
         # ให้คอลัมน์ยืดบางส่วน และเลื่อนแนวนอนได้เมื่อกว้างเกิน
-        for i in (0,1,2,3,4,7,8,9,10,11,12,13,14,15,16,17):
+        for i in (0,1,2,3,4,7,8,9,10,11,12,13,14,15,16,17,18):
             hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeToContents)   # Diagnosis
         hdr.setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeToContents)   # Operation
         self.tree2.setColumnWidth(17, 160)
+        self.tree2.setColumnWidth(18, 140)
+        self.tree2.setColumnHidden(0, True)
+        hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.Fixed)
+        self.tree2.setColumnWidth(0, 0)
         self.tree2.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.tree2.customContextMenuRequested.connect(self._result_ctx_menu)
         gr2.addWidget(self.tree2,0,0,1,1)
@@ -975,12 +1035,10 @@ class Main(QtWidgets.QWidget):
         self.table.itemDoubleClicked.connect(self._on_monitor_double_click)
         self.tree2.itemDoubleClicked.connect(self._on_result_double_click)
 
-        # default period
-        self._default_period()
-        self.date.dateChanged.connect(self._update_period_warning)
-        self.time.timeChanged.connect(self._update_period_warning)
-        self.rb_in.toggled.connect(self._update_period_warning)
-        self.rb_off.toggled.connect(self._update_period_warning)
+        # default period info (auto-calculated)
+        self._update_period_info()
+        self.date.dateChanged.connect(lambda *_: self._update_period_info())
+        self.time.timeChanged.connect(lambda *_: self._update_period_info())
 
         self._set_doctor_visibility(False)
         self._on_dept_changed(self.cb_dept.currentText())
@@ -1116,16 +1174,16 @@ class Main(QtWidgets.QWidget):
             rooms=[lst.item(i).text() for i in range(lst.count())]; self.sched.set_or_rooms(rooms); self._refresh_or_cb(self.cb_or); dlg.accept()
         ok.clicked.connect(save); dlg.exec()
 
-    def _default_period(self):
-        now = datetime.now()
-        self.rb_in.setChecked(_now_period(now)=="in"); self.rb_off.setChecked(_now_period(now)!="in")
-        self._update_period_warning()
-    def _get_selected_period(self)->str: return "in" if self.rb_in.isChecked() else "off"
-    def _update_period_warning(self):
-        qd=self.date.date(); qtime=self.time.time()
+    def _update_period_info(self):
+        qd = self.date.date()
+        qtime = self.time.time()
         dt = datetime(qd.year(), qd.month(), qd.day(), qtime.hour(), qtime.minute())
-        auto = _now_period(dt); chosen = self._get_selected_period()
-        self.lbl_warn.setText("" if auto==chosen else f"คำเตือน: วัน/เวลา {dt:%d/%m/%Y %H:%M} เป็น '{_period_label(auto)}' แต่คุณเลือก '{_period_label(chosen)}'")
+        auto = _now_period(dt)
+        if hasattr(self, "lbl_period_info"):
+            self.lbl_period_info.setText(
+                f"ระบบกำหนดช่วงเวลาอัตโนมัติ: {_period_label(auto)} (อ้างอิง {dt:%d/%m/%Y %H:%M})"
+            )
+        return auto
 
     def _on_dept_changed(self, dept_label:str):
         if dept_label and not dept_label.startswith("—"):
@@ -1157,6 +1215,7 @@ class Main(QtWidgets.QWidget):
     def _collect(self):
         qd=self.date.date()
         dt = datetime(qd.year(), qd.month(), qd.day(), self.time.time().hour(), self.time.time().minute())
+        auto_period = _now_period(dt)
         ward_text = self.cb_ward.currentText().strip()
         if ward_text == WARD_PLACEHOLDER:
             ward_text = ""
@@ -1169,7 +1228,8 @@ class Main(QtWidgets.QWidget):
             ward=ward_text,
             case_size=self.cb_case.currentText().strip(),
             queue=0,
-            period=self._get_selected_period(),
+            period=auto_period,
+            urgency=self.cb_urgency.currentText().strip() or "Elective",
             assist1=self.cb_assist1.currentText().strip(),
             assist2=self.cb_assist2.currentText().strip(),
             scrub=self.cb_scrub.currentText().strip(),
@@ -1186,6 +1246,9 @@ class Main(QtWidgets.QWidget):
         self.cb_ward.setCurrentIndex(0); self.cb_ward.setEditText(WARD_PLACEHOLDER)
         if hasattr(self, "cb_case"):
             self.cb_case.setCurrentIndex(0)
+        if hasattr(self, "cb_urgency"):
+            idx = self.cb_urgency.findText("Elective")
+            self.cb_urgency.setCurrentIndex(idx if idx >= 0 else 0)
         for cb in (self.cb_assist1, self.cb_assist2, self.cb_scrub, self.cb_circulate):
             cb.setCurrentIndex(0)
             cb.setEditText("")
@@ -1193,7 +1256,7 @@ class Main(QtWidgets.QWidget):
         self.ck_time_end.setChecked(False); self.time_end.setEnabled(False); self.time_end.setTime(QtCore.QTime.currentTime())
         self.date.setDate(QtCore.QDate.currentDate())
         self.time.setTime(QtCore.QTime.currentTime())
-        self._default_period()
+        self._update_period_info()
         self._on_dept_changed(self.cb_dept.currentText())
         self._set_add_mode()
 
@@ -1219,8 +1282,9 @@ class Main(QtWidgets.QWidget):
         self.ent_name.setText(e.name or "")
         self.ent_age.setText(str(e.age or 0))
         self.ent_hn.setText(e.hn or "")
-        if e.period == "in": self.rb_in.setChecked(True)
-        else: self.rb_off.setChecked(True)
+        if hasattr(self, "cb_urgency"):
+            idx_u = self.cb_urgency.findText(e.urgency or "Elective")
+            self.cb_urgency.setCurrentIndex(idx_u if idx_u >= 0 else 0)
         try:
             d = QtCore.QDate(e.date.year, e.date.month, e.date.day)
             self.date.setDate(d)
@@ -1229,6 +1293,7 @@ class Main(QtWidgets.QWidget):
             hh, mm = (e.time or "00:00").split(":")
             self.time.setTime(QtCore.QTime(int(hh), int(mm)))
         except Exception: pass
+        self._update_period_info()
         if e.dept:
             for i in range(self.cb_dept.count()):
                 if self.cb_dept.itemText(i).startswith(e.dept) or self.cb_dept.itemText(i)==e.dept:
@@ -1382,6 +1447,8 @@ class Main(QtWidgets.QWidget):
             self.tree2.expandAll()
             self.tree2.header().setSectionResizeMode(17, QtWidgets.QHeaderView.ResizeToContents)
             self.tree2.setColumnWidth(17, 160)
+            self.tree2.header().setSectionResizeMode(18, QtWidgets.QHeaderView.ResizeToContents)
+            self.tree2.setColumnWidth(18, 140)
             self.tree2.resizeColumnToContents(5)
             self.tree2.resizeColumnToContents(6)
             return
@@ -1437,7 +1504,8 @@ class Main(QtWidgets.QWidget):
                     entry.circulate or "-",                     # 14
                     entry.time_start or "-",                    # 15
                     entry.time_end or "-",                      # 16
-                    ""                                          # 17 (คิว: widget)
+                    "",                                        # 17 (คิว: widget)
+                    entry.urgency or "Elective",                # 18
                 ])
                 row.setData(0, QtCore.Qt.UserRole, entry.uid())
                 row.setData(0, QtCore.Qt.UserRole+1, idx)
@@ -1461,6 +1529,8 @@ class Main(QtWidgets.QWidget):
         self.tree2.expandAll()
         self.tree2.header().setSectionResizeMode(17, QtWidgets.QHeaderView.ResizeToContents)
         self.tree2.setColumnWidth(17, 160)
+        self.tree2.header().setSectionResizeMode(18, QtWidgets.QHeaderView.ResizeToContents)
+        self.tree2.setColumnWidth(18, 140)
         self.tree2.resizeColumnToContents(5)
         self.tree2.resizeColumnToContents(6)
 
@@ -1482,6 +1552,8 @@ class Main(QtWidgets.QWidget):
         self._flash_row_by_uid(uid)
         self.tree2.header().setSectionResizeMode(17, QtWidgets.QHeaderView.ResizeToContents)
         self.tree2.setColumnWidth(17, 160)
+        self.tree2.header().setSectionResizeMode(18, QtWidgets.QHeaderView.ResizeToContents)
+        self.tree2.setColumnWidth(18, 140)
         self.tree2.resizeColumnToContents(5)
         self.tree2.resizeColumnToContents(6)
 
@@ -1640,11 +1712,12 @@ class Main(QtWidgets.QWidget):
                     "op": " | ".join(e.ops or []),
                     "ward": e.ward or "",
                     "case_size": e.case_size or "",
+                    "urgency": e.urgency or "",
                     "doctor": e.doctor or "",
                     # หมายเหตุ: ไม่ส่งออก HN/ชื่อ
                 })
             with open(path,"w",newline="",encoding="utf-8-sig") as f:
-                cols=["hn_hash","dept","or","queue","period","scheduled_date","scheduled_time","time_start","time_end","diag","op","ward","case_size","doctor"]
+                cols=["hn_hash","dept","or","queue","period","scheduled_date","scheduled_time","time_start","time_end","diag","op","ward","case_size","urgency","doctor"]
                 w=csv.DictWriter(f, fieldnames=cols)
                 w.writeheader(); w.writerows(rows)
             QtWidgets.QMessageBox.information(self,"ส่งออกแล้ว",path)
