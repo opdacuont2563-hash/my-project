@@ -913,9 +913,11 @@ class Main(QtWidgets.QWidget):
                 return
 
             hn = (item.text(2) or "").strip()
+            entry = item.data(0, QtCore.Qt.UserRole)
             if hn and hn.isdigit() and len(hn) == 9:
                 self.ent_hn.setText(hn)
-                self._maybe_show_repeat_history(hn)
+                current_entry = entry if isinstance(entry, _SchedEntry) else None
+                self._maybe_show_repeat_history(hn, current_entry)
 
             or_room = (item.parent().text(0) or "").strip()
             if or_room:
@@ -941,20 +943,29 @@ class Main(QtWidgets.QWidget):
         except Exception:
             pass
 
-    def _maybe_show_repeat_history(self, hn: str):
+    def _maybe_show_repeat_history(self, hn: str, current: _SchedEntry | None = None):
         if not hn:
             return
         history = self._sched_history_by_hn.get(hn)
         if not history or len(history) <= 1:
             return
+
+        if current is None:
+            current = history[-1]
+        elif current not in history:
+            history = history + [current]
+            history.sort(key=lambda ent: ((ent.date_obj or ddate.min), ent.time or ""))
+
         seen_count = self._history_alert_counts.get(hn, 0)
-        if seen_count == len(history):
+        if seen_count >= len(history):
             return
 
         def _fmt_date(entry: _SchedEntry) -> str:
             if entry.date_obj:
                 return entry.date_obj.isoformat()
-            return entry.date or "-"
+            if entry.date:
+                return entry.date
+            return datetime.now().date().isoformat()
 
         def _fmt_ops(entry: _SchedEntry) -> str:
             ops = getattr(entry, "ops", None)
@@ -962,27 +973,68 @@ class Main(QtWidgets.QWidget):
                 return ", ".join(ops)
             return "-"
 
-        lines = []
-        for idx, entry in enumerate(history, 1):
+        try:
+            current_index = history.index(current)
+        except ValueError:
+            current_index = len(history) - 1
+            current = history[current_index]
+
+        latest_entry = history[-1]
+        previous_entry = history[current_index - 1] if current_index > 0 else None
+
+        def _format_line(idx: int, entry: _SchedEntry, mark_current: bool, mark_latest: bool) -> str:
             date_txt = _fmt_date(entry)
             time_txt = entry.time or "-"
             ops_txt = _fmt_ops(entry)
-            lines.append(f"{idx}. {date_txt} {time_txt} • {ops_txt}")
+            tags = []
+            if mark_current:
+                tags.append("วันนี้")
+            if mark_latest:
+                tags.append("ล่าสุด")
+            tag_txt = f" [{' / '.join(tags)}]" if tags else ""
+            return f"{idx}. {date_txt} {time_txt} • {ops_txt}{tag_txt}"
 
-        latest = history[-1]
-        latest_date = _fmt_date(latest)
-        latest_time = latest.time or "-"
+        lines: list[str] = []
+        for idx, entry in enumerate(history, 1):
+            lines.append(
+                _format_line(
+                    idx,
+                    entry,
+                    mark_current=(entry is current),
+                    mark_latest=(entry is latest_entry),
+                )
+            )
 
-        message = "\n".join(lines)
-        QtWidgets.QMessageBox.information(
-            self,
-            "ประวัติการผ่าตัด",
-            (
-                f"HN {hn} มีประวัติการผ่าตัด {len(history)} ครั้ง\n"
-                f"{message}\n\nครั้งล่าสุด: {latest_date} {latest_time}"
-            ),
-        )
-        self._history_alert_counts[hn] = len(history)
+        summary_parts = [
+            f"HN {hn} มีประวัติการผ่าตัด {len(history)} ครั้ง",
+            "\n".join(lines),
+            "",
+            f"รอบปัจจุบัน ({current_index + 1}/{len(history)}): {_fmt_date(current)} {current.time or '-'}",
+            f"หัตถการ: {_fmt_ops(current)}",
+        ]
+
+        if previous_entry is not None:
+            summary_parts.append(
+                f"ครั้งล่าสุดก่อนหน้า: {_fmt_date(previous_entry)} {previous_entry.time or '-'}"
+            )
+
+        if latest_entry is not current:
+            summary_parts.append(
+                f"กำหนดครั้งถัดไป: {_fmt_date(latest_entry)} {latest_entry.time or '-'}"
+            )
+
+        message_text = "\n".join(part for part in summary_parts if part is not None)
+
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("ประวัติการผ่าตัด")
+        box.setIcon(QtWidgets.QMessageBox.Information)
+        box.setTextFormat(QtCore.Qt.PlainText)
+        box.setText(message_text)
+        box.setStandardButtons(QtWidgets.QMessageBox.Ok)
+        box.exec()
+
+        actual_total = len(self._sched_history_by_hn.get(hn, []))
+        self._history_alert_counts[hn] = max(actual_total, len(history))
 
     def _make_form_label(self, text: str) -> QtWidgets.QLabel:
         lbl = QtWidgets.QLabel(text)
@@ -1898,6 +1950,7 @@ QCheckBox { color:#0f172a; }
                     (str(e.queue) if str(getattr(e, "queue", "0")).isdigit() and int(getattr(e, "queue", "0")) > 0 else "ตามเวลา"),
                     (e.urgency or "Elective"),
                 ])
+                row.setData(0, QtCore.Qt.UserRole, e)
                 parent.addChild(row)
 
         # 6) ไม่บังคับ expandAll() เพื่อไม่ให้เด้งกลับ
