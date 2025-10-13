@@ -9,7 +9,6 @@ SurgiBot Client — PySide6 (revamped layout)
 
 import os, sys, json, argparse
 import math
-from functools import partial
 from pathlib import Path
 from typing import Union, List, Dict
 from datetime import datetime, timedelta, time as dtime, date as ddate
@@ -1494,8 +1493,9 @@ QCheckBox { color:#0f172a; }
         self.tree_sched.setUniformRowHeights(False)
         hdr = self.tree_sched.header()
         hdr.setStretchLastSection(False)
-        hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
-        for i in range(1, 20):
+        hdr.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        hdr.setFixedHeight(42)
+        for i in range(20):
             hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
         self.tree_sched.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.tree_sched.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
@@ -1807,6 +1807,33 @@ QCheckBox { color:#0f172a; }
             if isinstance(entry, _SchedEntry) and entry.uid() == uid:
                 self._open_postop_dialog(entry)
                 break
+
+    def _make_postop_button(self, uid: str) -> QtWidgets.QPushButton:
+        btn = QtWidgets.QPushButton("💾 บันทึกหลังผ่าตัด")
+        btn.setCursor(QtCore.Qt.PointingHandCursor)
+        btn.setFocusPolicy(QtCore.Qt.NoFocus)
+        btn.setStyleSheet(
+            """
+            QPushButton{
+                background:#fb923c; color:#111; border:1px solid #f97316;
+                border-radius:12px; padding:6px 10px; font-weight:800;
+            }
+            QPushButton:hover{ background:#f59e0b; }
+            """
+        )
+        effect = QtWidgets.QGraphicsOpacityEffect(btn)
+        btn.setGraphicsEffect(effect)
+        anim = QtCore.QPropertyAnimation(effect, b"opacity", btn)
+        anim.setDuration(1200)
+        anim.setStartValue(0.55)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QtCore.QEasingCurve.InOutQuad)
+        anim.setLoopCount(-1)
+        anim.start()
+        btn._pulse_anim = anim  # type: ignore[attr-defined]
+        btn._pulse_effect = effect  # type: ignore[attr-defined]
+        btn.clicked.connect(lambda *_: self._open_postop_by_uid(uid))
+        return btn
 
     def _incomplete(self, entry: _SchedEntry) -> bool:
         if not (entry.time_start and entry.time_end):
@@ -2276,7 +2303,8 @@ QCheckBox { color:#0f172a; }
                 if not groups[orr]:
                     continue
 
-                parent = QtWidgets.QTreeWidgetItem([f"{orr}"] + [""] * 19)
+                parent = QtWidgets.QTreeWidgetItem()
+                parent.setText(0, orr)
                 parent.setFirstColumnSpanned(True)
                 tree.addTopLevelItem(parent)
 
@@ -2315,36 +2343,7 @@ QCheckBox { color:#0f172a; }
                     parent.addChild(row)
 
                     if self._incomplete(e):
-                        btn = QtWidgets.QPushButton("💾 บันทึกหลังผ่าตัด")
-                        btn.setCursor(QtCore.Qt.PointingHandCursor)
-                        btn.setFocusPolicy(QtCore.Qt.NoFocus)
-                        btn.setStyleSheet(
-                            """
-                            QPushButton{
-                                background:#fb923c; color:#111; border:1px solid #f97316;
-                                border-radius:12px; padding:6px 10px; font-weight:800;
-                            }
-                            QPushButton:hover{ background:#f59e0b; }
-                            """
-                        )
-                        effect = QtWidgets.QGraphicsOpacityEffect(btn)
-                        btn.setGraphicsEffect(effect)
-                        anim = QtCore.QPropertyAnimation(effect, b"opacity", btn)
-                        anim.setDuration(1200)
-                        anim.setStartValue(0.55)
-                        anim.setEndValue(1.0)
-                        anim.setEasingCurve(QtCore.QEasingCurve.InOutQuad)
-                        anim.setLoopCount(-1)
-                        anim.start()
-                        btn._pulse_anim = anim  # type: ignore[attr-defined]
-                        btn._pulse_effect = effect  # type: ignore[attr-defined]
-                        btn.clicked.connect(partial(self._open_postop_by_uid, e.uid()))
-                        tree.setItemWidget(row, 0, btn)
-                    else:
-                        placeholder = QtWidgets.QWidget()
-                        placeholder.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
-                        placeholder.setFixedSize(QtCore.QSize(1, 1))
-                        tree.setItemWidget(row, 0, placeholder)
+                        tree.setItemWidget(row, 0, self._make_postop_button(e.uid()))
         finally:
             tree.setUpdatesEnabled(True)
 
