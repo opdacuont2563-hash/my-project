@@ -1523,6 +1523,31 @@ QCheckBox { color:#0f172a; }
         self.tree_sched.itemSelectionChanged.connect(self._on_sched_item_clicked_from_selection)
         self.tree_sched.setStyleSheet(self.tree_sched.styleSheet() + "\nQTreeView::item{ min-height: 34px; }")
 
+        # --- OR sticky badge overlay ---
+        self._orSticky = QtWidgets.QFrame(self.tree_sched.viewport())
+        self._orSticky.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        self._orSticky.hide()
+        self._orSticky.setStyleSheet("""
+QFrame {
+    background: qlineargradient(x1:0,y1:0, x2:1,y2:1, stop:0 #4f86ff, stop:1 #2f64e9);
+    border-radius: 14px;
+    padding: 6px 12px;
+    color: #fff;
+    border: 0px solid transparent;
+}
+QLabel { color:#fff; font-weight: 900; }
+""")
+        sticky_layout = QtWidgets.QHBoxLayout(self._orSticky)
+        sticky_layout.setContentsMargins(12, 6, 12, 6)
+        self._orStickyLabel = QtWidgets.QLabel("OR")
+        sticky_layout.addWidget(self._orStickyLabel)
+
+        self.tree_sched.verticalScrollBar().valueChanged.connect(self._update_or_sticky)
+        self.tree_sched.horizontalScrollBar().valueChanged.connect(self._update_or_sticky)
+        self.tree_sched.itemExpanded.connect(lambda *_: self._update_or_sticky())
+        self.tree_sched.itemCollapsed.connect(lambda *_: self._update_or_sticky())
+        self.tree_sched.viewport().installEventFilter(self)
+
         # Monitor
         self.card_table = ElevatedCard(
             "Result (Monitor) — จากเซิร์ฟเวอร์",
@@ -1844,6 +1869,66 @@ QCheckBox { color:#0f172a; }
             return True
         return False
 
+    def _first_visible_item(self) -> QtWidgets.QTreeWidgetItem | None:
+        tree = getattr(self, "tree_sched", None)
+        if tree is None:
+            return None
+        viewport = tree.viewport()
+        if viewport is None:
+            return None
+        top_y = 0
+        for i in range(tree.topLevelItemCount()):
+            parent = tree.topLevelItem(i)
+            if parent is None:
+                continue
+            rect = tree.visualItemRect(parent)
+            if rect.bottom() >= top_y:
+                if rect.top() <= top_y <= rect.bottom():
+                    return parent
+                for j in range(parent.childCount()):
+                    child = parent.child(j)
+                    if child is None:
+                        continue
+                    child_rect = tree.visualItemRect(child)
+                    if child_rect.bottom() >= top_y:
+                        return child
+                return parent
+        return None
+
+    def _update_or_sticky(self):
+        tree = getattr(self, "tree_sched", None)
+        sticky = getattr(self, "_orSticky", None)
+        if tree is None or sticky is None:
+            return
+
+        item = self._first_visible_item()
+        if item is None:
+            sticky.hide()
+            return
+
+        parent = item
+        while parent.parent() is not None:
+            parent = parent.parent()
+
+        or_text = (parent.text(0) or "").strip()
+        if not or_text:
+            sticky.hide()
+            return
+
+        rect = tree.visualItemRect(parent)
+        if not rect.isValid():
+            sticky.hide()
+            return
+
+        self._orStickyLabel.setText(or_text)
+        sticky.adjustSize()
+        width = max(120, sticky.sizeHint().width())
+        height = 32
+        x = 8
+        y = max(4, rect.top() + 6)
+        sticky.setGeometry(x, y, width, height)
+        sticky.show()
+
     def _set_chip(self, ok: bool):
         base = getattr(self, "_status_pill_base", "background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;padding:4px 10px;font-weight:600;")
         color = "#16a34a" if ok else "#ef4444"
@@ -2157,6 +2242,17 @@ QCheckBox { color:#0f172a; }
             self.lbl_scan_state.setStyleSheet("color:#16a34a;font-weight:600;")
 
     def eventFilter(self, obj, event):
+        tree = getattr(self, "tree_sched", None)
+        viewport = tree.viewport() if tree else None
+        if viewport is not None and obj is viewport:
+            if event.type() in (
+                QtCore.QEvent.Resize,
+                QtCore.QEvent.Paint,
+                QtCore.QEvent.Show,
+                QtCore.QEvent.UpdateRequest,
+            ):
+                QtCore.QTimer.singleShot(0, self._update_or_sticky)
+
         if event.type() == QtCore.QEvent.KeyPress and self.scan_enabled:
             key = event.key()
             text = event.text() or ""
@@ -2356,6 +2452,7 @@ QCheckBox { color:#0f172a; }
             QtCore.QTimer.singleShot(0, _restore_scroll)
 
         QtCore.QTimer.singleShot(0, self._autofit_schedule_columns)
+        QtCore.QTimer.singleShot(0, self._update_or_sticky)
         QtCore.QTimer.singleShot(0, self._restore_selected_schedule_item)
         if self.monitor_ready:
             self._update_schedule_completion_markers()
