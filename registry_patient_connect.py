@@ -369,6 +369,12 @@ class ScheduleEntry(QtCore.QObject):
         circulate="",
         time_start="",
         time_end="",
+        case_uid: str = "",
+        version: int = 1,
+        state: str = "scheduled",
+        returning_started_at: str = "",
+        returned_to_ward_at: str = "",
+        postop_completed: bool = False,
     ):
         super().__init__()
         self.or_room = or_room
@@ -392,6 +398,16 @@ class ScheduleEntry(QtCore.QObject):
         self.circulate = circulate
         self.time_start = time_start
         self.time_end = time_end
+        self.case_uid = case_uid or self._gen_case_uid()
+        self.version = int(version or 1)
+        self.state = state or "scheduled"
+        self.returning_started_at = returning_started_at or ""
+        self.returned_to_ward_at = returned_to_ward_at or ""
+        self.postop_completed = bool(postop_completed)
+
+    def _gen_case_uid(self) -> str:
+        base = f"{self.or_room}|{self.hn}|{self.time}|{self.date}"
+        return hashlib.sha1(base.encode("utf-8", "ignore")).hexdigest()
 
     def to_dict(self):
         return {
@@ -416,6 +432,12 @@ class ScheduleEntry(QtCore.QObject):
             "circulate": self.circulate,
             "time_start": self.time_start,
             "time_end": self.time_end,
+            "case_uid": self.case_uid,
+            "version": self.version,
+            "state": self.state,
+            "returning_started_at": self.returning_started_at,
+            "returned_to_ward_at": self.returned_to_ward_at,
+            "postop_completed": self.postop_completed,
         }
 
     @staticmethod
@@ -446,6 +468,12 @@ class ScheduleEntry(QtCore.QObject):
             d.get("circulate",""),
             d.get("time_start",""),
             d.get("time_end",""),
+            d.get("case_uid",""),
+            d.get("version", 1),
+            d.get("state","scheduled"),
+            d.get("returning_started_at",""),
+            d.get("returned_to_ward_at",""),
+            bool(d.get("postop_completed", False)),
         )
 
     def uid(self)->str:
@@ -623,6 +651,27 @@ def _parse_iso(ts: str):
     if not ts: return None
     try: return datetime.fromisoformat(ts.replace("Z",""))
     except Exception: return None
+
+def _now_iso() -> str:
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+def _is_postop_complete_entry(e: "ScheduleEntry") -> bool:
+    if not (e.time_start and e.time_end):
+        return False
+    try:
+        hh1, mm1 = e.time_start.split(":")
+        hh2, mm2 = e.time_end.split(":")
+        t1 = int(hh1) * 60 + int(mm1)
+        t2 = int(hh2) * 60 + int(mm2)
+        if t2 < t1:
+            return False
+    except Exception:
+        return False
+    if not (e.scrub or e.circulate or e.assist1 or e.assist2):
+        return False
+    if not (e.ops or e.diags):
+        return False
+    return True
 
 def _app_icon() -> QIcon:
     pm=QtGui.QPixmap(64,64); pm.fill(QtCore.Qt.transparent)
@@ -1102,6 +1151,31 @@ class Main(QtWidgets.QWidget):
         self._seq_timer = QtCore.QTimer(self); self._seq_timer.timeout.connect(self._check_seq); self._seq_timer.start(1000)
         QtCore.QTimer.singleShot(200, lambda: self._refresh(True))
         QtCore.QTimer.singleShot(600, self._start_ws)
+        self._returning_cron = QtCore.QTimer(self)
+        self._returning_cron.timeout.connect(self._tick_returning_cron)
+        self._returning_cron.start(30_000)
+
+    def _tick_returning_cron(self):
+        changed = False
+        now = datetime.now()
+        for entry in self.sched.entries:
+            if entry.state == "returning_to_ward" and entry.returning_started_at:
+                t0 = _parse_iso(entry.returning_started_at)
+                if not t0:
+                    continue
+                if (now - t0) >= timedelta(minutes=3):
+                    if _is_postop_complete_entry(entry):
+                        entry.postop_completed = True
+                        entry.state = "returned_to_ward"
+                    else:
+                        entry.postop_completed = False
+                        entry.state = "postop_pending"
+                    entry.returned_to_ward_at = _now_iso()
+                    entry.version = int(entry.version or 1) + 1
+                    changed = True
+        if changed:
+            self.sched._save()
+            self._render_tree2()
 
     # ---------- PDPA first-run gate ----------
     def _pdpa_gate(self):
@@ -1430,6 +1504,14 @@ class Main(QtWidgets.QWidget):
             self.toast.show_toast("เพิ่มรายการสำเร็จ")
             # ไม่เพิ่มเข้า historical_monitor_seen ที่นี่ — ปล่อยให้ monitor รายงาน HN จะเป็นคนเพิ่ม
         else:
+            if 0 <= self._edit_idx < len(self.sched.entries):
+                old_entry = self.sched.entries[self._edit_idx]
+                e.case_uid = old_entry.case_uid
+                e.version = int(old_entry.version or 1) + 1
+                e.state = old_entry.state
+                e.returning_started_at = old_entry.returning_started_at
+                e.returned_to_ward_at = old_entry.returned_to_ward_at
+                e.postop_completed = old_entry.postop_completed
             self.sched.update(self._edit_idx, e)
             self._notify("บันทึกการแก้ไขแล้ว", f"OR {e.or_room} • {e.time} • HN {e.hn}")
             self.toast.show_toast("อัปเดตรายการสำเร็จ")
@@ -1460,9 +1542,7 @@ class Main(QtWidgets.QWidget):
 
     def _is_entry_completed(self, e: ScheduleEntry) -> bool:
         """ตรวจว่ารายการถูกเติมข้อมูลหลังผ่าตัดครบถ้วนพอสำหรับการปิดเคส"""
-        nurse_ok = bool(e.scrub or e.circulate)
-        time_ok = bool(e.time_start) and bool(e.time_end)
-        return nurse_ok and time_ok
+        return _is_postop_complete_entry(e)
 
     def _render_tree2(self):
         hbar = self.tree2.horizontalScrollBar()
@@ -1503,6 +1583,12 @@ class Main(QtWidgets.QWidget):
             def time_key(se:Tuple[int,ScheduleEntry]):
                 entry = se[1]
                 return entry.time or "99:99"
+
+            status_map_color = {
+                "returning_to_ward": "#ede9fe",
+                "postop_pending": "#fff7ed",
+                "returned_to_ward": "#ecfdf5",
+            }
 
             for orr in sorted(groups.keys(), key=lambda x: (order.index(x) if x in order else 999, x)):
                 parent=QtWidgets.QTreeWidgetItem(["", orr])
@@ -1555,6 +1641,21 @@ class Main(QtWidgets.QWidget):
                     uid = entry.uid()
                     qs.changed.connect(lambda new_q, u=uid: self._apply_queue_select(u, int(new_q)))
                     self.tree2.setItemWidget(row, 17, qs)
+
+                    st = entry.state or "scheduled"
+                    tip_lines = [f"State: {st}"]
+                    if entry.returning_started_at:
+                        tip_lines.append(f"กำลังส่งกลับตึกตั้งแต่: {entry.returning_started_at}")
+                    if entry.returned_to_ward_at:
+                        tip_lines.append(f"กลับตึกเมื่อ: {entry.returned_to_ward_at}")
+                    if entry.postop_completed:
+                        tip_lines.append("(กรอกหลังผ่าตัดครบแล้ว ✓)")
+                    row.setToolTip(3, "\n".join(tip_lines))
+
+                    if st in status_map_color:
+                        brush = QtGui.QBrush(QtGui.QColor(status_map_color[st]))
+                        for col_idx in range(self.tree2.columnCount()):
+                            row.setBackground(col_idx, brush)
 
                     # ขีดฆ่าเมื่อ "เสร็จแล้ว"
                     # ปรับ: จะขีดเฉพาะเมื่อ HN เคยถูกเห็นใน Monitor แต่ขณะนี้ไม่อยู่ใน Monitor อีกต่อไป
@@ -1709,11 +1810,65 @@ class Main(QtWidgets.QWidget):
             "ward",
             "doctor",
         }
-        for i, entry in enumerate(self.sched.entries):
+        accepted_keys |= {
+            "state",
+            "returning_started_at",
+            "returned_to_ward_at",
+            "postop_completed",
+            "version",
+        }
+
+        intent = str(patch.get("_intent") or "").strip().lower()
+
+        for entry in self.sched.entries:
             if entry.uid() == uid:
+                if intent == "mark_returning":
+                    if not entry.time_end:
+                        self.toast.show_toast("ยังไม่มีเวลา 'จบผ่าตัด' — ตั้งสถานะกำลังส่งกลับตึกไม่ได้")
+                        return False
+                    entry.state = "returning_to_ward"
+                    entry.returning_started_at = _now_iso()
+                    entry.postop_completed = False
+                    entry.returned_to_ward_at = ""
+                    entry.version = int(entry.version or 1) + 1
+                    self.sched._save()
+                    self._render_tree2()
+                    self._flash_row_by_uid(uid)
+                    self.toast.show_toast("ตั้งสถานะ 'กำลังส่งกลับตึก' แล้ว (เริ่มนับ 3 นาที)")
+                    return True
+
+                string_fields = {
+                    "assist1",
+                    "assist2",
+                    "scrub",
+                    "circulate",
+                    "time_start",
+                    "time_end",
+                    "ward",
+                    "doctor",
+                    "state",
+                    "returning_started_at",
+                    "returned_to_ward_at",
+                }
+
                 for key in accepted_keys:
-                    if key in patch:
-                        setattr(entry, key, str(patch.get(key) or ""))
+                    if key not in patch:
+                        continue
+                    value = patch.get(key)
+                    if key == "version":
+                        # version จะถูกปรับเพิ่มท้ายฟังก์ชัน
+                        continue
+                    if key == "postop_completed":
+                        entry.postop_completed = bool(value)
+                        continue
+                    if key in string_fields:
+                        setattr(entry, key, str(value or ""))
+                        continue
+                    setattr(entry, key, value)
+
+                entry.version = int(entry.version or 1) + 1
+                if entry.state == "returning_to_ward" and not entry.returning_started_at:
+                    entry.returning_started_at = _now_iso()
                 self.sched._save()
                 self._render_tree2()
                 self._flash_row_by_uid(uid)
