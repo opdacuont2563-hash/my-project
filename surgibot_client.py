@@ -1443,11 +1443,6 @@ QCheckBox { color:#0f172a; }
         for btn in (self.rb_add, self.rb_edit, self.rb_del):
             btn.toggled.connect(self._update_action_styles)
 
-        self.btn_postop = ShadowButton("💾 บันทึกหลังผ่าตัด", "#f97316")
-        self.btn_postop.setMinimumWidth(150)
-        self.btn_postop.clicked.connect(self._on_postop_clicked)
-        act_layout.addWidget(self.btn_postop)
-
         self.btn_send = ShadowButton("🚀 ส่งคำสั่ง", "#10b981")
         self.btn_send.setMinimumWidth(130)
         self.btn_send.clicked.connect(self._on_send)
