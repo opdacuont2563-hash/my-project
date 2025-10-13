@@ -22,6 +22,7 @@ from icd10_catalog import (
     diagnosis_suggestions,
     operation_suggestions,
     load_icd10tm_xlsx,
+    load_icd9_ops,
 )
 
 try:
@@ -936,8 +937,24 @@ class Main(QtWidgets.QWidget):
         except Exception:
             self._icd10tm_list = []
 
+        self._icd9_valid_path = os.getenv(
+            "ICD9_VALID_XLSX_PATH",
+            r"C:\\Users\\EndoScope\\Desktop\\my-project\\section111validicd9-jan2025_0.xlsx",
+        )
+        self._icd9_excluded_path = os.getenv(
+            "ICD9_EXCLUDED_XLSX_PATH",
+            r"C:\\Users\\EndoScope\\Desktop\\my-project\\section111excludedicd9-jan2025_0.xlsx",
+        )
+        self._icd9_ops: List[str] = []
+        try:
+            self._icd9_ops = load_icd9_ops(self._icd9_valid_path, self._icd9_excluded_path) or []
+        except Exception:
+            self._icd9_ops = []
+
         self._diag_catalog_full: List[str] = []
+        self._op_catalog_full: List[str] = []
         self._dx_index: Optional[FastSearchIndex] = None
+        self._op_index: Optional[FastSearchIndex] = None
         self._search_executor = ThreadPoolExecutor(max_workers=1)
         self._search_timer = QtCore.QTimer(self)
         self._search_timer.setSingleShot(True)
@@ -952,6 +969,19 @@ class Main(QtWidgets.QWidget):
         self._search_timer.setInterval(debounce_ms)
         self._search_timer.timeout.connect(self._on_diag_search_timeout)
         self._latest_diag_query = ""
+        try:
+            self._op_search_limit = max(1, int(os.getenv("OP_SEARCH_LIMIT", "100")))
+        except ValueError:
+            self._op_search_limit = 100
+        try:
+            op_debounce = max(0, int(os.getenv("OP_SEARCH_DEBOUNCE_MS", "150")))
+        except ValueError:
+            op_debounce = 150
+        self._op_search_timer = QtCore.QTimer(self)
+        self._op_search_timer.setSingleShot(True)
+        self._op_search_timer.setInterval(op_debounce)
+        self._op_search_timer.timeout.connect(self._on_op_search_timeout)
+        self._latest_op_query = ""
 
         self.setWindowTitle("Registry Patient Connect — ORNBH")
         self.resize(1360, 900)
@@ -1052,6 +1082,8 @@ class Main(QtWidgets.QWidget):
         self.op_adder = SearchSelectAdder("ค้นหา/เลือก Operation...", suggestions=[])
         self.op_adder.itemsChanged.connect(self._on_operations_changed)
         self.op_adder.itemAdded.connect(lambda txt: _append_seed_item(SEED_OP_KEY, self._current_specialty_key, txt))
+        if self.op_adder.search_line:
+            self.op_adder.search_line.textChanged.connect(self._on_op_query_changed)
         g.addWidget(self.op_adder, r,0,1,6)
         r+=1
 
@@ -1499,7 +1531,31 @@ class Main(QtWidgets.QWidget):
         primary_ops = operation_suggestions(key)
         fallback_ops = [op for op in ALL_OPERATIONS if op not in primary_ops]
         custom_ops = _get_seed_list(SEED_OP_KEY, key)
-        self.op_adder.set_suggestions(custom_ops + primary_ops + fallback_ops)
+
+        merged_ops: List[str] = []
+
+        def _append_unique(source: List[str]):
+            for item in source:
+                if item and item not in merged_ops:
+                    merged_ops.append(item)
+
+        if self._icd9_ops:
+            _append_unique(self._icd9_ops)
+        _append_unique(custom_ops)
+        _append_unique(primary_ops)
+        _append_unique(fallback_ops)
+
+        self._op_catalog_full = merged_ops
+        if self.op_adder.search_line:
+            self._latest_op_query = self.op_adder.search_line.text()
+        else:
+            self._latest_op_query = ""
+        self._op_index = FastSearchIndex(merged_ops, prefix_len=3) if merged_ops else None
+        if self._op_index:
+            initial_ops = self._op_index.search(self._latest_op_query, self._op_search_limit)
+        else:
+            initial_ops = merged_ops[: self._op_search_limit]
+        self.op_adder.set_suggestions(initial_ops)
         self._refresh_diag_suggestions()
 
     def _handle_diag_item_added(self, text: str):
@@ -1554,6 +1610,48 @@ class Main(QtWidgets.QWidget):
             if query != self._latest_diag_query:
                 return
             self.diag_adder.set_suggestions(results)
+
+        future.add_done_callback(lambda fut: QtCore.QTimer.singleShot(0, lambda: _apply(fut)))
+
+    def _on_op_query_changed(self, text: str):
+        self._latest_op_query = text or ""
+        if self._op_index:
+            self._op_search_timer.stop()
+            self._op_search_timer.start()
+        else:
+            self._run_op_search(self._latest_op_query)
+
+    def _on_op_search_timeout(self):
+        self._run_op_search(self._latest_op_query)
+
+    def _run_op_search(self, query: str):
+        if not self._op_index:
+            if not self._op_catalog_full:
+                self.op_adder.set_suggestions([])
+                return
+            normalized_query = normalize_text(query)
+            if not normalized_query:
+                subset = self._op_catalog_full[: self._op_search_limit]
+            else:
+                subset = []
+                for item in self._op_catalog_full:
+                    if normalized_query in normalize_text(item):
+                        subset.append(item)
+                    if len(subset) >= self._op_search_limit:
+                        break
+            self.op_adder.set_suggestions(subset)
+            return
+
+        future = self._search_executor.submit(self._op_index.search, query, self._op_search_limit)
+
+        def _apply(fut):
+            try:
+                results = fut.result()
+            except Exception:
+                results = []
+            if query != self._latest_op_query:
+                return
+            self.op_adder.set_suggestions(results)
 
         future.add_done_callback(lambda fut: QtCore.QTimer.singleShot(0, lambda: _apply(fut)))
 

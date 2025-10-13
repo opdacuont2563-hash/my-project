@@ -221,3 +221,99 @@ def load_icd10tm_xlsx(xlsx_path: str) -> List[str]:
         return sorted({item for item in results if item}, key=str.lower)
     except Exception:
         return []
+
+
+# ---------------------------------------------------------------------------
+# Excel loader for ICD-9 operations (valid + excluded)
+# ---------------------------------------------------------------------------
+
+
+def _read_xlsx_rows(xlsx_path: str):
+    """Yield trimmed string rows from an Excel worksheet."""
+
+    try:  # pragma: no cover - optional dependency
+        import openpyxl  # type: ignore
+    except Exception:
+        return []
+
+    path = Path(xlsx_path)
+    if not path.exists():
+        return []
+
+    try:
+        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        sheet = workbook.active
+        for row in sheet.iter_rows(min_row=1, values_only=True):
+            if not row:
+                continue
+            yield [str(cell).strip() for cell in row if cell is not None]
+    except Exception:
+        return []
+
+
+def load_icd9_ops(valid_path: str, exclude_path: str) -> List[str]:
+    """Load ICD-9 operations from Excel workbooks.
+
+    ``valid_path`` should point to the workbook that contains the canonical
+    operation list, while ``exclude_path`` lists codes that must be removed.
+    Returned values follow the ``"CODE - Description"`` format and are sorted
+    by the normalized code for a consistent experience.
+    """
+
+    excluded: Set[str] = set()
+    for values in _read_xlsx_rows(exclude_path):
+        if not values:
+            continue
+        code = values[0].split()[0] if values else ""
+        normalized = code.replace(".", "").strip().upper()
+        if not normalized:
+            continue
+        if normalized in {"CODE", "ICD9", "ICD-9", "รหัส"}:
+            continue
+        excluded.add(normalized)
+
+    items: Dict[str, str] = {}
+    for values in _read_xlsx_rows(valid_path):
+        if not values:
+            continue
+        raw_code = (values[0] if len(values) >= 1 else "").strip()
+        raw_desc = (values[1] if len(values) >= 2 else "").strip()
+        if not raw_code or not raw_desc:
+            continue
+
+        lowered = raw_code.lower()
+        if lowered in {"code", "icd9", "icd-9", "operation", "รหัส", "หัตถการ"}:
+            continue
+
+        key = raw_code.replace(".", "").strip().upper()
+        if key in excluded:
+            continue
+
+        items[key] = f"{raw_code} - {raw_desc}"
+
+    return [items[idx] for idx in sorted(items.keys())]
+
+
+def _merge_icd9_from_env_into_all_operations() -> None:
+    """Append ICD-9 operations from environment-provided workbooks."""
+
+    import os
+
+    valid_path = os.getenv("ICD9_VALID_XLSX_PATH", "")
+    exclude_path = os.getenv("ICD9_EXCLUDED_XLSX_PATH", "")
+    if not valid_path or not exclude_path:
+        return
+
+    try:
+        extra_ops = load_icd9_ops(valid_path, exclude_path)
+    except Exception:
+        extra_ops = []
+
+    if not extra_ops:
+        return
+
+    merged: List[str] = list(dict.fromkeys(ALL_OPERATIONS + extra_ops))
+    globals()["ALL_OPERATIONS"] = merged
+
+
+_merge_icd9_from_env_into_all_operations()
