@@ -1065,7 +1065,7 @@ class Main(QtWidgets.QWidget):
             topc = self.tree_sched.topLevelItemCount()
             for i in range(topc):
                 it = self.tree_sched.topLevelItem(i)
-                key = (it.text(0) or "").strip()
+                key = self._or_item_label(it)
                 if key:
                     st[key] = it.isExpanded()
             self._or_expand_state = st
@@ -1073,9 +1073,23 @@ class Main(QtWidgets.QWidget):
             pass
 
     def _apply_or_expand_state(self, item: QtWidgets.QTreeWidgetItem):
-        key = (item.text(0) or "").strip()
+        key = self._or_item_label(item)
         expanded = self._or_expand_state.get(key, True)
         item.setExpanded(bool(expanded))
+
+    def _or_item_label(self, item: QtWidgets.QTreeWidgetItem | None) -> str:
+        if item is None:
+            return ""
+        text = (item.text(0) or "").strip()
+        if not text:
+            cached_title = item.data(0, QtCore.Qt.UserRole + 201)
+            if cached_title:
+                text = str(cached_title).strip()
+        if not text:
+            cached_or = item.data(0, QtCore.Qt.UserRole + 200)
+            if cached_or:
+                text = str(cached_or).strip()
+        return text
 
     def _or_card_widget(self, title: str, accent: str) -> QtWidgets.QWidget:
         w = QtWidgets.QFrame(); w.setObjectName("OrCard")
@@ -1242,12 +1256,24 @@ class Main(QtWidgets.QWidget):
         hdr = tree.header()
         if hdr is None:
             return
+        hbar = tree.horizontalScrollBar()
+        vbar = tree.verticalScrollBar()
+        old_h = hbar.value() if hbar is not None else 0
+        old_v = vbar.value() if vbar is not None else 0
         hdr.setStretchLastSection(False)
         for c in (0, 1, 2, 4, 9, 19):
             try:
                 tree.resizeColumnToContents(c)
             except Exception:
                 break
+        if hbar is not None or vbar is not None:
+            def _restore_after_autofit():
+                if hbar is not None:
+                    hbar.setValue(min(old_h, hbar.maximum()))
+                if vbar is not None:
+                    vbar.setValue(min(old_v, vbar.maximum()))
+
+            QtCore.QTimer.singleShot(0, _restore_after_autofit)
 
     def _build_header_frame(self) -> QtWidgets.QFrame:
         banner = WaveBanner(self)
@@ -1910,9 +1936,7 @@ QLabel { color:#fff; font-weight: 900; }
         while parent.parent() is not None:
             parent = parent.parent()
 
-        or_text = (parent.text(0) or "").strip()
-        if not or_text:
-            or_text = (parent.data(0, QtCore.Qt.UserRole + 200) or "").strip()
+        or_text = self._or_item_label(parent)
         if not or_text:
             sticky.hide()
             return
@@ -1930,6 +1954,7 @@ QLabel { color:#fff; font-weight: 900; }
         y = max(4, rect.top() + 6)
         sticky.setGeometry(x, y, width, height)
         sticky.show()
+        sticky.raise_()
 
     def _set_chip(self, ok: bool):
         base = getattr(self, "_status_pill_base", "background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;padding:4px 10px;font-weight:600;")
@@ -2402,8 +2427,10 @@ QLabel { color:#fff; font-weight: 900; }
                     continue
 
                 parent = QtWidgets.QTreeWidgetItem([""] * tree.columnCount())
-                parent.setText(0, f"{orr}  ห้องผ่าตัด")
+                header_title = f"{orr}  ห้องผ่าตัด"
+                parent.setText(0, header_title)
                 parent.setData(0, QtCore.Qt.UserRole + 200, orr)
+                parent.setData(0, QtCore.Qt.UserRole + 201, header_title)
                 parent.setFirstColumnSpanned(True)
                 tree.addTopLevelItem(parent)
 
