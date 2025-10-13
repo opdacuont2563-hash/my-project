@@ -929,7 +929,7 @@ class Main(QtWidgets.QWidget):
         self._icd10tm_list: List[str] = []
         self._icd10tm_path = os.getenv(
             "ICD10TM_XLSX_PATH",
-            r"C:\\Users\\Admin\\Desktop\\my-project\\ICD10TM-Public.xlsx",
+            r"C:\\Users\\EndoScope\\Desktop\\my-project\\ICD10TM-Public.xlsx",
         )
         try:
             self._icd10tm_list = load_icd10tm_xlsx(self._icd10tm_path) or []
