@@ -22,24 +22,6 @@ from icd10_catalog import (
     operation_suggestions,
 )
 
-# ---------------------- Helpers: "done" style ----------------------
-DONE_KEYWORDS = ("ผ่าตัดเสร็จ", "done", "completed", "finished")
-
-def _is_done_status(text: str) -> bool:
-    if not text:
-        return False
-    t = str(text).strip().lower()
-    return any(k in t for k in DONE_KEYWORDS)
-
-def _apply_done_style(item: QtWidgets.QTreeWidgetItem, col_count: int) -> None:
-    """ขีดฆ่า + โทนสีเทาให้อ่านง่าย"""
-    font = item.font(0)
-    font.setStrikeOut(True)
-    gray = QtGui.QBrush(QtGui.QColor("#9ca3af"))
-    for c in range(col_count):
-        item.setFont(c, font)
-        item.setForeground(c, gray)
-
 # ---------------------- Modern theme ----------------------
 def apply_modern_theme(widget: QtWidgets.QWidget):
     widget.setStyleSheet("""
@@ -210,6 +192,11 @@ STATUS_COLORS = {
 }
 PULSE_STATUS = {"กำลังผ่าตัด","กำลังพักฟื้น","กำลังส่งกลับตึก"}
 DEFAULT_OR_ROOMS = ["OR1","OR2","OR3","OR4","OR5","OR6","OR8"]
+
+# --- สถานะจาก monitor ที่ใช้จับเวลา / auto-complete ---
+STATUS_OP_START = "กำลังผ่าตัด"
+STATUS_OP_END = "กำลังพักฟื้น"
+STATUS_RETURNING = "กำลังส่งกลับตึก"
 
 WARD_LIST = [
     "— กรุณาเลือก —",
@@ -522,7 +509,8 @@ class LocalDBLogger:
 
     def _init(self, conn):
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS schedule(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT,
@@ -544,7 +532,19 @@ class LocalDBLogger:
                 time_end TEXT,
                 case_size TEXT
             )
-        """)
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS surgery_events(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_uid TEXT,
+                event TEXT,
+                at TEXT,
+                details TEXT
+            )
+            """
+        )
         conn.commit()
 
     def append_entry(self, e: 'ScheduleEntry'):
@@ -583,6 +583,15 @@ class LocalDBLogger:
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             row,
+        )
+        conn.commit()
+
+    def log_event(self, case_uid: str, event: str, details: Optional[dict] = None, emergency: bool = False):
+        conn = self.conn_x if emergency else self.conn_e
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO surgery_events(case_uid,event,at,details) VALUES(?,?,?,?)",
+            (case_uid, event, _now_iso(), json.dumps(details or {})),
         )
         conn.commit()
 
@@ -795,8 +804,7 @@ class Main(QtWidgets.QWidget):
         self.setWindowIcon(icon)
         self.tray = QtWidgets.QSystemTrayIcon(icon, self); self.tray.show()
 
-        # new: เก็บ HN ที่เคยเห็นใน Monitor (historical) เพื่อไม่ให้ขีดฆ่ารายการที่เพิ่งเพิ่มใหม่
-        self._historical_monitor_seen = set()
+        self._last_status_by_hn: dict[str, str] = {}
 
         # form edit mode
         self._edit_idx: Optional[int] = None
@@ -1156,26 +1164,75 @@ class Main(QtWidgets.QWidget):
         self._returning_cron.start(30_000)
 
     def _tick_returning_cron(self):
-        changed = False
         now = datetime.now()
+        changed = False
+        alerts: List[Tuple[str, ScheduleEntry]] = []
+
         for entry in self.sched.entries:
             if entry.state == "returning_to_ward" and entry.returning_started_at:
                 t0 = _parse_iso(entry.returning_started_at)
-                if not t0:
+                if not t0 or not entry.time_end:
                     continue
                 if (now - t0) >= timedelta(minutes=3):
-                    if _is_postop_complete_entry(entry):
+                    if self._is_entry_completed(entry):
                         entry.postop_completed = True
                         entry.state = "returned_to_ward"
+                        entry.returned_to_ward_at = now.strftime("%Y-%m-%dT%H:%M:%S")
+                        self._db_insert_case(entry)
+                        alerts.append(("ok", entry))
                     else:
                         entry.postop_completed = False
                         entry.state = "postop_pending"
-                    entry.returned_to_ward_at = _now_iso()
+                        entry.returned_to_ward_at = now.strftime("%Y-%m-%dT%H:%M:%S")
+                        alerts.append(("warn", entry))
                     entry.version = int(entry.version or 1) + 1
                     changed = True
+
         if changed:
             self.sched._save()
             self._render_tree2()
+            if alerts:
+                kind, entry = alerts[-1]
+                if kind == "ok":
+                    self._banner_returned_ok(entry)
+                else:
+                    self._banner_incomplete(entry)
+
+    def _db_insert_case(self, entry: "ScheduleEntry"):
+        try:
+            self.db_logger.log_event(
+                case_uid=entry.case_uid,
+                event="returned_to_ward",
+                details={
+                    "hn": entry.hn,
+                    "or": entry.or_room,
+                    "time_start": entry.time_start,
+                    "time_end": entry.time_end,
+                    "assist1": entry.assist1,
+                    "assist2": entry.assist2,
+                    "scrub": entry.scrub,
+                    "circulate": entry.circulate,
+                    "diags": entry.diags,
+                    "ops": entry.ops,
+                },
+                emergency=str(entry.urgency).lower() == "emergency",
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "DB error", str(exc))
+
+    def _banner_incomplete(self, entry: "ScheduleEntry"):
+        self.result_banner.set_icon("⚠️")
+        self.result_banner.set_title("⚠️ ข้อมูลหลังผ่าตัดยังไม่ครบ — ยังไม่บันทึกลงฐานข้อมูล")
+        self.result_banner.set_subtitle(
+            f"HN {entry.hn} | OR {entry.or_room} | โปรดกรอกทีมพยาบาล/Diagnosis/Operation และตรวจเวลาเริ่ม–จบ"
+        )
+
+    def _banner_returned_ok(self, entry: "ScheduleEntry"):
+        self.result_banner.set_icon("✅")
+        self.result_banner.set_title("บันทึกลงฐานข้อมูลสำเร็จ (Returned)")
+        self.result_banner.set_subtitle(
+            f"HN {entry.hn} | OR {entry.or_room} | เวลา {entry.time_start or '-'}–{entry.time_end or '-'}"
+        )
 
     # ---------- PDPA first-run gate ----------
     def _pdpa_gate(self):
@@ -1209,14 +1266,7 @@ class Main(QtWidgets.QWidget):
             data=self._client().list_items()
             rows=extract_rows(data)
             # อัปเดต historical monitor seen ก่อน render (เก็บ HN ที่ monitor รายงานมา)
-            for r in rows:
-                hn = str(r.get("hn_full") or "").strip()
-                if not hn:
-                    rid = str(r.get("id") or "")
-                    if rid.isdigit() and len(rid)==9:
-                        hn = rid
-                if hn:
-                    self._historical_monitor_seen.add(hn)
+            self._scan_monitor_status_transitions(rows)
             self._rebuild_table(rows); self._chip(True)
         except Exception:
             self._chip(False); self._rebuild_table([])
@@ -1264,15 +1314,7 @@ class Main(QtWidgets.QWidget):
     def _on_ws_msg(self, msg):
         try:
             rows=extract_rows(json.loads(msg))
-            # update historical seen on live ws msgs too
-            for r in rows:
-                hn = str(r.get("hn_full") or "").strip()
-                if not hn:
-                    rid = str(r.get("id") or "")
-                    if rid.isdigit() and len(rid)==9:
-                        hn = rid
-                if hn:
-                    self._historical_monitor_seen.add(hn)
+            self._scan_monitor_status_transitions(rows)
             self._rebuild_table(rows)
         except Exception: pass
 
@@ -1526,19 +1568,72 @@ class Main(QtWidgets.QWidget):
 
         self._clear_form()
 
-    # ---------- Result tree (with off-hours filtering + strike-through) ----------
-    def _monitor_hn_set(self) -> set:
-        """ดึงชุด HN ที่ยังอยู่ใน Monitor (rows_cache ปัจจุบัน)"""
-        s=set()
-        for r in (self.rows_cache or []):
-            hn = str(r.get("hn_full") or "").strip()
+    # ---------- Helpers for monitor state sync ----------
+    def _find_entry_by_hn_latest(self, hn: str):
+        matches = [e for e in self.sched.entries if str(e.hn).strip() == str(hn).strip()]
+        if not matches:
+            return None
+
+        def _key(entry: ScheduleEntry):
+            try:
+                hh, mm = (entry.time or "00:00").split(":")
+                return (str(entry.date), int(hh) * 60 + int(mm))
+            except Exception:
+                return (str(entry.date), 0)
+
+        matches.sort(key=_key, reverse=True)
+        return matches[0]
+
+    def _set_time_start_if_empty(self, entry: ScheduleEntry):
+        if not entry.time_start:
+            entry.time_start = datetime.now().strftime("%H:%M")
+            entry.version = int(entry.version or 1) + 1
+
+    def _set_time_end_if_empty(self, entry: ScheduleEntry):
+        if not entry.time_end:
+            entry.time_end = datetime.now().strftime("%H:%M")
+            entry.version = int(entry.version or 1) + 1
+
+    def _scan_monitor_status_transitions(self, rows: List[dict]):
+        for row in rows:
+            hn = str(row.get("hn_full") or row.get("id") or "").strip()
             if not hn:
-                rid = str(r.get("id") or "")
-                if rid.isdigit() and len(rid)==9:
-                    hn = rid
-            if hn:
-                s.add(hn)
-        return s
+                continue
+            status = str(row.get("status") or "").strip()
+            if not status:
+                continue
+
+            prev = self._last_status_by_hn.get(hn)
+            if prev == status:
+                continue
+            self._last_status_by_hn[hn] = status
+
+            entry = self._find_entry_by_hn_latest(hn)
+            if not entry:
+                continue
+
+            changed = False
+            if status == STATUS_OP_START:
+                self._set_time_start_if_empty(entry)
+                if entry.state in {"scheduled", "in_or", "operation_ended", "postop_pending", ""}:
+                    entry.state = "operation_started"
+                    changed = True
+            elif status == STATUS_OP_END:
+                self._set_time_end_if_empty(entry)
+                if entry.state in {"operation_started", "in_or", "scheduled", ""}:
+                    entry.state = "operation_ended"
+                    changed = True
+            elif status == STATUS_RETURNING:
+                if not entry.time_end:
+                    continue
+                if entry.state != "returning_to_ward":
+                    entry.state = "returning_to_ward"
+                    entry.returning_started_at = _now_iso()
+                    entry.version = int(entry.version or 1) + 1
+                    changed = True
+
+            if changed:
+                self.sched._save()
 
     def _is_entry_completed(self, e: ScheduleEntry) -> bool:
         """ตรวจว่ารายการถูกเติมข้อมูลหลังผ่าตัดครบถ้วนพอสำหรับการปิดเคส"""
@@ -1551,47 +1646,35 @@ class Main(QtWidgets.QWidget):
 
         try:
             self.tree2.clear()
-
-            # เลือก entries ที่ต้องแสดงตามกติกา
-            now_code = _now_period(datetime.now())  # "in" / "off"
-            in_monitor = self._monitor_hn_set()
-
-            def should_show(entry: ScheduleEntry) -> bool:
-                if now_code == "in":
-                    return True  # ในเวลาราชการ แสดงทั้งหมด
-                # นอกเวลาราชการ: แสดงเฉพาะ off-period และ in-period ที่ยังไม่เสร็จ (HN ยังอยู่ใน monitor)
-                return (entry.period == "off") or (entry.period == "in" and entry.hn in in_monitor)
-
-            entries_to_show: List[Tuple[int, ScheduleEntry]] = [
-                (idx, entry) for idx, entry in enumerate(self.sched.entries) if should_show(entry)
-            ]
-
-            # อัปเดตหัวการ์ด/แบนเนอร์ทุกครั้งที่เรนเดอร์
             self._set_result_title()
 
-            # เคสไม่มีข้อมูลให้คืนค่าอย่างนุ่มนวล
+            entries_to_show: List[Tuple[int, ScheduleEntry]] = list(enumerate(self.sched.entries))
             if not entries_to_show:
                 return
 
-            # จัดกลุ่มตาม OR
             groups: Dict[str, List[Tuple[int, ScheduleEntry]]] = {}
             for idx, entry in entries_to_show:
                 groups.setdefault(entry.or_room or "-", []).append((idx, entry))
 
-            order=self.sched.or_rooms
+            order = self.sched.or_rooms
 
-            def time_key(se:Tuple[int,ScheduleEntry]):
+            def time_key(se: Tuple[int, ScheduleEntry]):
                 entry = se[1]
                 return entry.time or "99:99"
 
-            status_map_color = {
+            status_colors = {
                 "returning_to_ward": "#ede9fe",
                 "postop_pending": "#fff7ed",
                 "returned_to_ward": "#ecfdf5",
             }
+            status_icons = {
+                "returning_to_ward": "⏳",
+                "postop_pending": "⚠️",
+                "returned_to_ward": "✅",
+            }
 
             for orr in sorted(groups.keys(), key=lambda x: (order.index(x) if x in order else 999, x)):
-                parent=QtWidgets.QTreeWidgetItem(["", orr])
+                parent = QtWidgets.QTreeWidgetItem(["", orr])
                 parent.setFirstColumnSpanned(True)
                 bg_brush = QtGui.QBrush(QtGui.QColor("#f6f9ff"))
                 parent.setBackground(0, bg_brush)
@@ -1603,7 +1686,6 @@ class Main(QtWidgets.QWidget):
                     parent.setData(c, QtCore.Qt.UserRole + 99, "grp")
                 self.tree2.addTopLevelItem(parent)
 
-                # คิว 1–9 มาก่อน (เรียงตามเลขคิว), คิว 0 ตามเวลา
                 rows_sorted = sorted(
                     groups[orr],
                     key=lambda se: (0, int(se[1].queue)) if int(se[1].queue or 0) > 0 else (1, time_key(se))
@@ -1611,30 +1693,30 @@ class Main(QtWidgets.QWidget):
 
                 for idx, entry in rows_sorted:
                     diag_txt = " with ".join(entry.diags) if entry.diags else "-"
-                    op_txt   = " with ".join(entry.ops)   if entry.ops   else "-"
-                    row=QtWidgets.QTreeWidgetItem([
-                        _period_label(entry.period),                # 0
-                        entry.time or "-",                          # 1
-                        entry.hn,                                   # 2
-                        entry.name or "-",                          # 3
-                        str(entry.age or 0),                        # 4
-                        diag_txt,                                   # 5
-                        op_txt,                                     # 6
-                        entry.doctor or "-",                        # 7
-                        entry.ward or "-",                          # 8
-                        entry.case_size or "-",                     # 9
-                        entry.dept or "-",                          # 10
-                        entry.assist1 or "-",                       # 11
-                        entry.assist2 or "-",                       # 12
-                        entry.scrub or "-",                         # 13
-                        entry.circulate or "-",                     # 14
-                        entry.time_start or "-",                    # 15
-                        entry.time_end or "-",                      # 16
-                        "",                                        # 17 (คิว: widget)
-                        entry.urgency or "Elective",                # 18
+                    op_txt = " with ".join(entry.ops) if entry.ops else "-"
+                    row = QtWidgets.QTreeWidgetItem([
+                        _period_label(entry.period),
+                        entry.time or "-",
+                        entry.hn,
+                        entry.name or "-",
+                        str(entry.age or 0),
+                        diag_txt,
+                        op_txt,
+                        entry.doctor or "-",
+                        entry.ward or "-",
+                        entry.case_size or "-",
+                        entry.dept or "-",
+                        entry.assist1 or "-",
+                        entry.assist2 or "-",
+                        entry.scrub or "-",
+                        entry.circulate or "-",
+                        entry.time_start or "-",
+                        entry.time_end or "-",
+                        "",
+                        entry.urgency or "Elective",
                     ])
                     row.setData(0, QtCore.Qt.UserRole, entry.uid())
-                    row.setData(0, QtCore.Qt.UserRole+1, idx)
+                    row.setData(0, QtCore.Qt.UserRole + 1, idx)
                     parent.addChild(row)
 
                     qs = QueueSelectWidget(int(entry.queue or 0))
@@ -1642,30 +1724,23 @@ class Main(QtWidgets.QWidget):
                     qs.changed.connect(lambda new_q, u=uid: self._apply_queue_select(u, int(new_q)))
                     self.tree2.setItemWidget(row, 17, qs)
 
-                    st = entry.state or "scheduled"
-                    tip_lines = [f"State: {st}"]
-                    if entry.returning_started_at:
-                        tip_lines.append(f"กำลังส่งกลับตึกตั้งแต่: {entry.returning_started_at}")
-                    if entry.returned_to_ward_at:
-                        tip_lines.append(f"กลับตึกเมื่อ: {entry.returned_to_ward_at}")
-                    if entry.postop_completed:
-                        tip_lines.append("(กรอกหลังผ่าตัดครบแล้ว ✓)")
-                    row.setToolTip(3, "\n".join(tip_lines))
-
-                    if st in status_map_color:
-                        brush = QtGui.QBrush(QtGui.QColor(status_map_color[st]))
+                    state = entry.state or ""
+                    if state in status_colors:
+                        brush = QtGui.QBrush(QtGui.QColor(status_colors[state]))
                         for col_idx in range(self.tree2.columnCount()):
                             row.setBackground(col_idx, brush)
-
-                    # ขีดฆ่าเมื่อ "เสร็จแล้ว"
-                    # ปรับ: จะขีดเฉพาะเมื่อ HN เคยถูกเห็นใน Monitor แต่ขณะนี้ไม่อยู่ใน Monitor อีกต่อไป
-                    if (
-                        entry.hn
-                        and (entry.hn not in in_monitor)
-                        and (entry.hn in self._historical_monitor_seen)
-                        and self._is_entry_completed(entry)
-                    ):
-                        _apply_done_style(row, row.columnCount())
+                        icon = status_icons.get(state)
+                        if icon:
+                            row.setText(3, f"{icon} {row.text(3)}")
+                    if state:
+                        tip = [f"State: {state}"]
+                        if entry.returning_started_at:
+                            tip.append(f"เริ่มส่งกลับตึก: {entry.returning_started_at}")
+                        if entry.returned_to_ward_at:
+                            tip.append(f"กลับตึกเมื่อ: {entry.returned_to_ward_at}")
+                        if entry.postop_completed:
+                            tip.append("(ข้อมูลหลังผ่าตัดครบถ้วน ✓)")
+                        row.setToolTip(3, "\n".join(tip))
 
             self.tree2.expandAll()
         finally:
@@ -1933,7 +2008,9 @@ class Main(QtWidgets.QWidget):
     def _set_result_title(self):
         now = datetime.now()
         txt = f"ตารางการผ่าตัด ประจำวัน ({now:%d/%m/%Y}) เวลา {now:%H:%M} น. ห้องผ่าตัดโรงพยาบาลหนองบัวลำภู"
+        self.result_banner.set_icon("📁")
         self.result_banner.set_title(txt)
+        self.result_banner.set_subtitle("ห้องผ่าตัดโรงพยาบาลหนองบัวลำภู")
         self.card_result.title_lbl.setText(txt)
 
     # ---------- seq watcher ----------
