@@ -1569,10 +1569,16 @@ class Main(QtWidgets.QWidget):
         suggestions = diagnosis_suggestions(self._current_specialty_key, ops)
         custom_dx = _get_seed_list(SEED_DX_KEY, self._current_specialty_key)
         merged: List[str] = []
-        if self._icd10tm_list:
-            merged.extend(self._icd10tm_list)
-        merged.extend(custom_dx)
-        merged.extend(suggestions)
+
+        def _append_unique(values: List[str]) -> None:
+            for value in values or []:
+                val = (value or "").strip()
+                if val and val not in merged:
+                    merged.append(val)
+
+        _append_unique(self._icd10tm_list)
+        _append_unique(custom_dx)
+        _append_unique(list(suggestions))
         self._diag_catalog_full = merged
         self._dx_index = FastSearchIndex(self._diag_catalog_full, prefix_len=3) if self._diag_catalog_full else None
         if self.diag_adder.search_line:

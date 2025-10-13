@@ -228,8 +228,8 @@ def load_icd10tm_xlsx(xlsx_path: str) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
-def _read_xlsx_rows(xlsx_path: str):
-    """Yield trimmed string rows from an Excel worksheet."""
+def _read_xlsx_rows_icd9(xlsx_path: str):
+    """Yield trimmed string rows from an Excel worksheet used for ICD-9 lists."""
 
     try:  # pragma: no cover - optional dependency
         import openpyxl  # type: ignore
@@ -261,7 +261,7 @@ def load_icd9_ops(valid_path: str, exclude_path: str) -> List[str]:
     """
 
     excluded: Set[str] = set()
-    for values in _read_xlsx_rows(exclude_path):
+    for values in _read_xlsx_rows_icd9(exclude_path):
         if not values:
             continue
         code = values[0].split()[0] if values else ""
@@ -273,7 +273,7 @@ def load_icd9_ops(valid_path: str, exclude_path: str) -> List[str]:
         excluded.add(normalized)
 
     items: Dict[str, str] = {}
-    for values in _read_xlsx_rows(valid_path):
+    for values in _read_xlsx_rows_icd9(valid_path):
         if not values:
             continue
         raw_code = (values[0] if len(values) >= 1 else "").strip()
