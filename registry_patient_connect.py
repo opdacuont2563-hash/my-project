@@ -2,10 +2,11 @@
 """
 (ปรับปรุงจาก registry_patient_connect.py — แก้ strike-through logic & ปรับสไตล์ตาราง)
 """
-import os, sys, json, argparse, csv, base64, secrets, hashlib
+import os, sys, json, argparse, csv, base64, secrets, hashlib, unicodedata, re
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timedelta, time as dtime
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from requests.adapters import HTTPAdapter, Retry
@@ -22,6 +23,13 @@ from icd10_catalog import (
     operation_suggestions,
     load_icd10tm_xlsx,
 )
+
+try:
+    from rapidfuzz import fuzz, process  # type: ignore
+
+    _HAS_RAPIDFUZZ = True
+except Exception:  # pragma: no cover - optional dependency
+    _HAS_RAPIDFUZZ = False
 
 # ---------------------- Modern theme ----------------------
 def apply_modern_theme(widget: QtWidgets.QWidget):
@@ -179,6 +187,111 @@ class InfoBanner(QtWidgets.QFrame):
 
     def set_icon(self, text: str):
         self.icon_lbl.setText(text or "📁")
+
+# ---------------------- Diagnosis search helpers ----------------------
+_COMBINE_RE = re.compile(r"[\u0300-\u036f\u0E31\u0E34-\u0E3A\u0E47-\u0E4E]")
+_NON_ALNUM_RE = re.compile(r"[^0-9A-Za-z\u0E00-\u0E7F]+")
+
+
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    val = unicodedata.normalize("NFKD", text).lower()
+    val = _COMBINE_RE.sub("", val)
+    val = _NON_ALNUM_RE.sub(" ", val).strip()
+    return " ".join(val.split())
+
+
+class FastSearchIndex:
+    def __init__(self, items: List[str], prefix_len: int = 3):
+        self.items: List[str] = items or []
+        self.norms: List[str] = [normalize_text(x) for x in self.items]
+        self.prefix_len = max(1, int(prefix_len or 1))
+        self.prefix_map: Dict[str, List[int]] = {}
+        for idx, (raw, norm) in enumerate(zip(self.items, self.norms)):
+            keys = set()
+            left = (raw.split(" - ", 1)[0] if raw else "")
+            for token in (raw, left, norm):
+                token_norm = normalize_text(token)
+                if not token_norm:
+                    continue
+                tokens = token_norm.split()
+                if not tokens:
+                    continue
+                first = tokens[0]
+                prefixes = {first[: self.prefix_len]}
+                if len(first) >= 2:
+                    prefixes.add(first[:2])
+                for tk in tokens[:3]:
+                    prefixes.add(tk[: self.prefix_len])
+                keys.update({p for p in prefixes if p})
+            for key in keys:
+                self.prefix_map.setdefault(key, []).append(idx)
+
+    def search(self, query: str, limit: int = 100) -> List[str]:
+        if not self.items:
+            return []
+        limit = max(1, int(limit or 1))
+        q = normalize_text(query)
+        if not q:
+            return self.items[:limit]
+
+        q_parts = q.split()
+        first_key = q_parts[0][: self.prefix_len]
+        cand_idx = list(dict.fromkeys(self.prefix_map.get(first_key, [])))
+        results: List[Tuple[int, float]] = []
+
+        for idx in cand_idx:
+            norm = self.norms[idx]
+            if all(part in norm for part in q_parts):
+                results.append((idx, 1.0))
+                if len(results) >= limit:
+                    break
+
+        if len(results) < max(15, limit // 3):
+            extra: List[Tuple[int, float]] = []
+            cap = min(len(self.items), 5000)
+            seen = {idx for idx, _ in results}
+            for idx in range(cap):
+                if idx in seen:
+                    continue
+                norm = self.norms[idx]
+                if all(part in norm for part in q_parts):
+                    extra.append((idx, 0.9))
+                    if len(results) + len(extra) >= limit:
+                        break
+            for idx, score in extra:
+                results.append((idx, score))
+
+        if _HAS_RAPIDFUZZ and len(results) < limit:
+            seen = {idx for idx, _ in results}
+            corpus = {idx: norm for idx, norm in enumerate(self.norms) if idx not in seen}
+            try:
+                top_matches = process.extract(  # type: ignore[misc]
+                    q,
+                    corpus,
+                    scorer=fuzz.partial_ratio,
+                    score_cutoff=65,
+                    limit=max(50, limit),
+                )
+            except Exception:
+                top_matches = []
+            for _, score, idx in top_matches:
+                results.append((idx, score / 100.0))
+                if len(results) >= limit:
+                    break
+
+        seen_idx = set()
+        ordered: List[Tuple[int, float]] = []
+        for idx, score in sorted(results, key=lambda item: (-item[1], len(self.items[item[0]]))):
+            if idx in seen_idx:
+                continue
+            seen_idx.add(idx)
+            ordered.append((idx, score))
+            if len(ordered) >= limit:
+                break
+
+        return [self.items[idx] for idx, _ in ordered]
 
 # ---------------------- Config ----------------------
 DEFAULT_HOST = os.getenv("SURGIBOT_CLIENT_HOST", "127.0.0.1")
@@ -823,6 +936,23 @@ class Main(QtWidgets.QWidget):
         except Exception:
             self._icd10tm_list = []
 
+        self._diag_catalog_full: List[str] = []
+        self._dx_index: Optional[FastSearchIndex] = None
+        self._search_executor = ThreadPoolExecutor(max_workers=1)
+        self._search_timer = QtCore.QTimer(self)
+        self._search_timer.setSingleShot(True)
+        try:
+            self._dx_search_limit = max(1, int(os.getenv("DX_SEARCH_LIMIT", "100")))
+        except ValueError:
+            self._dx_search_limit = 100
+        try:
+            debounce_ms = max(0, int(os.getenv("DX_SEARCH_DEBOUNCE_MS", "150")))
+        except ValueError:
+            debounce_ms = 150
+        self._search_timer.setInterval(debounce_ms)
+        self._search_timer.timeout.connect(self._on_diag_search_timeout)
+        self._latest_diag_query = ""
+
         self.setWindowTitle("Registry Patient Connect — ORNBH")
         self.resize(1360, 900)
         apply_modern_theme(self)
@@ -911,7 +1041,9 @@ class Main(QtWidgets.QWidget):
         g.addWidget(section_header("Diagnosis"), r,0,1,6)
         r+=1
         self.diag_adder = SearchSelectAdder("ค้นหา ICD-10 / ICD-10-TM...", suggestions=[])
-        self.diag_adder.itemAdded.connect(lambda txt: _append_seed_item(SEED_DX_KEY, self._current_specialty_key, txt))
+        self.diag_adder.itemAdded.connect(self._handle_diag_item_added)
+        if self.diag_adder.search_line:
+            self.diag_adder.search_line.textChanged.connect(self._on_diag_query_changed)
         g.addWidget(self.diag_adder, r,0,1,6)
         r+=1
 
@@ -1162,6 +1294,10 @@ class Main(QtWidgets.QWidget):
         try:
             if self.ws: self.ws.close()
         except Exception: pass
+        try:
+            self._search_executor.shutdown(wait=False)
+        except Exception:
+            pass
         super().closeEvent(e)
 
     def _start_timers(self):
@@ -1366,6 +1502,10 @@ class Main(QtWidgets.QWidget):
         self.op_adder.set_suggestions(custom_ops + primary_ops + fallback_ops)
         self._refresh_diag_suggestions()
 
+    def _handle_diag_item_added(self, text: str):
+        _append_seed_item(SEED_DX_KEY, self._current_specialty_key, text)
+        self._refresh_diag_suggestions()
+
     def _refresh_diag_suggestions(self):
         if not hasattr(self, "op_adder"):
             return
@@ -1377,10 +1517,45 @@ class Main(QtWidgets.QWidget):
             merged.extend(self._icd10tm_list)
         merged.extend(custom_dx)
         merged.extend(suggestions)
-        self.diag_adder.set_suggestions(merged)
+        self._diag_catalog_full = merged
+        self._dx_index = FastSearchIndex(self._diag_catalog_full, prefix_len=3) if self._diag_catalog_full else None
+        if self.diag_adder.search_line:
+            self._latest_diag_query = self.diag_adder.search_line.text()
+        if self._dx_index:
+            initial = self._dx_index.search(self._latest_diag_query, self._dx_search_limit)
+        else:
+            initial = []
+        self.diag_adder.set_suggestions(initial)
 
     def _on_operations_changed(self, _items: List[str]):
         self._refresh_diag_suggestions()
+
+    def _on_diag_query_changed(self, text: str):
+        self._latest_diag_query = text or ""
+        if not self._dx_index:
+            return
+        self._search_timer.stop()
+        self._search_timer.start()
+
+    def _on_diag_search_timeout(self):
+        self._run_diag_search(self._latest_diag_query)
+
+    def _run_diag_search(self, query: str):
+        if not self._dx_index:
+            self.diag_adder.set_suggestions([])
+            return
+        future = self._search_executor.submit(self._dx_index.search, query, self._dx_search_limit)
+
+        def _apply(fut):
+            try:
+                results = fut.result()
+            except Exception:
+                results = []
+            if query != self._latest_diag_query:
+                return
+            self.diag_adder.set_suggestions(results)
+
+        future.add_done_callback(lambda fut: QtCore.QTimer.singleShot(0, lambda: _apply(fut)))
 
     def _set_doctor_visibility(self, visible: bool):
         self.row_doctor_label.setVisible(visible); self.cb_doctor.setVisible(visible)
@@ -2081,8 +2256,9 @@ class SearchSelectAdder(QtWidgets.QWidget):
         self.combo.setEditable(True)
         self.combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
         self.combo.setMinimumWidth(280)
-        if self.combo.lineEdit():
-            self.combo.lineEdit().setPlaceholderText(placeholder)
+        self.search_line = self.combo.lineEdit()
+        if self.search_line:
+            self.search_line.setPlaceholderText(placeholder)
         self.btn = QtWidgets.QPushButton("➕ เพิ่ม")
         self.btn.setProperty("variant", "ghost")
         row.addWidget(self.combo, 1)
@@ -2096,8 +2272,8 @@ class SearchSelectAdder(QtWidgets.QWidget):
 
         self.set_suggestions(suggestions or [])
         self.btn.clicked.connect(self._add_current)
-        if self.combo.lineEdit():
-            self.combo.lineEdit().returnPressed.connect(self._add_current)
+        if self.search_line:
+            self.search_line.returnPressed.connect(self._add_current)
         self.list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._ctx_menu)
         model = self.list.model()
@@ -2136,15 +2312,25 @@ class SearchSelectAdder(QtWidgets.QWidget):
         self._emit_items_changed()
 
     def set_suggestions(self, suggestions):
-        options = sorted({s for s in suggestions if s})
-        current = self.combo.currentText() if self.combo.count() else ""
+        seen = set()
+        options: List[str] = []
+        for value in suggestions or []:
+            val = (value or "").strip()
+            if not val or val in seen:
+                continue
+            seen.add(val)
+            options.append(val)
+        current_text = self.search_line.text() if self.search_line else ""
         self.combo.blockSignals(True)
         self.combo.clear()
         self.combo.addItem("")
         self.combo.addItems(options)
         self.combo.blockSignals(False)
-        if current:
-            self.combo.setEditText(current)
+        if self.search_line is not None:
+            self.search_line.blockSignals(True)
+            self.search_line.setText(current_text)
+            self.search_line.setCursorPosition(len(current_text))
+            self.search_line.blockSignals(False)
         comp = QtWidgets.QCompleter(options)
         comp.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
         comp.setFilterMode(QtCore.Qt.MatchContains)
