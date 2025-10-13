@@ -1912,6 +1912,8 @@ QLabel { color:#fff; font-weight: 900; }
 
         or_text = (parent.text(0) or "").strip()
         if not or_text:
+            or_text = (parent.data(0, QtCore.Qt.UserRole + 200) or "").strip()
+        if not or_text:
             sticky.hide()
             return
 
@@ -2399,8 +2401,9 @@ QLabel { color:#fff; font-weight: 900; }
                 if not groups[orr]:
                     continue
 
-                parent = QtWidgets.QTreeWidgetItem()
-                parent.setText(0, orr)
+                parent = QtWidgets.QTreeWidgetItem([""] * tree.columnCount())
+                parent.setText(0, f"{orr}  ห้องผ่าตัด")
+                parent.setData(0, QtCore.Qt.UserRole + 200, orr)
                 parent.setFirstColumnSpanned(True)
                 tree.addTopLevelItem(parent)
 
