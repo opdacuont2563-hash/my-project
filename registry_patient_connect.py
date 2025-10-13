@@ -20,6 +20,7 @@ from icd10_catalog import (
     ALL_OPERATIONS,
     diagnosis_suggestions,
     operation_suggestions,
+    load_icd10tm_xlsx,
 )
 
 # ---------------------- Modern theme ----------------------
@@ -812,6 +813,15 @@ class Main(QtWidgets.QWidget):
 
         self.toast = Toast(self)
         self._current_specialty_key = "Surgery"
+        self._icd10tm_list: List[str] = []
+        self._icd10tm_path = os.getenv(
+            "ICD10TM_XLSX_PATH",
+            r"C:\\Users\\Admin\\Desktop\\my-project\\ICD10TM-Public.xlsx",
+        )
+        try:
+            self._icd10tm_list = load_icd10tm_xlsx(self._icd10tm_path) or []
+        except Exception:
+            self._icd10tm_list = []
 
         self.setWindowTitle("Registry Patient Connect — ORNBH")
         self.resize(1360, 900)
@@ -1362,7 +1372,12 @@ class Main(QtWidgets.QWidget):
         ops = self.op_adder.items() if hasattr(self.op_adder, "items") else []
         suggestions = diagnosis_suggestions(self._current_specialty_key, ops)
         custom_dx = _get_seed_list(SEED_DX_KEY, self._current_specialty_key)
-        self.diag_adder.set_suggestions(custom_dx + suggestions)
+        merged: List[str] = []
+        if self._icd10tm_list:
+            merged.extend(self._icd10tm_list)
+        merged.extend(custom_dx)
+        merged.extend(suggestions)
+        self.diag_adder.set_suggestions(merged)
 
     def _on_operations_changed(self, _items: List[str]):
         self._refresh_diag_suggestions()
