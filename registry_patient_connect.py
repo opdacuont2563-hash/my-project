@@ -1082,6 +1082,153 @@ def map_to_known_ward(src: str, known_wards: List[str]) -> str:
     return src
 
 
+# ====== Service detection & OR plan helpers ======
+SERVICE: Dict[str, str] = {
+    "SUR": "ศัลยกรรมทั่วไป",
+    "ORTHO": "ศัลยกรรมกระดูก",
+    "ENT": "โสต ศอ นาสิก (หูคอจมูก)",
+    "URO": "ศัลยกรรมระบบปัสสาวะ",
+    "OBGYN": "สูติ-นรีเวช",
+    "EYE": "จักษุ",
+    "MAXILO": "ศัลยกรรมช่องปาก/แมกซิลโลฯ",
+    "CLOSE": "ปิดห้อง",
+}
+
+SERVICE_ALIASES: Dict[str, List[str]] = {
+    "SUR": ["sur", "ศัลยกรรม", "ศัลยกรรมทั่วไป", "general surgery"],
+    "ORTHO": ["ortho", "ศัลยกรรมกระดูก", "ออร์โธ"],
+    "ENT": ["ent", "หูคอจมูก", "โสตศอนาสิก", "โสต ศอ นาสิก"],
+    "URO": ["uro", "ระบบทางเดินปัสสาวะ", "ยูโร"],
+    "OBGYN": ["obgyn", "สูติ-นรีเวช", "สูติ", "นรีเวช"],
+    "EYE": ["eye", "จักษุ", "ตา", "ophthalmology"],
+    "MAXILO": ["maxilo", "แมกซิลโล", "ช่องปาก", "omfs", "ศัลยกรรมช่องปาก"],
+}
+
+
+def detect_service_from_text(txt: str) -> str:
+    s = (txt or "").strip().lower().replace(" ", "")
+    if not s:
+        return ""
+    for key, words in SERVICE_ALIASES.items():
+        for word in words:
+            if word.replace(" ", "") in s:
+                return key
+    return ""
+
+
+WEEKLY_OR_PLAN: Dict[int, Dict[str, object]] = {
+    0: {
+        "OR1": "SUR",
+        "OR2": "ORTHO",
+        "OR3": "ENT",
+        "OR5": "OBGYN",
+        "OR6": "OBGYN",
+        "OR8": "EYE",
+    },
+    1: {
+        "OR1": "URO",
+        "OR2": "ORTHO",
+        "OR3": {"AM": "SUR", "PM": "MAXILO"},
+        "OR5": "OBGYN",
+        "OR6": "SUR",
+        "OR8": "EYE",
+    },
+    2: {
+        "OR1": "SUR",
+        "OR2": "ORTHO",
+        "OR3": "CLOSE",
+        "OR5": "OBGYN",
+        "OR6": "SUR",
+        "OR8": "EYE",
+    },
+    3: {
+        "OR1": "URO",
+        "OR2": "ORTHO",
+        "OR3": {"AM": "SUR", "PM": "MAXILO"},
+        "OR5": "OBGYN",
+        "OR6": "SUR",
+        "OR8": "EYE",
+    },
+    4: {
+        "OR1": "SUR",
+        "OR2": "ORTHO",
+        "OR3": "ENT",
+        "OR5": "OBGYN",
+        "OR6": "",
+        "OR8": "EYE",
+    },
+}
+
+
+def _parse_hhmm_to_minutes(hhmm: str) -> int:
+    try:
+        if hhmm and hhmm.upper() == "TF":
+            return -1
+        hh, mm = hhmm.split(":")
+        return int(hh) * 60 + int(mm)
+    except Exception:
+        return -1
+
+
+def pick_or_by_plan(case_date, case_time_hhmm: str, service_key: str) -> str:
+    if not service_key:
+        return ""
+
+    weekday = case_date.weekday()
+    plan = WEEKLY_OR_PLAN.get(weekday) or {}
+    if not plan:
+        return ""
+
+    minutes = _parse_hhmm_to_minutes(case_time_hhmm)
+    has_time = minutes >= 0
+    is_am = has_time and minutes < (12 * 60)
+
+    if has_time:
+        for or_room, svc in plan.items():
+            if not svc or svc == "CLOSE":
+                continue
+            if isinstance(svc, dict):
+                target = svc.get("AM") if is_am else svc.get("PM")
+                if target == service_key:
+                    return or_room
+            elif svc == service_key:
+                return or_room
+
+    for or_room, svc in plan.items():
+        if not svc or svc == "CLOSE":
+            continue
+        if isinstance(svc, dict):
+            if service_key in (svc.get("AM"), svc.get("PM")):
+                return or_room
+        elif svc == service_key:
+            return or_room
+
+    return ""
+
+
+def _service_from_row(raw: Dict[str, object]) -> str:
+    if not raw:
+        return ""
+
+    def _lookup(key: str) -> str:
+        if key in raw:
+            return str(raw.get(key) or "")
+        lower = key.lower()
+        return str(raw.get(lower, ""))
+
+    ward_txt = _lookup("Ward")
+    svc = detect_service_from_text(ward_txt)
+    if svc:
+        return svc
+
+    for key in ("ชื่อการผ่าตัด", "ICD Name", "แพทย์ผู้สั่ง"):
+        svc = detect_service_from_text(_lookup(key))
+        if svc:
+            return svc
+
+    return ""
+
+
 class Main(QtWidgets.QWidget):
     def __init__(self, host, port, token):
         super().__init__()
@@ -1842,7 +1989,8 @@ class Main(QtWidgets.QWidget):
                     val = lookup.get(header.lower())
                 return str(val or "").strip()
 
-            time_str = parse_time_hhmm(get("time"))
+            time_raw = lookup.get(FIXED_MAPPING_TH["time"])
+            time_str = parse_time_hhmm(time_raw) or "TF"
             hn = get("hn")
             name = get("name")
 
@@ -1850,17 +1998,23 @@ class Main(QtWidgets.QWidget):
                 skipped.append((hn or "-", "ต้องมี เวลา, HN, ชื่อ"))
                 continue
 
-            try:
-                hh, mm = [int(x) for x in time_str.split(":", 1)]
-                period_code = _now_period(datetime(base_date.year, base_date.month, base_date.day, hh, mm))
-            except Exception:
+            if time_str != "TF":
+                try:
+                    hh, mm = [int(x) for x in time_str.split(":", 1)]
+                    period_code = _now_period(datetime(base_date.year, base_date.month, base_date.day, hh, mm))
+                except Exception:
+                    period_code = default_period
+            else:
                 period_code = default_period
 
             diag_txt = get("diags")
             op_txt = get("ops")
 
+            service_key = _service_from_row(lookup)
+            or_room = pick_or_by_plan(base_date, time_str, service_key)
+
             entry = ScheduleEntry(
-                or_room="",
+                or_room=or_room,
                 dt=base_date,
                 time_str=time_str,
                 hn=hn,
