@@ -1130,7 +1130,7 @@ class Main(QtWidgets.QWidget):
         g.addWidget(section_header("Diagnosis"), r,0,1,6)
         r+=1
         self.diag_adder = SearchSelectAdder("ค้นหา ICD-10 / ICD-10-TM...", suggestions=[])
-        self.diag_adder.itemAdded.connect(self._on_diagnosis_added_by_user)
+        self.diag_adder.requestPersist.connect(self._on_diagnosis_persist_requested)
         if self.diag_adder.search_line:
             self.diag_adder.search_line.textChanged.connect(self._on_diag_query_changed)
         g.addWidget(self.diag_adder, r,0,1,6)
@@ -1140,7 +1140,7 @@ class Main(QtWidgets.QWidget):
         r+=1
         self.op_adder = SearchSelectAdder("ค้นหา/เลือก Operation...", suggestions=[])
         self.op_adder.itemsChanged.connect(self._on_operations_changed)
-        self.op_adder.itemAdded.connect(self._on_operation_added_by_user)
+        self.op_adder.requestPersist.connect(self._on_operation_persist_requested)
         if self.op_adder.search_line:
             self.op_adder.search_line.textChanged.connect(self._on_op_query_changed)
         g.addWidget(self.op_adder, r,0,1,6)
@@ -1670,7 +1670,7 @@ class Main(QtWidgets.QWidget):
 
         self._refresh_diag_suggestions()
 
-    def _on_operation_added_by_user(self, text: str):
+    def _on_operation_persist_requested(self, text: str):
         item = (text or "").strip()
         if not item:
             return
@@ -1688,10 +1688,10 @@ class Main(QtWidgets.QWidget):
         SweetAlert.success(
             self,
             "สำเร็จ" if added else "ซ้ำ",
-            "เพิ่ม Operation แล้ว" if added else "มี Operation นี้อยู่แล้ว",
+            "บันทึก Operation เพิ่มเข้าคลังแล้ว" if added else "มี Operation นี้อยู่แล้ว",
         )
 
-    def _on_diagnosis_added_by_user(self, text: str):
+    def _on_diagnosis_persist_requested(self, text: str):
         item = (text or "").strip()
         if not item:
             return
@@ -1709,7 +1709,7 @@ class Main(QtWidgets.QWidget):
         SweetAlert.success(
             self,
             "สำเร็จ" if added else "ซ้ำ",
-            "เพิ่ม Diagnosis แล้ว" if added else "มี Diagnosis นี้อยู่แล้ว",
+            "บันทึก Diagnosis เพิ่มเข้าคลังแล้ว" if added else "มี Diagnosis นี้อยู่แล้ว",
         )
 
     def _refresh_diag_suggestions(self):
@@ -2510,10 +2510,14 @@ class WrapItemDelegate(QtWidgets.QStyledItemDelegate):
         return QtCore.QSize(w, int(s.height()) + 12)
 
 class SearchSelectAdder(QtWidgets.QWidget):
-    """Searchable selector with a multi-select list and change signal."""
+    """Searchable selector with a multi-select list.
+
+    - Enter / ปุ่ม "➕ เพิ่ม"  : เพิ่มลงรายการของเคส (ไม่แตะคลังหลัก)
+    - ปุ่ม "💾 บันทึกเป็นรายการใหม่" : ส่งสัญญาณให้ภายนอกบันทึกเข้าคลังหลัก
+    """
 
     itemsChanged = QtCore.Signal(list)
-    itemAdded = QtCore.Signal(str)   # ส่งข้อความที่ถูกเพิ่ม (สำหรับ seed)
+    requestPersist = QtCore.Signal(str)
 
     def __init__(self, placeholder="ค้นหา ICD-10...", suggestions=None, parent=None):
         super().__init__(parent)
@@ -2530,10 +2534,15 @@ class SearchSelectAdder(QtWidgets.QWidget):
         self.search_line = self.combo.lineEdit()
         if self.search_line:
             self.search_line.setPlaceholderText(placeholder)
-        self.btn = QtWidgets.QPushButton("➕ เพิ่ม")
-        self.btn.setProperty("variant", "ghost")
+
+        self.btn_add = QtWidgets.QPushButton("➕ เพิ่ม")
+        self.btn_add.setProperty("variant", "ghost")
+        self.btn_persist = QtWidgets.QPushButton("💾 บันทึกเป็นรายการใหม่")
+        self.btn_persist.setProperty("variant", "ghost")
+
         row.addWidget(self.combo, 1)
-        row.addWidget(self.btn)
+        row.addWidget(self.btn_add)
+        row.addWidget(self.btn_persist)
         v.addLayout(row)
 
         self.list = QtWidgets.QListWidget()
@@ -2542,9 +2551,12 @@ class SearchSelectAdder(QtWidgets.QWidget):
         v.addWidget(self.list)
 
         self.set_suggestions(suggestions or [])
-        self.btn.clicked.connect(self._add_current)
+
+        self.btn_add.clicked.connect(self._add_current)
+        self.btn_persist.clicked.connect(self._persist_current)
         if self.search_line:
             self.search_line.returnPressed.connect(self._add_current)
+
         self.list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._ctx_menu)
         model = self.list.model()
@@ -2567,11 +2579,14 @@ class SearchSelectAdder(QtWidgets.QWidget):
         text = self.combo.currentText().strip()
         if text and text.lower() not in [self.list.item(i).text().lower() for i in range(self.list.count())]:
             self.list.addItem(text)
-            # แจ้งว่าเป็นรายการใหม่ เพื่อให้ฝั่ง Main บันทึกถาวร
-            self.itemAdded.emit(text)
         self.combo.setCurrentIndex(0)
         self.combo.setEditText("")
         self._emit_items_changed()
+
+    def _persist_current(self):
+        text = self.combo.currentText().strip()
+        if text:
+            self.requestPersist.emit(text)
 
     def items(self) -> List[str]:
         return [self.list.item(i).text().strip() for i in range(self.list.count())]
