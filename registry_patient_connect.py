@@ -1791,9 +1791,11 @@ class Main(QtWidgets.QWidget):
         # ไม่พับบรรทัดและไม่ตัดข้อความเป็น "..." เพื่อให้อ่านได้เต็มโดยเลื่อนแนวนอน
         self.tree2.setWordWrap(False)
         self.tree2.setTextElideMode(QtCore.Qt.ElideNone)
-        self.tree2.setUniformRowHeights(True)
+        # ต้องให้หัว OR ที่เป็น widget ปรับความสูงตามเนื้อหาได้ จึงไม่ใช้ uniform row height
+        self.tree2.setUniformRowHeights(False)
         self.tree2.setAlternatingRowColors(True)
-        self.tree2.setRootIsDecorated(False)
+        # อนุญาตให้หัวกลุ่ม (เช่น OR1, OR2) พับเก็บ/ขยายได้ จึงเปิด child indicator
+        self.tree2.setRootIsDecorated(True)
         self.tree2.setIndentation(12)
         self.tree2.setMouseTracking(True)
         # เปิดสกรอลล์บาร์แนวนอนเสมอเมื่อคอลัมน์กว้าง
@@ -2995,6 +2997,48 @@ class Main(QtWidgets.QWidget):
         """ตรวจว่ารายการถูกเติมข้อมูลหลังผ่าตัดครบถ้วนพอสำหรับการปิดเคส"""
         return _is_postop_complete_entry(e)
 
+    def _create_or_header_widget(self, or_room: str, plan_desc: str) -> QtWidgets.QWidget:
+        container = QtWidgets.QFrame()
+        container.setObjectName("orHeaderFrame")
+        container.setStyleSheet(
+            """
+            QFrame#orHeaderFrame {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #34d399, stop:1 #059669);
+                border-radius: 18px;
+                padding: 12px 18px;
+            }
+            QFrame#orHeaderFrame QLabel {
+                color: #ffffff;
+            }
+            """
+        )
+        container.setMinimumHeight(56)
+
+        layout = QtWidgets.QVBoxLayout(container)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(2)
+
+        title = QtWidgets.QLabel((or_room or "-").upper())
+        title_font = QtGui.QFont(self.font())
+        title_font.setBold(True)
+        title_font.setPointSize(max(title_font.pointSize() + 2, title_font.pointSize()))
+        title.setFont(title_font)
+
+        subtitle = QtWidgets.QLabel("ห้องผ่าตัด")
+        subtitle.setStyleSheet("font-size: 12px; font-weight: 600; color: rgba(255,255,255,0.85);")
+
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        if plan_desc:
+            plan = QtWidgets.QLabel(plan_desc)
+            plan.setWordWrap(True)
+            plan.setStyleSheet("color: rgba(255,255,255,0.82); font-size: 11px;")
+            layout.addWidget(plan)
+
+        layout.addStretch(1)
+        return container
+
     def _render_tree2(self):
         hbar = self.tree2.horizontalScrollBar()
         old_hval = hbar.value()
@@ -3041,22 +3085,21 @@ class Main(QtWidgets.QWidget):
             }
 
             for orr in sorted(groups.keys(), key=lambda x: (order.index(x) if x in order else 999, x)):
-                header_text = orr or "-"
                 plan_desc = describe_or_plan_label(base_date, orr)
-                if plan_desc:
-                    header_text = f"{header_text} • {plan_desc}"
 
-                parent = QtWidgets.QTreeWidgetItem([header_text] + ["" for _ in range(self.tree2.columnCount() - 1)])
+                parent = QtWidgets.QTreeWidgetItem(["" for _ in range(self.tree2.columnCount())])
+                parent.setChildIndicatorPolicy(QtWidgets.QTreeWidgetItem.ShowIndicator)
                 parent.setFirstColumnSpanned(True)
-                bg_brush = QtGui.QBrush(QtGui.QColor("#f6f9ff"))
-                for col in range(self.tree2.columnCount()):
-                    parent.setBackground(col, bg_brush)
-                pfont = parent.font(0)
-                pfont.setBold(True)
-                parent.setFont(0, pfont)
+                parent.setSizeHint(0, QtCore.QSize(220, 72))
                 for c in range(self.tree2.columnCount()):
                     parent.setData(c, QtCore.Qt.UserRole + 99, "grp")
                 self.tree2.addTopLevelItem(parent)
+
+                header_widget = self._create_or_header_widget(orr or "-", plan_desc)
+                if plan_desc:
+                    header_widget.setToolTip(plan_desc)
+                self.tree2.setItemWidget(parent, 0, header_widget)
+                parent.setExpanded(True)
 
                 rows_sorted = sorted(
                     groups[orr],
