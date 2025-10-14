@@ -1161,47 +1161,88 @@ WEEKLY_DOCTOR_OR_PLAN: Dict[int, Dict[str, List[Dict[str, object]]]] = {
         "OR8": [{"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
     },
     1: {
-        "OR1": [{"doctor": "พญ.สายฝน บรรณจิตร์", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR2": [{"doctor": "นพ.ชัชพล องค์โฆษิต", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR3": [
-            {"doctor": "SUR_ANY", "when": "AM", "weeks": [1, 2, 3, 4]},
-            {"doctor": "MAXILO_ANY", "when": "PM", "weeks": [1, 2, 3, 4]},
+        "OR1": [
+            {"doctor": "พญ.สายฝน บรรณจิตร์", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
         ],
-        "OR5": [{"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR6": [{"doctor": "SUR_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR8": [{"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR2": [
+            {"doctor": "นพ.ชัชพล องค์โฆษิต", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
+        ],
+        "OR3": [
+            {"doctor": "พญ.สุภาภรณ์ พิณพาทย์", "when": "AM", "weeks": [1, 2, 3, 4]},
+            {"doctor": "ทพญ.อรุณนภา คิสารัง", "when": "PM", "weeks": [1, 2, 3, 4]},
+        ],
+        "OR5": [
+            {"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
+        ],
+        "OR6": [
+            {"doctor": "นพ.พิชัย สุวัฒนพูนลาภ", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
+        ],
+        "OR8": [
+            {"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
+        ],
     },
     2: {
-        "OR1": [{"doctor": "นพ.สุริยา คุณาชน", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR2": [{"doctor": "นพ.วิษณุ ผูกพันธ์", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR3": [{"doctor": "CLOSE", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR5": [{"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR6": [{"doctor": "SUR_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR8": [{"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-    },
-    3: {
-        "OR1": [{"doctor": "พญ.สายฝน บรรณจิตร์", "when": "AM", "weeks": [1, 2, 3, 4]}],
+        "OR1": [
+            {"doctor": "พญ.สายฝน บรรณจิตร์", "when": "AM", "weeks": [1, 2, 3, 4]},
+            {"doctor": "นพ.ชัชพล องค์โฆษิต", "when": "PM", "weeks": [1, 3]},
+            {"doctor": "นพ.ณัฐพงศ์ ศรีโพนทอง", "when": "PM", "weeks": [2, 4]},
+            {"doctor": "นพ.วิษณุ ผูกพันธ์", "when": "PM", "weeks": [2, 4]},
+            {"doctor": "นพ.กฤษฎา อิ้งอำพร", "when": "PM", "weeks": [2, 4]},
+        ],
         "OR2": [
-            {"doctor": "นพ.ชัชพล องค์โฆษิต", "when": "PM", "weeks": [1]},
-            {"doctor": "นพ.ณัฐพงศ์ ศรีโพนทอง", "when": "PM", "weeks": [2]},
-            {"doctor": "นพ.วิษณุ ผูกพันธ์", "when": "PM", "weeks": [3]},
-            {"doctor": "นพ.กฤษฎา อิ้งอำพร", "when": "PM", "weeks": [4]},
+            {"doctor": "นพ.วิษณุ ผูกพันธ์", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
         ],
         "OR3": [
-            {"doctor": "SUR_ANY", "when": "AM", "weeks": [1, 2, 3, 4]},
-            {"doctor": "MAXILO_ANY", "when": "PM", "weeks": [1, 2, 3, 4]},
+            {"doctor": "CLOSED", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
         ],
-        "OR5": [{"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR6": [{"doctor": "นพ.ธนวัฒน์ พันธุ์พรหม", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR8": [{"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR5": [
+            {"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
+        ],
+        "OR6": [
+            {"doctor": "พญ.รัฐพร ตั้งเพียร", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
+        ],
+        "OR8": [
+            {"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
+        ],
+    },
+    3: {
+        "OR1": [],
+        "OR2": [
+            {"doctor": "นพ.อำนาจ อนันต์วัฒนกุล", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
+        ],
+        "OR3": [
+            {"doctor": "นพ.วรวิช พลเวียงธรรม", "when": "AM", "weeks": [1, 2, 3, 4]},
+            {"doctor": "ทพ.ฉลองรัฐ เดชา", "when": "PM", "weeks": [1, 2, 3, 4]},
+        ],
+        "OR5": [
+            {"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
+        ],
+        "OR6": [
+            {"doctor": "นพ.ธนวัฒน์ พันธุ์พรหม", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
+        ],
+        "OR8": [
+            {"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
+        ],
     },
     4: {
-        "OR1": [{"doctor": "พญ.สุภาภรณ์ พิณพาทย์", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR2": [{"doctor": "ORTHO_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR3": [{"doctor": "พญ.สุทธิพร หมวดไธสง", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR5": [{"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR6": [{"doctor": "CLOSE", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR8": [{"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR1": [
+            {"doctor": "พญ.สุภาภรณ์ พิณพาทย์", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
+        ],
+        "OR2": [
+            {"doctor": "นพ.กฤษฎา อิ้งอำพร", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
+        ],
+        "OR3": [
+            {"doctor": "พญ.สุทธิพร หมวดไธสง", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
+        ],
+        "OR5": [
+            {"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
+        ],
+        "OR6": [
+            {"doctor": "CLOSED", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
+        ],
+        "OR8": [
+            {"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
+        ],
     },
 }
 
@@ -1285,6 +1326,15 @@ DOCTOR_ALIASES: Dict[str, str] = {
     "พญ.สีกชมพู ตั้งสัตยาธ": "พญ.สีกชมพู ตั้งสัตยาธิษฐาน",
 }
 
+DOCTOR_ALIASES.update(
+    {
+        "ทพญ.อรุณนภา": "ทพญ.อรุณนภา คิสารัง",
+        "ทพ.ฉลองรัฐ": "ทพ.ฉลองรัฐ เดชา",
+        "นพ.วรวิช": "นพ.วรวิช พลเวียงธรรม",
+        "พญ.สุทธิพร": "พญ.สุทธิพร หมวดไธสง",
+    }
+)
+
 TOKEN_DISPLAY_NAMES: Dict[str, str] = {
     "SUR_ANY": "ทีมศัลยกรรมทั่วไป",
     "ORTHO_ANY": "ทีมศัลยกรรมกระดูก",
@@ -1294,7 +1344,10 @@ TOKEN_DISPLAY_NAMES: Dict[str, str] = {
     "EYE_ANY": "ทีมจักษุ",
     "MAXILO_ANY": "ทีมศัลยกรรมขากรรไกร",
     "CLOSE": "ปิดห้อง",
+    "CLOSED": "ปิดห้อง",
 }
+
+CLOSED_TOKENS = {"CLOSE", "CLOSED"}
 # ================================================================
 
 
@@ -1327,7 +1380,7 @@ def match_doctor(token_or_name: str, doctor_name: str) -> bool:
     token = token_or_name
     if not token:
         return False
-    if token == "CLOSE":
+    if token in CLOSED_TOKENS:
         return False
     if token in GROUPS or token in {"SUR_ANY", "ORTHO_ANY", "ENT_ANY", "EYE_ANY", "MAXILO_ANY", "OBGYN_ANY"}:
         return doctor_in_group(doctor_name, token)
@@ -1421,20 +1474,24 @@ def pick_or_by_doctor(case_date: date, time_str: str, doctor_name: str) -> str:
     if period == "ANY":
         for or_room, rule in iter_rules():
             doctor_token = rule.get("doctor")
-            if not doctor_token or rule.get("doctor") == "CLOSE":
+            if not doctor_token:
                 continue
             weeks = rule.get("weeks", [1, 2, 3, 4, 5])
             if current_week not in weeks:
                 continue
             doctors = doctor_token if isinstance(doctor_token, list) else [doctor_token]
+            if any(tok in CLOSED_TOKENS for tok in doctors):
+                continue
             if any(match_doctor(doc, doctor_name) for doc in doctors):
                 return or_room
 
     for or_room, rule in iter_rules():
         doctor_token = rule.get("doctor")
-        if not doctor_token or doctor_token == "CLOSE":
+        if not doctor_token:
             continue
         doctors = doctor_token if isinstance(doctor_token, list) else [doctor_token]
+        if any(tok in CLOSED_TOKENS for tok in doctors):
+            continue
         if any(match_doctor(doc, doctor_name) for doc in doctors):
             return or_room
 
