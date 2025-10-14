@@ -2598,6 +2598,8 @@ class SearchSelectAdder(QtWidgets.QWidget):
         self._emit_items_changed()
 
     def _on_combo_activated(self, index: int):
+        if index < 0:
+            return
         text = (self.combo.itemText(index) or "").strip()
         self._add_text(text)
 
@@ -2608,8 +2610,9 @@ class SearchSelectAdder(QtWidgets.QWidget):
         text = ""
         try:
             if isinstance(arg, QtCore.QModelIndex):
-                model = arg.model()
-                text = model.data(arg, QtCore.Qt.DisplayRole)
+                if arg.isValid():
+                    model = arg.model()
+                    text = model.data(arg, QtCore.Qt.DisplayRole)
             else:
                 text = str(arg)
         except Exception:
@@ -2672,18 +2675,37 @@ class SearchSelectAdder(QtWidgets.QWidget):
         completer.setFilterMode(QtCore.Qt.MatchContains)
 
         if self._completer is not None:
-            try:
-                self._completer.activated.disconnect(self._on_completer_activated)
-            except Exception:
-                pass
+            for getter in (
+                lambda comp: getattr(comp, "activated"),
+                lambda comp: comp.activated[str],
+                lambda comp: comp.activated[QtCore.QModelIndex],
+            ):
+                try:
+                    getter(self._completer).disconnect(self._on_completer_activated)
+                except Exception:
+                    pass
 
         self._completer = completer
         self.combo.setCompleter(self._completer)
 
-        try:
-            self._completer.activated.connect(self._on_completer_activated)
-        except Exception:
-            pass
+        connected = False
+        for getter in (
+            lambda comp: getattr(comp, "activated"),
+            lambda comp: comp.activated[str],
+            lambda comp: comp.activated[QtCore.QModelIndex],
+        ):
+            try:
+                getter(self._completer).connect(self._on_completer_activated)
+                connected = True
+                break
+            except Exception:
+                continue
+
+        if not connected:
+            try:
+                self._completer.activated.connect(self._on_completer_activated)
+            except Exception:
+                pass
 
         # ปิดการเลื่อนด้วยล้อเมาส์บนคอมโบ (กันเปลี่ยนค่าเวลาเลื่อนหน้า)
         self.combo.setFocusPolicy(QtCore.Qt.StrongFocus)
