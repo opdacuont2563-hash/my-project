@@ -2562,10 +2562,22 @@ class SearchSelectAdder(QtWidgets.QWidget):
         self.btn_add.clicked.connect(self._add_current)
         self.btn_persist.clicked.connect(self._persist_current)
 
-        self.combo.activated[int].connect(self._on_combo_activated)
-        self.combo.activated[str].connect(self._on_combo_activated_text)
-        self.combo.highlighted[int].connect(self._on_combo_activated)
-        self.combo.highlighted[str].connect(self._on_combo_activated_text)
+        try:
+            self.combo.activated[int].connect(self._on_combo_activated)
+        except Exception:
+            pass
+        try:
+            self.combo.highlighted[int].connect(self._on_combo_activated)
+        except Exception:
+            pass
+        try:
+            self.combo.textActivated.connect(self._on_combo_activated_text)
+        except Exception:
+            pass
+        try:
+            self.combo.textHighlighted.connect(self._on_combo_activated_text)
+        except Exception:
+            pass
 
         self.list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._ctx_menu)
@@ -2592,13 +2604,14 @@ class SearchSelectAdder(QtWidgets.QWidget):
     def _on_combo_activated_text(self, text: str):
         self._add_text((text or "").strip())
 
-    def _on_completer_activated(self, text: str):
-        self._add_text((text or "").strip())
-
-    def _on_completer_index_activated(self, index: QtCore.QModelIndex):
+    def _on_completer_activated(self, arg):
+        text = ""
         try:
-            model = index.model()
-            text = model.data(index, QtCore.Qt.DisplayRole)
+            if isinstance(arg, QtCore.QModelIndex):
+                model = arg.model()
+                text = model.data(arg, QtCore.Qt.DisplayRole)
+            else:
+                text = str(arg)
         except Exception:
             text = ""
         self._add_text((text or "").strip())
@@ -2660,11 +2673,7 @@ class SearchSelectAdder(QtWidgets.QWidget):
 
         if self._completer is not None:
             try:
-                self._completer.activated[str].disconnect(self._on_completer_activated)
-            except Exception:
-                pass
-            try:
-                self._completer.activated[QtCore.QModelIndex].disconnect(self._on_completer_index_activated)
+                self._completer.activated.disconnect(self._on_completer_activated)
             except Exception:
                 pass
 
@@ -2672,11 +2681,7 @@ class SearchSelectAdder(QtWidgets.QWidget):
         self.combo.setCompleter(self._completer)
 
         try:
-            self._completer.activated[str].connect(self._on_completer_activated)
-        except Exception:
-            pass
-        try:
-            self._completer.activated[QtCore.QModelIndex].connect(self._on_completer_index_activated)
+            self._completer.activated.connect(self._on_completer_activated)
         except Exception:
             pass
 
