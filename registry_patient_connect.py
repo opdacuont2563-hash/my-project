@@ -1232,6 +1232,17 @@ DOCTOR_ALIASES: Dict[str, str] = {
     "ทพญ.อรุณนภา คิสาลัง": "ทพญ.อรุณนภา คิสารัง",
     "พญ.สีกชมพู ตั้งสัตยาธ": "พญ.สีกชมพู ตั้งสัตยาธิษฐาน",
 }
+
+TOKEN_DISPLAY_NAMES: Dict[str, str] = {
+    "SUR_ANY": "ทีมศัลยกรรมทั่วไป",
+    "ORTHO_ANY": "ทีมศัลยกรรมกระดูก",
+    "URO_ANY": "ทีมระบบทางเดินปัสสาวะ",
+    "ENT_ANY": "ทีมโสต ศอ นาสิก",
+    "OBGYN_ANY": "ทีมสูติ-นรีเวช",
+    "EYE_ANY": "ทีมจักษุ",
+    "MAXILO_ANY": "ทีมศัลยกรรมขากรรไกร",
+    "CLOSE": "ปิดห้อง",
+}
 # ================================================================
 
 
@@ -1269,6 +1280,62 @@ def match_doctor(token_or_name: str, doctor_name: str) -> bool:
     if token in GROUPS or token in {"SUR_ANY", "ORTHO_ANY", "ENT_ANY", "EYE_ANY", "MAXILO_ANY", "OBGYN_ANY"}:
         return doctor_in_group(doctor_name, token)
     return normalize_doctor_name(token) == normalize_doctor_name(doctor_name)
+
+
+def _describe_doctor_token(token: str) -> str:
+    if not token:
+        return ""
+    label = TOKEN_DISPLAY_NAMES.get(token)
+    if label:
+        return label
+    if token in GROUPS:
+        # ไม่มีข้อความเฉพาะ ให้ใช้ชื่อกลุ่มแรกเป็นตัวแทน
+        members = GROUPS.get(token, [])
+        if members:
+            return f"{TOKEN_DISPLAY_NAMES.get(token, '') or members[0]}"
+    return normalize_doctor_name(token)
+
+
+def describe_or_plan_label(case_date: date, or_room: str) -> str:
+    if not or_room or or_room == "-":
+        return ""
+
+    weekday = case_date.weekday()
+    plan = WEEKLY_DOCTOR_OR_PLAN.get(weekday, {})
+    rules = plan.get(or_room, []) or []
+    if not rules:
+        return ""
+
+    current_week = week_of_month(case_date)
+
+    def label_for_rule(rule: Dict[str, object]) -> str:
+        doctor_token = rule.get("doctor")
+        if isinstance(doctor_token, list):
+            tokens = [str(tok) for tok in doctor_token]
+        else:
+            tokens = [str(doctor_token or "")]
+        parts: List[str] = []
+        for tok in tokens:
+            desc = _describe_doctor_token(tok)
+            if desc:
+                parts.append(desc)
+        label = ", ".join(parts)
+        when = (str(rule.get("when") or "ALLDAY").upper())
+        if when == "AM":
+            return f"เช้า: {label}" if label else "เช้า"
+        if when == "PM":
+            return f"บ่าย: {label}" if label else "บ่าย"
+        if label:
+            return label
+        return ""
+
+    filtered = [rule for rule in rules if current_week in rule.get("weeks", [1, 2, 3, 4, 5])]
+    if not filtered:
+        filtered = rules
+
+    labels = [label_for_rule(rule) for rule in filtered]
+    labels = [lbl for lbl in labels if lbl]
+    return " • ".join(labels)
 
 
 def pick_or_by_doctor(case_date: date, time_str: str, doctor_name: str) -> str:
@@ -2781,6 +2848,17 @@ class Main(QtWidgets.QWidget):
 
             order = self.sched.or_rooms
 
+            base_date = datetime.now().date()
+            try:
+                if hasattr(self, "date"):
+                    qdate = self.date.date()
+                    if hasattr(qdate, "toPython"):
+                        base_date = qdate.toPython()
+                    else:
+                        base_date = date(qdate.year(), qdate.month(), qdate.day())
+            except Exception:
+                base_date = datetime.now().date()
+
             def time_key(se: Tuple[int, ScheduleEntry]):
                 entry = se[1]
                 return entry.time or "99:99"
@@ -2797,14 +2875,19 @@ class Main(QtWidgets.QWidget):
             }
 
             for orr in sorted(groups.keys(), key=lambda x: (order.index(x) if x in order else 999, x)):
-                parent = QtWidgets.QTreeWidgetItem(["", orr])
+                header_text = orr or "-"
+                plan_desc = describe_or_plan_label(base_date, orr)
+                if plan_desc:
+                    header_text = f"{header_text} • {plan_desc}"
+
+                parent = QtWidgets.QTreeWidgetItem([header_text] + ["" for _ in range(self.tree2.columnCount() - 1)])
                 parent.setFirstColumnSpanned(True)
                 bg_brush = QtGui.QBrush(QtGui.QColor("#f6f9ff"))
-                parent.setBackground(0, bg_brush)
-                parent.setBackground(1, bg_brush)
-                pfont = parent.font(1)
+                for col in range(self.tree2.columnCount()):
+                    parent.setBackground(col, bg_brush)
+                pfont = parent.font(0)
                 pfont.setBold(True)
-                parent.setFont(1, pfont)
+                parent.setFont(0, pfont)
                 for c in range(self.tree2.columnCount()):
                     parent.setData(c, QtCore.Qt.UserRole + 99, "grp")
                 self.tree2.addTopLevelItem(parent)
