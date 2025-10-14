@@ -18,11 +18,11 @@ from PySide6.QtWebSockets import QWebSocket
 from PySide6.QtWidgets import QDialog
 
 from icd10_catalog import (
-    ALL_OPERATIONS,
     add_custom_entry,
     diagnosis_suggestions,
-    get_custom_list,
-    operation_suggestions,
+    get_custom_entries,
+    get_diagnoses,
+    get_operations,
 )
 
 try:
@@ -365,15 +365,60 @@ DEPT_DOCTORS = {
     "Maxillofacial | ศัลยกรรมขากรรไกร": ["นพ.ฉลองรัฐ เดชา","พญ.อรุณนภา คิสารัง"],
 }
 
-def _dept_key(label:str)->str:
-    t=(label or "").lower()
-    if "กระดูก" in t or "ortho" in t: return "Orthopedics"
-    if "ปัสสาวะ" in t or "uro" in t: return "Urology"
-    if "สูติ" in t or "ob" in t: return "OBGYN"
-    if "โสต" in t or "ent" in t or "คอ" in t: return "ENT"
-    if "จักษุ" in t or "oph" in t: return "Ophthalmology"
-    if "ขากรรไกร" in t or "max" in t: return "Maxillofacial"
-    return "Surgery"
+DEPT_KEY_MAP = {
+    "Surgery": "Surgery",
+    "ศัลยกรรมทั่วไป": "Surgery",
+    "Surgery | ศัลยกรรมทั่วไป": "Surgery",
+    "Orthopedics": "Orthopedics",
+    "ศัลยกรรมกระดูกและข้อ": "Orthopedics",
+    "Orthopedics | ศัลยกรรมกระดูกและข้อ": "Orthopedics",
+    "Urology": "Urology",
+    "ศัลยกรรมระบบทางเดินปัสสาวะ": "Urology",
+    "ระบบทางเดินปัสสาวะ": "Urology",
+    "Urology | ศัลยกรรมระบบทางเดินปัสสาวะ": "Urology",
+    "ENT": "ENT",
+    "ศัลยกรรม โสต ศอ นาสิก": "ENT",
+    "หู คอ จมูก": "ENT",
+    "ENT | ศัลยกรรม โสต ศอ นาสิก": "ENT",
+    "Obstetrics-Gynecology": "OBGYN",
+    "สูติ-นรีเวช": "OBGYN",
+    "Obstetrics-Gynecology | สูติ-นรีเวช": "OBGYN",
+    "Ophthalmology": "Ophthalmology",
+    "จักษุ": "Ophthalmology",
+    "Ophthalmology | จักษุ": "Ophthalmology",
+    "Maxillofacial": "Maxillofacial",
+    "ศัลยกรรมขากรรไกร": "Maxillofacial",
+    "ศัลยกรรมช่องปากและใบหน้า": "Maxillofacial",
+    "Maxillofacial | ศัลยกรรมขากรรไกร": "Maxillofacial",
+}
+
+
+def _dept_to_specialty_key(label: str) -> str:
+    text = (label or "").strip()
+    if not text:
+        return ""
+    parts = [p.strip() for p in text.split("|")]
+    for part in parts + [text]:
+        if part in DEPT_KEY_MAP:
+            return DEPT_KEY_MAP[part]
+        lowered = part.lower()
+        for name, key in DEPT_KEY_MAP.items():
+            if lowered == name.lower():
+                return key
+    lowered_all = text.lower()
+    if "กระดูก" in lowered_all or "ortho" in lowered_all:
+        return "Orthopedics"
+    if "ปัสสาวะ" in lowered_all or "uro" in lowered_all:
+        return "Urology"
+    if "สูติ" in lowered_all or "ob" in lowered_all:
+        return "OBGYN"
+    if "โสต" in lowered_all or "ent" in lowered_all or "คอ" in lowered_all:
+        return "ENT"
+    if "จักษุ" in lowered_all or "oph" in lowered_all:
+        return "Ophthalmology"
+    if "ขากรรไกร" in lowered_all or "ช่องปาก" in lowered_all or "max" in lowered_all:
+        return "Maxillofacial"
+    return ""
 
 class Toast(QtWidgets.QFrame):
     def __init__(self, parent=None):
@@ -962,7 +1007,7 @@ class Main(QtWidgets.QWidget):
         self._last_focus_uid: Optional[str] = None  # ใช้ไฮไลต์หลังบันทึก
 
         self.toast = Toast(self)
-        self._current_specialty_key = "Surgery"
+        self._current_specialty_key = ""
 
         self._diag_base_catalog: List[str] = []
         self._diag_catalog_full: List[str] = []
@@ -1333,8 +1378,7 @@ class Main(QtWidgets.QWidget):
 
     # ---------- settings / timers ----------
     def _current_specialty_key_safe(self) -> str:
-        key = (getattr(self, "_current_specialty_key", "") or "").strip()
-        return key if key else "Surgery"
+        return (getattr(self, "_current_specialty_key", "") or "").strip()
 
     def _load_settings(self):
         self.cfg = QSettings(ORG_NAME, APP_SETTINGS)
@@ -1548,58 +1592,81 @@ class Main(QtWidgets.QWidget):
             self._set_doctor_visibility(False)
             self.cb_doctor.clear()
 
-        key = _dept_key(dept_label or "")
-        self._current_specialty_key = key
-        specialty = self._current_specialty_key_safe()
+        specialty = _dept_to_specialty_key(dept_label or "")
+        self._current_specialty_key = specialty
 
-        user_dx = get_custom_list("diagnosis", specialty)
-        user_op = get_custom_list("operation", specialty)
+        if not specialty:
+            self._diag_base_catalog = []
+            self._diag_catalog_full = []
+            self._op_catalog_full = []
+            self._dx_index = None
+            self._op_index = None
+            if self.diag_adder.search_line:
+                self.diag_adder.search_line.clear()
+            if self.op_adder.search_line:
+                self.op_adder.search_line.clear()
+            self.diag_adder.clear()
+            self.op_adder.clear()
+            self.diag_adder.set_suggestions([])
+            self.op_adder.set_suggestions([])
+            self.diag_adder.setEnabled(False)
+            self.op_adder.setEnabled(False)
+            return
 
-        base_ops = operation_suggestions(specialty)
-        fallback_ops = [op for op in ALL_OPERATIONS if op not in base_ops]
-        base_dx_list = diagnosis_suggestions(specialty, [])
+        loader = SweetAlert.loading(self, "กำลังเตรียมรายการสำหรับแผนกนี้...")
+        QtWidgets.QApplication.processEvents()
+        try:
+            base_ops = get_operations(specialty) or []
+            base_dx_list = get_diagnoses(specialty) or []
+            user_op = get_custom_entries("operation", specialty) or []
+            user_dx = get_custom_entries("diagnosis", specialty) or []
+        finally:
+            loader.close()
 
         merged_ops: List[str] = []
-
-        def _append_ops(values: List[str]) -> None:
-            for value in values or []:
+        for bucket in (user_op, base_ops):
+            for value in bucket:
                 val = (value or "").strip()
                 if val and val not in merged_ops:
                     merged_ops.append(val)
 
-        _append_ops(base_ops)
-        _append_ops(user_op)
-        _append_ops(fallback_ops)
-
         merged_dx: List[str] = []
-
-        def _append_dx(values: List[str]) -> None:
-            for value in values or []:
+        for bucket in (user_dx, base_dx_list):
+            for value in bucket:
                 val = (value or "").strip()
                 if val and val not in merged_dx:
                     merged_dx.append(val)
 
-        _append_dx(base_dx_list)
-        _append_dx(user_dx)
-
         self._op_catalog_full = merged_ops
         self._diag_base_catalog = merged_dx
+        self._diag_catalog_full = list(merged_dx)
+
+        self._op_index = FastSearchIndex(merged_ops, prefix_len=3) if merged_ops else None
+        self._dx_index = FastSearchIndex(merged_dx, prefix_len=3) if merged_dx else None
 
         if self.op_adder.search_line:
-            self._latest_op_query = self.op_adder.search_line.text()
-        else:
-            self._latest_op_query = ""
-        self._op_index = FastSearchIndex(merged_ops, prefix_len=3) if merged_ops else None
-        if self._op_index:
-            initial_ops = self._op_index.search(self._latest_op_query, self._op_search_limit)
-        else:
-            initial_ops = merged_ops[: self._op_search_limit]
-        self.op_adder.set_suggestions(initial_ops)
-
+            self.op_adder.search_line.clear()
         if self.diag_adder.search_line:
-            self._latest_diag_query = self.diag_adder.search_line.text()
-        else:
-            self._latest_diag_query = ""
+            self.diag_adder.search_line.clear()
+
+        self.op_adder.clear()
+        self.diag_adder.clear()
+
+        self.op_adder.setEnabled(True)
+        self.diag_adder.setEnabled(True)
+
+        self._latest_op_query = ""
+        self._latest_diag_query = ""
+
+        initial_ops = (
+            self._op_index.search("", self._op_search_limit) if self._op_index else merged_ops[: self._op_search_limit]
+        )
+        initial_dx = (
+            self._dx_index.search("", self._dx_search_limit) if self._dx_index else merged_dx[: self._dx_search_limit]
+        )
+
+        self.op_adder.set_suggestions(initial_ops)
+        self.diag_adder.set_suggestions(initial_dx)
 
         self._refresh_diag_suggestions()
 
@@ -1608,7 +1675,15 @@ class Main(QtWidgets.QWidget):
         if not item:
             return
         specialty = self._current_specialty_key_safe()
-        added = add_custom_entry("operation", specialty, item)
+        if not specialty:
+            SweetAlert.warning(self, "เตือน", "กรุณาเลือกแผนกก่อน")
+            return
+        loader = SweetAlert.loading(self, "กำลังบันทึก Operation ...")
+        QtWidgets.QApplication.processEvents()
+        try:
+            added = add_custom_entry("operation", specialty, item)
+        finally:
+            loader.close()
         self._on_dept_changed(self.cb_dept.currentText())
         SweetAlert.success(
             self,
@@ -1621,7 +1696,15 @@ class Main(QtWidgets.QWidget):
         if not item:
             return
         specialty = self._current_specialty_key_safe()
-        added = add_custom_entry("diagnosis", specialty, item)
+        if not specialty:
+            SweetAlert.warning(self, "เตือน", "กรุณาเลือกแผนกก่อน")
+            return
+        loader = SweetAlert.loading(self, "กำลังบันทึก Diagnosis ...")
+        QtWidgets.QApplication.processEvents()
+        try:
+            added = add_custom_entry("diagnosis", specialty, item)
+        finally:
+            loader.close()
         self._on_dept_changed(self.cb_dept.currentText())
         SweetAlert.success(
             self,
@@ -1634,6 +1717,11 @@ class Main(QtWidgets.QWidget):
             return
         ops = self.op_adder.items() if hasattr(self.op_adder, "items") else []
         specialty = self._current_specialty_key_safe()
+        if not specialty:
+            self._diag_catalog_full = []
+            self._dx_index = None
+            self.diag_adder.set_suggestions([])
+            return
         suggestions = diagnosis_suggestions(specialty, ops)
 
         merged: List[str] = []

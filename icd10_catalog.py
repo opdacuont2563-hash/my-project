@@ -907,3 +907,19 @@ def load_icd10tm_xlsx(_xlsx_path: str) -> List[str]:
 def load_icd9_ops(_valid_path: str, _exclude_path: str) -> List[str]:
     return []
 
+
+def get_operations(specialty: str) -> List[str]:
+    """Return the core operation catalog for the requested specialty."""
+    return operation_suggestions(specialty)
+
+
+def get_diagnoses(specialty: str) -> List[str]:
+    """Return the core diagnosis catalog for the requested specialty."""
+    key = _normalize_specialty(specialty)
+    return list(_SPECIALTY_DIAGNOSES.get(key, []))
+
+
+def get_custom_entries(kind: str, specialty: str) -> List[str]:
+    """Expose user-added catalog entries (diagnosis/operation) for a specialty."""
+    return get_custom_list(kind, specialty)
+
