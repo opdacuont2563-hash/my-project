@@ -5,7 +5,7 @@
 import os, sys, json, argparse, csv, base64, secrets, hashlib, unicodedata, re
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta, time as dtime, date
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -702,6 +702,24 @@ class SharedScheduleModel:
     def delete(self, idx:int):
         if 0<=idx<len(self.entries): self.entries.pop(idx); self._save()
     def seq(self)->int: return int(self.s.value(SEQ_KEY, 0))
+    def all(self) -> List[ScheduleEntry]:
+        return list(self.entries)
+    def clear(self) -> int:
+        removed = len(self.entries)
+        if removed:
+            self.entries.clear()
+            self._save()
+        return removed
+    def remove_by_date(self, day: date) -> int:
+        before = len(self.entries)
+        self.entries = [e for e in self.entries if getattr(e, "date", None) != day]
+        removed = before - len(self.entries)
+        if removed:
+            self._save()
+        return removed
+    def replace_all(self, items: List[ScheduleEntry]) -> None:
+        self.entries = list(items)
+        self._save()
 
 class LocalDBLogger:
     def __init__(self, elective_path="schedule_elective.db", emergency_path="schedule_emergency.db"):
@@ -1249,6 +1267,7 @@ class Main(QtWidgets.QWidget):
 
         self.toast = Toast(self)
         self._current_specialty_key = ""
+        self._last_snapshot: Optional[List[Dict[str, object]]] = None
 
         self._diag_base_catalog: List[str] = []
         self._diag_catalog_full: List[str] = []
@@ -1557,12 +1576,22 @@ class Main(QtWidgets.QWidget):
         self.btn_import_excel = QtWidgets.QPushButton("📥 นำเข้าจาก Excel")
         self.btn_import_excel.setProperty("variant", "ghost")
         import_bar.addWidget(self.btn_import_excel, 0)
+        self.btn_clear_board = QtWidgets.QPushButton("🧹 ล้างกระดาน")
+        self.btn_clear_board.setProperty("variant", "destructive")
+        import_bar.addWidget(self.btn_clear_board, 0)
+        self.btn_undo_clear = QtWidgets.QPushButton("↩️ ย้อนกลับการล้าง")
+        self.btn_undo_clear.setProperty("variant", "ghost")
+        self.btn_undo_clear.setEnabled(False)
+        import_bar.addWidget(self.btn_undo_clear, 0)
         import_bar.addStretch(1)
         gr2.addLayout(import_bar,1,0,1,1)
         gr2.setRowStretch(0, 1)
         gr2.setRowStretch(1, 0)
         t2.addWidget(self.card_result, 1)
         self.tabs.addTab(tab2, "Result Schedule")
+
+        self._clear_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Del"), self)
+        self._clear_shortcut.activated.connect(self._on_clear_board_clicked)
 
         # TAB 3 — Monitor
         tab3 = QtWidgets.QWidget(); t3 = QtWidgets.QVBoxLayout(tab3); t3.setSpacing(12); t3.setContentsMargins(0,0,0,0)
@@ -1612,6 +1641,8 @@ class Main(QtWidgets.QWidget):
         self.btn_export.clicked.connect(self._export_csv)
         self.btn_export_deid.clicked.connect(self._export_deid_csv)
         self.btn_import_excel.clicked.connect(self._on_import_excel)
+        self.btn_clear_board.clicked.connect(self._on_clear_board_clicked)
+        self.btn_undo_clear.clicked.connect(self._on_undo_clear_clicked)
         self.btn_manage_or.clicked.connect(self._manage_or)
         self.cb_dept.currentTextChanged.connect(self._on_dept_changed)
         self.btn_add.clicked.connect(self._on_add_or_update)
@@ -2047,6 +2078,92 @@ class Main(QtWidgets.QWidget):
         self._render_tree2()
 
         return ok, skipped
+
+    def _snapshot_sched(self) -> None:
+        try:
+            self._last_snapshot = [entry.to_dict() for entry in self.sched.all()]
+        except Exception:
+            self._last_snapshot = None
+        if hasattr(self, "btn_undo_clear"):
+            self.btn_undo_clear.setEnabled(bool(self._last_snapshot))
+
+    def _restore_snapshot(self) -> None:
+        if not self._last_snapshot:
+            SweetAlert.info(self, "ไม่มีสำเนา", "ยังไม่มีข้อมูลสำหรับย้อนกลับ")
+            return
+
+        restored: List[ScheduleEntry] = []
+        for payload in self._last_snapshot:
+            try:
+                restored.append(ScheduleEntry.from_dict(payload))
+            except Exception:
+                continue
+
+        self._last_snapshot = None
+        if hasattr(self, "btn_undo_clear"):
+            self.btn_undo_clear.setEnabled(False)
+
+        self.sched.replace_all(restored)
+        self._set_result_title()
+        self._render_tree2()
+        SweetAlert.success(self, "เรียบร้อย", "กู้คืนข้อมูลล่าสุดแล้ว", auto_close_msec=1500)
+
+    def _on_clear_board_clicked(self) -> None:
+        entries = self.sched.all()
+        if not entries:
+            SweetAlert.info(self, "ไม่มีข้อมูล", "ยังไม่มีรายการในตารางให้ล้าง")
+            return
+
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("ยืนยันการล้างกระดาน")
+        box.setIcon(QtWidgets.QMessageBox.Question)
+        box.setText("ต้องการล้างรายการในตารางสำหรับทดสอบใช่ไหม?")
+        btn_today = box.addButton("ล้างเฉพาะวันปัจจุบัน", QtWidgets.QMessageBox.AcceptRole)
+        btn_all = box.addButton("ล้างทั้งหมด", QtWidgets.QMessageBox.DestructiveRole)
+        btn_cancel = box.addButton("ยกเลิก", QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(btn_today)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is None or clicked is btn_cancel:
+            return
+
+        if clicked is btn_today:
+            qdate = self.date.date() if hasattr(self, "date") else QtCore.QDate.currentDate()
+            day = qdate.toPython()
+            todays = [e for e in entries if getattr(e, "date", None) == day]
+            if not todays:
+                SweetAlert.info(self, "ไม่พบข้อมูล", f"ไม่มีรายการวันที่ {day.strftime('%d/%m/%Y')} ให้ล้าง")
+                return
+
+            self._snapshot_sched()
+            removed = self.sched.remove_by_date(day)
+            if removed <= 0:
+                self._last_snapshot = None
+                if hasattr(self, "btn_undo_clear"):
+                    self.btn_undo_clear.setEnabled(False)
+                SweetAlert.info(self, "ไม่พบข้อมูล", f"ไม่มีรายการวันที่ {day.strftime('%d/%m/%Y')} ให้ล้าง")
+                return
+
+            message = f"ลบ {removed} รายการของวันที่ {day.strftime('%d/%m/%Y')} แล้ว"
+        else:
+            self._snapshot_sched()
+            removed = self.sched.clear()
+            if removed <= 0:
+                self._last_snapshot = None
+                if hasattr(self, "btn_undo_clear"):
+                    self.btn_undo_clear.setEnabled(False)
+                SweetAlert.info(self, "ไม่มีข้อมูล", "ยังไม่มีรายการในตารางให้ล้าง")
+                return
+
+            message = f"ลบทั้งหมด {removed} รายการแล้ว"
+
+        self._set_result_title()
+        self._render_tree2()
+        SweetAlert.success(self, "ล้างสำเร็จ", message, auto_close_msec=1500)
+
+    def _on_undo_clear_clicked(self) -> None:
+        self._restore_snapshot()
 
     def _update_period_info(self):
         qd = self.date.date()
