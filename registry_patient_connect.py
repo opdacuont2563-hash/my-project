@@ -2560,23 +2560,6 @@ class SearchSelectAdder(QtWidgets.QWidget):
         self.btn_add.clicked.connect(self._add_current)
         self.btn_persist.clicked.connect(self._persist_current)
 
-        try:
-            self.combo.activated[int].connect(self._on_combo_activated)
-        except Exception:
-            pass
-        try:
-            self.combo.highlighted[int].connect(self._on_combo_activated)
-        except Exception:
-            pass
-        try:
-            self.combo.textActivated.connect(self._on_combo_activated_text)
-        except Exception:
-            pass
-        try:
-            self.combo.textHighlighted.connect(self._on_combo_activated_text)
-        except Exception:
-            pass
-
         self.list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._ctx_menu)
         model = self.list.model()
@@ -2594,28 +2577,6 @@ class SearchSelectAdder(QtWidgets.QWidget):
         elif act == a2:
             self.list.clear()
         self._emit_items_changed()
-
-    def _on_combo_activated(self, index: int):
-        if index < 0:
-            return
-        text = (self.combo.itemText(index) or "").strip()
-        self._add_text(text)
-
-    def _on_combo_activated_text(self, text: str):
-        self._add_text((text or "").strip())
-
-    def _on_completer_activated(self, arg):
-        text = ""
-        try:
-            if isinstance(arg, QtCore.QModelIndex):
-                if arg.isValid():
-                    model = arg.model()
-                    text = model.data(arg, QtCore.Qt.DisplayRole)
-            else:
-                text = str(arg)
-        except Exception:
-            text = ""
-        self._add_text((text or "").strip())
 
     def _add_text(self, text: str):
         if not text:
@@ -2668,21 +2629,10 @@ class SearchSelectAdder(QtWidgets.QWidget):
             self.search_line.setCursorPosition(len(current_text))
             self.search_line.blockSignals(False)
 
-        if self._completer is not None:
-            try:
-                self._completer.activated.disconnect(self._on_completer_activated)
-            except Exception:
-                pass
-
         self._completer = QtWidgets.QCompleter(options)
         self._completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
         self._completer.setFilterMode(QtCore.Qt.MatchContains)
         self.combo.setCompleter(self._completer)
-
-        try:
-            self._completer.activated.connect(self._on_completer_activated)
-        except Exception:
-            pass
 
         # ปิดการเลื่อนด้วยล้อเมาส์บนคอมโบ (กันเปลี่ยนค่าเวลาเลื่อนหน้า)
         self.combo.setFocusPolicy(QtCore.Qt.StrongFocus)
