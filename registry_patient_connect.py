@@ -1713,16 +1713,14 @@ class Main(QtWidgets.QWidget):
         )
 
     def _refresh_diag_suggestions(self):
-        if not hasattr(self, "op_adder"):
-            return
-        ops = self.op_adder.items() if hasattr(self.op_adder, "items") else []
         specialty = self._current_specialty_key_safe()
         if not specialty:
             self._diag_catalog_full = []
             self._dx_index = None
             self.diag_adder.set_suggestions([])
             return
-        suggestions = diagnosis_suggestions(specialty, ops)
+
+        base_suggestions = diagnosis_suggestions(specialty)
 
         merged: List[str] = []
 
@@ -1733,7 +1731,7 @@ class Main(QtWidgets.QWidget):
                     merged.append(val)
 
         _append(self._diag_base_catalog)
-        _append(list(suggestions))
+        _append(list(base_suggestions))
 
         self._diag_catalog_full = merged
         self._dx_index = FastSearchIndex(self._diag_catalog_full, prefix_len=3) if self._diag_catalog_full else None
