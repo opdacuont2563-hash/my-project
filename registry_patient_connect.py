@@ -2554,12 +2554,29 @@ class SearchSelectAdder(QtWidgets.QWidget):
 
         self.set_suggestions(suggestions or [])
 
+        # --- signals: รองรับทั้ง Enter / คลิกคอมโบ / เลือกจากคอมพลีทเตอร์ ---
         if self.search_line:
             self.search_line.returnPressed.connect(self._add_current)
 
         self.btn_add.clicked.connect(self._add_current)
         self.btn_persist.clicked.connect(self._persist_current)
-        self.combo.activated[int].connect(self._on_combo_activated)
+
+        try:
+            self.combo.activated[int].connect(self._on_combo_activated)
+        except Exception:
+            pass
+        try:
+            self.combo.activated[str].connect(self._on_combo_activated_text)
+        except Exception:
+            pass
+        try:
+            self.combo.highlighted[int].connect(self._on_combo_activated)
+        except Exception:
+            pass
+        try:
+            self.combo.highlighted[str].connect(self._on_combo_activated_text)
+        except Exception:
+            pass
 
         self.list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._ctx_menu)
@@ -2583,7 +2600,18 @@ class SearchSelectAdder(QtWidgets.QWidget):
         text = (self.combo.itemText(index) or "").strip()
         self._add_text(text)
 
+    def _on_combo_activated_text(self, text: str):
+        self._add_text((text or "").strip())
+
     def _on_completer_activated(self, text: str):
+        self._add_text((text or "").strip())
+
+    def _on_completer_index_activated(self, index: QtCore.QModelIndex):
+        try:
+            model = index.model()
+            text = model.data(index, QtCore.Qt.DisplayRole)
+        except Exception:
+            text = ""
         self._add_text((text or "").strip())
 
     def _add_text(self, text: str):
@@ -2646,10 +2674,22 @@ class SearchSelectAdder(QtWidgets.QWidget):
                 self._completer.activated[str].disconnect(self._on_completer_activated)
             except Exception:
                 pass
+            try:
+                self._completer.activated[QtCore.QModelIndex].disconnect(self._on_completer_index_activated)
+            except Exception:
+                pass
 
         self._completer = completer
-        self._completer.activated[str].connect(self._on_completer_activated)
         self.combo.setCompleter(self._completer)
+
+        try:
+            self._completer.activated[str].connect(self._on_completer_activated)
+        except Exception:
+            pass
+        try:
+            self._completer.activated[QtCore.QModelIndex].connect(self._on_completer_index_activated)
+        except Exception:
+            pass
 
         # ปิดการเลื่อนด้วยล้อเมาส์บนคอมโบ (กันเปลี่ยนค่าเวลาเลื่อนหน้า)
         self.combo.setFocusPolicy(QtCore.Qt.StrongFocus)
