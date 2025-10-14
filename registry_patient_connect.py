@@ -2670,42 +2670,21 @@ class SearchSelectAdder(QtWidgets.QWidget):
             self.search_line.setCursorPosition(len(current_text))
             self.search_line.blockSignals(False)
 
-        completer = QtWidgets.QCompleter(options)
-        completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
-        completer.setFilterMode(QtCore.Qt.MatchContains)
-
         if self._completer is not None:
-            for getter in (
-                lambda comp: getattr(comp, "activated"),
-                lambda comp: comp.activated[str],
-                lambda comp: comp.activated[QtCore.QModelIndex],
-            ):
-                try:
-                    getter(self._completer).disconnect(self._on_completer_activated)
-                except Exception:
-                    pass
-
-        self._completer = completer
-        self.combo.setCompleter(self._completer)
-
-        connected = False
-        for getter in (
-            lambda comp: getattr(comp, "activated"),
-            lambda comp: comp.activated[str],
-            lambda comp: comp.activated[QtCore.QModelIndex],
-        ):
             try:
-                getter(self._completer).connect(self._on_completer_activated)
-                connected = True
-                break
-            except Exception:
-                continue
-
-        if not connected:
-            try:
-                self._completer.activated.connect(self._on_completer_activated)
+                self._completer.activated.disconnect(self._on_completer_activated)
             except Exception:
                 pass
+
+        self._completer = QtWidgets.QCompleter(options)
+        self._completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        self._completer.setFilterMode(QtCore.Qt.MatchContains)
+        self.combo.setCompleter(self._completer)
+
+        try:
+            self._completer.activated.connect(self._on_completer_activated)
+        except Exception:
+            pass
 
         # ปิดการเลื่อนด้วยล้อเมาส์บนคอมโบ (กันเปลี่ยนค่าเวลาเลื่อนหน้า)
         self.combo.setFocusPolicy(QtCore.Qt.StrongFocus)
