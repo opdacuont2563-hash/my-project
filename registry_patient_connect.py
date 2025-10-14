@@ -22,9 +22,6 @@ from icd10_catalog import (
     add_custom_entry,
     diagnosis_suggestions,
     get_custom_list,
-    load_icd10tm_xlsx,
-    load_icd9_ops,
-    load_specialty_catalog,
     operation_suggestions,
 )
 
@@ -424,6 +421,44 @@ class Toast(QtWidgets.QFrame):
         anim.finished.connect(self.hide)
         self._anim = anim
         anim.start()
+
+
+class SweetAlert:
+    @staticmethod
+    def info(parent: QtWidgets.QWidget, title: str, text: str) -> None:
+        QtWidgets.QMessageBox.information(parent, title, text)
+
+    @staticmethod
+    def success(parent: QtWidgets.QWidget, title: str, text: str) -> None:
+        box = QtWidgets.QMessageBox(parent)
+        box.setIcon(QtWidgets.QMessageBox.Information)
+        box.setWindowTitle(title)
+        box.setText(f"✅ {text}")
+        box.exec()
+
+    @staticmethod
+    def warning(parent: QtWidgets.QWidget, title: str, text: str) -> None:
+        QtWidgets.QMessageBox.warning(parent, title, text)
+
+    @staticmethod
+    def confirm(parent: QtWidgets.QWidget, title: str, text: str) -> bool:
+        box = QtWidgets.QMessageBox(parent)
+        box.setIcon(QtWidgets.QMessageBox.Question)
+        box.setWindowTitle(title)
+        box.setText(text)
+        box.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        box.setDefaultButton(QtWidgets.QMessageBox.No)
+        return box.exec() == QtWidgets.QMessageBox.Yes
+
+    @staticmethod
+    def loading(parent: QtWidgets.QWidget, text: str = "กำลังดำเนินการ...") -> QtWidgets.QProgressDialog:
+        dlg = QtWidgets.QProgressDialog(text, None, 0, 0, parent)
+        dlg.setWindowModality(QtCore.Qt.ApplicationModal)
+        dlg.setCancelButton(None)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setWindowTitle("โปรดรอสักครู่")
+        return dlg
 
 class StatusChipWidget(QtWidgets.QWidget):
     def __init__(self, text:str, color:str, pulse:bool=False, parent=None):
@@ -928,29 +963,6 @@ class Main(QtWidgets.QWidget):
 
         self.toast = Toast(self)
         self._current_specialty_key = "Surgery"
-        self._icd10tm_list: List[str] = []
-        self._icd10tm_path = os.getenv(
-            "ICD10TM_XLSX_PATH",
-            r"C:\\Users\\EndoScope\\Desktop\\my-project\\ICD10TM-Public.xlsx",
-        )
-        try:
-            self._icd10tm_list = load_icd10tm_xlsx(self._icd10tm_path) or []
-        except Exception:
-            self._icd10tm_list = []
-
-        self._icd9_valid_path = os.getenv(
-            "ICD9_VALID_XLSX_PATH",
-            r"C:\\Users\\EndoScope\\Desktop\\my-project\\section111validicd9-jan2025_0.xlsx",
-        )
-        self._icd9_excluded_path = os.getenv(
-            "ICD9_EXCLUDED_XLSX_PATH",
-            r"C:\\Users\\EndoScope\\Desktop\\my-project\\section111excludedicd9-jan2025_0.xlsx",
-        )
-        self._icd9_ops: List[str] = []
-        try:
-            self._icd9_ops = load_icd9_ops(self._icd9_valid_path, self._icd9_excluded_path) or []
-        except Exception:
-            self._icd9_ops = []
 
         self._diag_base_catalog: List[str] = []
         self._diag_catalog_full: List[str] = []
@@ -1540,17 +1552,12 @@ class Main(QtWidgets.QWidget):
         self._current_specialty_key = key
         specialty = self._current_specialty_key_safe()
 
-        base_dx_list, base_op_list = load_specialty_catalog(specialty)
-        if not base_dx_list:
-            base_dx_list = list(self._icd10tm_list or [])
-        if not base_op_list:
-            base_op_list = list(self._icd9_ops or [])
-
         user_dx = get_custom_list("diagnosis", specialty)
         user_op = get_custom_list("operation", specialty)
 
-        primary_ops = operation_suggestions(specialty)
-        fallback_ops = [op for op in ALL_OPERATIONS if op not in primary_ops]
+        base_ops = operation_suggestions(specialty)
+        fallback_ops = [op for op in ALL_OPERATIONS if op not in base_ops]
+        base_dx_list = diagnosis_suggestions(specialty, [])
 
         merged_ops: List[str] = []
 
@@ -1560,9 +1567,8 @@ class Main(QtWidgets.QWidget):
                 if val and val not in merged_ops:
                     merged_ops.append(val)
 
-        _append_ops(base_op_list)
+        _append_ops(base_ops)
         _append_ops(user_op)
-        _append_ops(primary_ops)
         _append_ops(fallback_ops)
 
         merged_dx: List[str] = []
@@ -1573,8 +1579,8 @@ class Main(QtWidgets.QWidget):
                 if val and val not in merged_dx:
                     merged_dx.append(val)
 
-        _append_dx(user_dx)
         _append_dx(base_dx_list)
+        _append_dx(user_dx)
 
         self._op_catalog_full = merged_ops
         self._diag_base_catalog = merged_dx
@@ -1604,7 +1610,11 @@ class Main(QtWidgets.QWidget):
         specialty = self._current_specialty_key_safe()
         added = add_custom_entry("operation", specialty, item)
         self._on_dept_changed(self.cb_dept.currentText())
-        self.toast.show_toast("เพิ่ม Operation แล้ว" if added else "มี Operation นี้อยู่แล้ว")
+        SweetAlert.success(
+            self,
+            "สำเร็จ" if added else "ซ้ำ",
+            "เพิ่ม Operation แล้ว" if added else "มี Operation นี้อยู่แล้ว",
+        )
 
     def _on_diagnosis_added_by_user(self, text: str):
         item = (text or "").strip()
@@ -1613,7 +1623,11 @@ class Main(QtWidgets.QWidget):
         specialty = self._current_specialty_key_safe()
         added = add_custom_entry("diagnosis", specialty, item)
         self._on_dept_changed(self.cb_dept.currentText())
-        self.toast.show_toast("เพิ่ม Diagnosis แล้ว" if added else "มี Diagnosis นี้อยู่แล้ว")
+        SweetAlert.success(
+            self,
+            "สำเร็จ" if added else "ซ้ำ",
+            "เพิ่ม Diagnosis แล้ว" if added else "มี Diagnosis นี้อยู่แล้ว",
+        )
 
     def _refresh_diag_suggestions(self):
         if not hasattr(self, "op_adder"):
@@ -1632,9 +1646,6 @@ class Main(QtWidgets.QWidget):
 
         _append(self._diag_base_catalog)
         _append(list(suggestions))
-
-        if not merged and self._icd10tm_list:
-            _append(list(self._icd10tm_list))
 
         self._diag_catalog_full = merged
         self._dx_index = FastSearchIndex(self._diag_catalog_full, prefix_len=3) if self._diag_catalog_full else None
@@ -1889,26 +1900,33 @@ class Main(QtWidgets.QWidget):
         # จำ uid ไว้เพื่อโฟกัสหลังบันทึก
         self._last_focus_uid = e.uid()
 
-        if self._edit_idx is None:
-            self.sched.add(e)
-            try: self.db_logger.append_entry(e)
-            except Exception: pass
-            self._notify("เพิ่มรายการแล้ว", f"OR {e.or_room} • {e.time} • HN {e.hn}")
-            self.toast.show_toast("เพิ่มรายการสำเร็จ")
-            # ไม่เพิ่มเข้า historical_monitor_seen ที่นี่ — ปล่อยให้ monitor รายงาน HN จะเป็นคนเพิ่ม
-        else:
-            if 0 <= self._edit_idx < len(self.sched.entries):
-                old_entry = self.sched.entries[self._edit_idx]
-                e.case_uid = old_entry.case_uid
-                e.version = int(old_entry.version or 1) + 1
-                e.state = old_entry.state
-                e.returning_started_at = old_entry.returning_started_at
-                e.returned_to_ward_at = old_entry.returned_to_ward_at
-                e.postop_completed = old_entry.postop_completed
-            self.sched.update(self._edit_idx, e)
-            self._notify("บันทึกการแก้ไขแล้ว", f"OR {e.or_room} • {e.time} • HN {e.hn}")
-            self.toast.show_toast("อัปเดตรายการสำเร็จ")
-            self._set_add_mode()
+        loader = SweetAlert.loading(self, "กำลังบันทึกข้อมูล...")
+        QtWidgets.QApplication.processEvents()
+        try:
+            if self._edit_idx is None:
+                self.sched.add(e)
+                try:
+                    self.db_logger.append_entry(e)
+                except Exception:
+                    pass
+                self._notify("เพิ่มรายการแล้ว", f"OR {e.or_room} • {e.time} • HN {e.hn}")
+                SweetAlert.success(self, "สำเร็จ", "บันทึกรายการใหม่เรียบร้อย")
+                # ไม่เพิ่มเข้า historical_monitor_seen ที่นี่ — ปล่อยให้ monitor รายงาน HN จะเป็นคนเพิ่ม
+            else:
+                if 0 <= self._edit_idx < len(self.sched.entries):
+                    old_entry = self.sched.entries[self._edit_idx]
+                    e.case_uid = old_entry.case_uid
+                    e.version = int(old_entry.version or 1) + 1
+                    e.state = old_entry.state
+                    e.returning_started_at = old_entry.returning_started_at
+                    e.returned_to_ward_at = old_entry.returned_to_ward_at
+                    e.postop_completed = old_entry.postop_completed
+                self.sched.update(self._edit_idx, e)
+                self._notify("บันทึกการแก้ไขแล้ว", f"OR {e.or_room} • {e.time} • HN {e.hn}")
+                SweetAlert.success(self, "สำเร็จ", "อัปเดตรายการเรียบร้อย")
+                self._set_add_mode()
+        finally:
+            loader.close()
 
         self._set_result_title()
         self._render_tree2()
@@ -2179,11 +2197,15 @@ class Main(QtWidgets.QWidget):
     def _delete_entry_idx(self, idx:int):
         if 0 <= idx < len(self.sched.entries):
             entry = self.sched.entries[idx]
-            ok = QtWidgets.QMessageBox.question(self, "ยืนยันการลบ", f"ลบรายการ HN {entry.hn} ({entry.name}) ?")
-            if ok == QtWidgets.QMessageBox.StandardButton.Yes:
-                self.sched.delete(idx)
-                self._render_tree2()
-                self.toast.show_toast("ลบรายการแล้ว")
+            if not SweetAlert.confirm(
+                self,
+                "ยืนยันการลบ",
+                f"ต้องการลบ HN {entry.hn} ({entry.name}) หรือไม่?",
+            ):
+                return
+            self.sched.delete(idx)
+            self._render_tree2()
+            SweetAlert.success(self, "สำเร็จ", "ลบรายการเรียบร้อย")
 
     def _on_monitor_double_click(self, item:QtWidgets.QTableWidgetItem):
         row = item.row()

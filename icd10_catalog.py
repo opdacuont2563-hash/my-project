@@ -1,173 +1,20 @@
-"""ICD/Operation catalog helpers for Registry Patient Connect."""
+"""ICD/Operation catalog helpers for Registry Patient Connect.
+
+This module now provides in-memory "Top 50" lists (full names, no codes)
+for each specialty so the application no longer depends on external Excel
+files.  User-added terms remain persisted in a portable JSON database so the
+catalog can keep learning per department.
+"""
 from __future__ import annotations
 
 import json
 import os
-import shutil
-import sys
-import tempfile
-from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Sequence, Set, Tuple
 
 # ---------------------------------------------------------------------------
-# Core catalog data
+# User additions (persisted per specialty)
 # ---------------------------------------------------------------------------
-
-_SPECIALTY_OPERATIONS: Dict[str, List[str]] = {
-    "Surgery": [
-        "Appendectomy (Laparoscopic)",
-        "Cholecystectomy (Laparoscopic)",
-        "Hemorrhoidectomy",
-        "Breast Lumpectomy",
-    ],
-    "Orthopedics": [
-        "Open Reduction Internal Fixation (ORIF) — Radius",
-        "Total Knee Arthroplasty",
-        "Arthroscopic Meniscectomy",
-        "External Fixator Adjustment",
-    ],
-    "Urology": [
-        "Transurethral Resection of Prostate (TURP)",
-        "Cystolitholapaxy",
-        "Percutaneous Nephrolithotomy",
-    ],
-    "OBGYN": [
-        "Cesarean Section",
-        "Total Abdominal Hysterectomy",
-        "Diagnostic Laparoscopy",
-    ],
-    "ENT": [
-        "Tonsillectomy",
-        "Functional Endoscopic Sinus Surgery (FESS)",
-        "Myringotomy with Tube Insertion",
-    ],
-    "Ophthalmology": [
-        "Phacoemulsification with IOL",
-        "Pterygium Excision",
-        "Vitrectomy",
-    ],
-    "Maxillofacial": [
-        "Open Reduction Internal Fixation — Mandible",
-        "Le Fort I Osteotomy",
-        "Temporomandibular Joint Arthroplasty",
-    ],
-}
-
-_SPECIALTY_DIAGNOSES: Dict[str, List[str]] = {
-    "Surgery": [
-        "K35.80 - Acute appendicitis, unspecified",
-        "K80.20 - Calculus of gallbladder without cholecystitis",
-        "I84.90 - Hemorrhoids, unspecified",
-    ],
-    "Orthopedics": [
-        "S52.50 - Fracture of distal radius",
-        "M17.10 - Osteoarthritis of knee, unspecified",
-        "S83.20 - Tear of meniscus, unspecified",
-    ],
-    "Urology": [
-        "N40.1 - Benign prostatic hyperplasia with LUTS",
-        "N20.0 - Calculus of kidney",
-    ],
-    "OBGYN": [
-        "O82.0 - Cesarean delivery, unspecified",
-        "N80.9 - Endometriosis, unspecified",
-    ],
-    "ENT": [
-        "J35.01 - Chronic tonsillitis",
-        "J32.9 - Chronic sinusitis, unspecified",
-    ],
-    "Ophthalmology": [
-        "H25.9 - Senile cataract, unspecified",
-        "H11.0 - Pterygium",
-    ],
-    "Maxillofacial": [
-        "S02.609 - Fracture of mandible",
-        "M26.609 - Temporomandibular joint disorder",
-    ],
-}
-
-_OPERATION_TO_DIAGNOSES: Dict[str, List[str]] = {
-    "Appendectomy (Laparoscopic)": ["K35.80 - Acute appendicitis, unspecified"],
-    "Cholecystectomy (Laparoscopic)": ["K80.20 - Calculus of gallbladder without cholecystitis"],
-    "Hemorrhoidectomy": ["I84.90 - Hemorrhoids, unspecified"],
-    "Breast Lumpectomy": ["D05.9 - Carcinoma in situ of breast"],
-    "Open Reduction Internal Fixation (ORIF) — Radius": ["S52.50 - Fracture of distal radius"],
-    "Total Knee Arthroplasty": ["M17.10 - Osteoarthritis of knee, unspecified"],
-    "Arthroscopic Meniscectomy": ["S83.20 - Tear of meniscus, unspecified"],
-    "External Fixator Adjustment": ["S82.209 - Fracture of tibia"],
-    "Transurethral Resection of Prostate (TURP)": ["N40.1 - Benign prostatic hyperplasia with LUTS"],
-    "Cystolitholapaxy": ["N21.0 - Calculus in bladder"],
-    "Percutaneous Nephrolithotomy": ["N20.0 - Calculus of kidney"],
-    "Cesarean Section": ["O82.0 - Cesarean delivery, unspecified"],
-    "Total Abdominal Hysterectomy": ["N85.2 - Hypertrophy of uterus"],
-    "Diagnostic Laparoscopy": ["N80.9 - Endometriosis, unspecified"],
-    "Tonsillectomy": ["J35.01 - Chronic tonsillitis"],
-    "Functional Endoscopic Sinus Surgery (FESS)": ["J32.9 - Chronic sinusitis, unspecified"],
-    "Myringotomy with Tube Insertion": ["H66.90 - Otitis media, unspecified"],
-    "Phacoemulsification with IOL": ["H25.9 - Senile cataract, unspecified"],
-    "Pterygium Excision": ["H11.0 - Pterygium"],
-    "Vitrectomy": ["H43.1 - Vitreous hemorrhage"],
-    "Open Reduction Internal Fixation — Mandible": ["S02.609 - Fracture of mandible"],
-    "Le Fort I Osteotomy": ["M26.212 - Maxillary hyperplasia"],
-    "Temporomandibular Joint Arthroplasty": ["M26.609 - Temporomandibular joint disorder"],
-}
-
-
-def _resolve_portable_path(env_key: str, default_rel: str = "") -> Path:
-    """Resolve ``env_key`` to a portable :class:`Path`."""
-
-    env_value = os.getenv(env_key, "").strip()
-    candidates: List[Path] = []
-
-    if env_value:
-        expanded = Path(os.path.expandvars(os.path.expanduser(env_value)))
-        candidates.append(expanded)
-
-    app_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-    if env_value and not Path(env_value).is_absolute():
-        candidates.append(app_dir / env_value)
-
-    if default_rel:
-        candidates.append(app_dir / default_rel)
-
-    home = Path.home()
-    candidates.append(home / "Desktop" / "my-project" / "ICD9_ICD10_by_Specialty.xlsx")
-
-    if env_value:
-        candidates.append(Path(env_value))
-
-    for candidate in candidates:
-        if candidate and candidate.exists():
-            return candidate
-
-    return candidates[0] if candidates else app_dir
-
-
-def _xlsx_rows(path: Path, sheet: str) -> List[List[str]]:
-    """Read ``sheet`` rows from ``path`` using :mod:`openpyxl`."""
-
-    try:  # pragma: no cover - optional dependency
-        import openpyxl  # type: ignore
-    except Exception:
-        return []
-
-    if not path.exists():
-        return []
-
-    try:
-        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        if sheet not in workbook.sheetnames:
-            return []
-        worksheet = workbook[sheet]
-        result: List[List[str]] = []
-        for row in worksheet.iter_rows(min_row=1, values_only=True):
-            if not row:
-                continue
-            result.append([("" if cell is None else str(cell)).strip() for cell in row])
-        return result
-    except Exception:
-        return []
 
 
 def _user_db_path() -> Path:
@@ -197,29 +44,27 @@ def _load_user_db() -> Dict[str, Dict[str, List[str]]]:
 
 def _atomic_json_write(fp: Path, payload: Dict[str, Dict[str, List[str]]]) -> None:
     fp.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=str(fp.parent)) as tmp:
-        json.dump(payload, tmp, ensure_ascii=False, indent=2)
-        tmp_path = Path(tmp.name)
-    shutil.move(str(tmp_path), fp)
+    tmp = fp.with_suffix(fp.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, fp)
 
 
 def add_custom_entry(kind: str, specialty: str, text: str) -> bool:
-    """Persist ``text`` for ``kind``/``specialty``. Returns ``True`` if stored."""
-
     kind_key = (kind or "").strip().lower()
     if kind_key not in {"diagnosis", "operation"}:
         return False
+
     specialty_key = (specialty or "").strip()
-    entry = (text or "").strip()
-    if not specialty_key or not entry:
+    value = (text or "").strip()
+    if not specialty_key or not value:
         return False
 
     db = _load_user_db()
     bucket = db.setdefault(kind_key, {})
-    items = bucket.setdefault(specialty_key, [])
-    if entry in items:
+    entries = bucket.setdefault(specialty_key, [])
+    if value in entries:
         return False
-    items.append(entry)
+    entries.append(value)
     _atomic_json_write(_user_db_path(), db)
     return True
 
@@ -233,92 +78,797 @@ def get_custom_list(kind: str, specialty: str) -> List[str]:
     return list(db.get(kind_key, {}).get(specialty_key, []))
 
 
-_SPECIALTY_SHEETS: Dict[str, Tuple[str, str]] = {
-    "Surgery": ("Surgery_ICD10", "Surgery_ICD9"),
-    "Orthopedics": ("Orthopedics_ICD10", "Orthopedics_ICD9"),
-    "Urology": ("Urology_ICD10", "Urology_ICD9"),
-    "ENT": ("ENT_ICD10", "ENT_ICD9"),
-    "Obstetrics-Gynecology": ("OBGYN_ICD10", "OBGYN_ICD9"),
-    "Ophthalmology": ("Ophthalmology_ICD10", "Ophthalmology_ICD9"),
-    "Maxillofacial": ("Maxillofacial_ICD10", "Maxillofacial_ICD9"),
+# ---------------------------------------------------------------------------
+# Core catalog data (Top 50 – full names, no codes)
+# ---------------------------------------------------------------------------
+
+_SPECIALTY_OPERATIONS: Dict[str, List[str]] = {
+    "Surgery": [
+        "Appendectomy",
+        "Laparoscopic Cholecystectomy (LC)",
+        "Open Cholecystectomy (OC)",
+        "Common Bile Duct Exploration",
+        "Choledochoduodenostomy",
+        "T-Tube Insertion with Cholangiogram",
+        "Herniorrhaphy / Hernioplasty",
+        "Hemorrhoidectomy",
+        "Exploratory Laparotomy",
+        "Endoscopic Retrograde Cholangiopancreatography",
+        "Esophagogastroduodenoscopy",
+        "Colonoscopy",
+        "Incision and Drainage",
+        "Debridement",
+        "Wound Exploration and Suturing",
+        "Low Anterior Resection",
+        "Hartmann’s Procedure",
+        "Colostomy (Creation/Revision)",
+        "Ileostomy (Creation/Revision)",
+        "End-to-End Anastomosis / Iliocecal Anastomosis",
+        "Right Hemicolectomy",
+        "Left Hemicolectomy",
+        "Sigmoid Colectomy",
+        "Subtotal Colectomy",
+        "Small Bowel Resection",
+        "Omentectomy",
+        "Lysis of Adhesions",
+        "Subtotal Gastrectomy",
+        "Roux-en-Y Reconstruction",
+        "Splenectomy",
+        "Partial Hepatectomy",
+        "Pancreatic Necrosectomy",
+        "Distal Pancreatectomy",
+        "Pancreaticoduodenectomy (Whipple)",
+        "Anal Fistulotomy / Fistulectomy",
+        "Lateral Internal Sphincterotomy",
+        "Pilonidal Sinus Excision",
+        "Lymph Node Biopsy",
+        "Excision of Breast Mass",
+        "Mastectomy / Modified Radical Mastectomy",
+        "Gastrostomy",
+        "Feeding Jejunostomy / Feeding Enterostomy",
+        "Tracheostomy (Creation/Revision/Closure)",
+        "Percutaneous Drainage (Intra-abdominal)",
+        "Ray Amputation",
+        "Transmetatarsal Amputation",
+        "Below-Knee Amputation",
+        "Above-Knee Amputation",
+        "Proctoscopy / Rigid Sigmoidoscopy",
+        "Vacuum-Assisted Wound Closure Application",
+    ],
+    "Urology": [
+        "Transurethral Resection of the Prostate (TURP)",
+        "Transurethral Resection of Bladder Tumor (TURBT)",
+        "Percutaneous Nephrolithotomy (PCNL)",
+        "Retrograde Intrarenal Surgery (RIRS)",
+        "Ureteroscopy with Lithotripsy (URSL)",
+        "Transurethral Lithotripsy (TUL)",
+        "Double J Stent Insertion",
+        "Double J Stent Removal",
+        "Antegrade Double J Stent Placement",
+        "Cystoscopy",
+        "Flexible Cystoscopy",
+        "TRUS-Guided Prostate Biopsy",
+        "Simple/Radical Nephrectomy",
+        "Radical Prostatectomy",
+        "Radical Cystectomy with Ileal Conduit",
+        "Partial Nephrectomy",
+        "Pyeloplasty",
+        "Ureterolithotomy",
+        "Pyelolithotomy",
+        "Cystolitholapaxy",
+        "Urethroplasty",
+        "Optical Internal Urethrotomy (OIU/DVIU)",
+        "Urethral Dilatation",
+        "Suprapubic Catheter Insertion",
+        "Percutaneous Nephrostomy Insertion",
+        "Nephrostomy Exchange/Removal",
+        "Radical Orchidectomy",
+        "Orchiopexy",
+        "Varicocelectomy",
+        "Hydrocelectomy",
+        "Circumcision",
+        "Vasectomy",
+        "Scrotal Exploration and Drainage",
+        "Hematuria Fulguration",
+        "Bladder Biopsy and Fulguration",
+        "Ureteral Reimplantation",
+        "Boari Flap Ureteric Reconstruction",
+        "Penile Prosthesis Implantation",
+        "Meatotomy / Meatal Dilatation",
+        "Penile Fracture Repair",
+        "Retrograde Pyelography",
+        "Antegrade Pyelography",
+        "Ureteral Stent Exchange",
+        "Nephrostogram",
+        "Partial Cystectomy",
+        "Bladder Augmentation",
+        "Artificial Urinary Sphincter Implantation",
+        "Testicular Prosthesis Insertion",
+        "Epididymectomy",
+        "Spermatocelectomy",
+    ],
+    "ENT": [
+        "Tonsillectomy",
+        "Adenoidectomy",
+        "Adenotonsillectomy",
+        "Functional Endoscopic Sinus Surgery (FESS)",
+        "Septoplasty / Septectomy",
+        "Inferior Turbinectomy / Turbinoplasty",
+        "Nasal Polypectomy",
+        "Myringotomy with Pressure Equalization Tube",
+        "Tympanoplasty",
+        "Mastoidectomy",
+        "Ossiculoplasty",
+        "Stapedectomy / Stapedotomy",
+        "Direct Laryngoscopy with Biopsy",
+        "Microlaryngoscopy",
+        "Panendoscopy",
+        "Tracheostomy (Creation/Revision/Closure)",
+        "Parotidectomy",
+        "Hemithyroidectomy / Total Thyroidectomy",
+        "Parathyroidectomy",
+        "Sistrunk’s Operation",
+        "Endoscopic Dacryocystorhinostomy",
+        "External Dacryocystorhinostomy",
+        "Anterior Nasal Packing",
+        "Nasal Cauterization for Epistaxis",
+        "Endoscopic Maxillary Antrostomy",
+        "Endoscopic Ethmoidectomy",
+        "Septoplasty with Turbinate Reduction",
+        "Rigid Esophagoscopy",
+        "Bronchoscopy with Foreign Body Removal",
+        "Balloon Sinuplasty",
+        "Uvulopalatopharyngoplasty",
+        "Selective/Modified Neck Dissection",
+        "Partial/Total Laryngectomy",
+        "Vocal Cord Injection / Microlaryngoscopic Excision",
+        "Ear Toilet and Debridement",
+        "Myringoplasty",
+        "Tympanomastoidectomy",
+        "Choanal Atresia Repair",
+        "Septorhinoplasty",
+        "Endoscopic Turbinate Coblation",
+        "Epiglottoplasty",
+        "Cricothyrotomy",
+        "Scar Revision (Head & Neck)",
+        "Submandibular Gland Excision",
+        "Parotid Duct Stone Removal",
+        "Thyroglossal Duct Cyst Excision",
+        "Vocal Cord Medialization Thyroplasty",
+        "Balloon Eustachian Tuboplasty",
+        "Endoscopic Frontal Sinusotomy",
+    ],
+    "OBGYN": [
+        "Cesarean Section",
+        "Dilatation and Curettage",
+        "Manual Vacuum Aspiration",
+        "Loop Electrosurgical Excision Procedure (LEEP)",
+        "Cervical Biopsy",
+        "Cervical Polypectomy",
+        "Myomectomy",
+        "Total Abdominal Hysterectomy",
+        "Subtotal Abdominal Hysterectomy",
+        "Laparoscopic Hysterectomy",
+        "Vaginal Hysterectomy",
+        "Salpingo-Oophorectomy",
+        "Bilateral Salpingo-Oophorectomy",
+        "Ovarian Cystectomy",
+        "Oophorectomy",
+        "Salpingectomy",
+        "Tubal Resection",
+        "Laparoscopic Salpingostomy",
+        "Diagnostic/Operative Laparoscopy",
+        "Lysis of Adhesions",
+        "Hysterotomy",
+        "Hysteroscopic Polypectomy",
+        "Hysteroscopic Myomectomy",
+        "Hysteroscopic Adhesiolysis",
+        "Endometrial Ablation",
+        "Operative Laparoscopy for Endometriosis",
+        "Uterine Artery Ligation for PPH",
+        "Episiotomy and Perineal Repair",
+        "Repair of 3rd/4th-Degree Perineal Tear",
+        "Evacuation of Vulvovaginal Hematoma",
+        "Marsupialization of Bartholin Cyst",
+        "Cervical Cerclage",
+        "Tubal Ligation",
+        "Uterosacral Ligament Suspension",
+        "Sacrospinous Fixation",
+        "Sacrocolpopexy",
+        "Anterior/Posterior Colporrhaphy",
+        "Repair of Uterine Perforation",
+        "Laparoscopic Myomectomy",
+        "Ovarian Drilling",
+        "Cystoscopy (Intra-op)",
+        "Manual Removal of Placenta",
+        "Postpartum Curettage",
+        "Laparoscopic Oophoropexy",
+        "Hysteroscopic Septum Resection",
+        "Bartholin Gland Excision",
+        "Perineorrhaphy",
+        "Vulvar Lesion Excision",
+        "Laparoscopic Management of Ectopic Pregnancy",
+    ],
+    "Orthopedics": [
+        "Open Reduction and Internal Fixation (ORIF)",
+        "Closed Reduction and Internal Fixation (CRIF)",
+        "Closed Reduction",
+        "Intramedullary Nailing (Interlocking Nail)",
+        "Locking Compression Plate Fixation",
+        "Tension Band Wiring",
+        "Proximal Femoral Nail Antirotation (PFNA)",
+        "External Fixation",
+        "Implant Removal (Plate/Screw/Nail/K-wire)",
+        "Total Knee Arthroplasty",
+        "Total Hip Replacement",
+        "Unicompartmental Knee Arthroplasty",
+        "Revision Arthroplasty (Knee/Hip)",
+        "Bipolar Hemiarthroplasty",
+        "Achilles Tendon Repair",
+        "Anterior Cruciate Ligament Reconstruction",
+        "Medial Collateral Ligament Repair",
+        "Arthroscopic Meniscectomy",
+        "Meniscal Repair",
+        "Rotator Cuff Repair",
+        "Subacromial Decompression",
+        "Bankart/Capsulolabral Repair",
+        "SLAP Repair",
+        "Ulnar Nerve Decompression at Elbow",
+        "Carpal Tunnel Release",
+        "Trigger Finger Release",
+        "De Quervain Release",
+        "Tendon Transfer / Tenolysis",
+        "Distal Radius Volar Plating",
+        "Hallux Valgus Correction",
+        "Ankle Ligament Reconstruction (Broström)",
+        "Ankle Arthrodesis",
+        "Wrist Arthroscopy",
+        "Elbow ORIF",
+        "Patellar Tendon Repair",
+        "Quadriceps Tendon Repair",
+        "Laminectomy",
+        "Microdiscectomy",
+        "Transforaminal Lumbar Interbody Fusion",
+        "Posterolateral Fusion",
+        "Pedicle Screw Fixation",
+        "Percutaneous Sacroiliac Screw Fixation",
+        "Kyphoplasty / Vertebroplasty",
+        "Correction Osteotomy with Plate Fixation",
+        "Split-Thickness Skin Graft",
+        "Fasciotomy",
+        "Skeletal Traction",
+        "Bone Biopsy",
+        "Excision of Heterotopic Ossification",
+        "Removal of External Fixator",
+    ],
+    "Ophthalmology": [
+        "Phacoemulsification with Intraocular Lens",
+        "Extracapsular Cataract Extraction with IOL",
+        "Intracapsular Cataract Extraction with IOL",
+        "Trabeculectomy",
+        "Glaucoma Drainage Device Implantation",
+        "Endoscopic Dacryocystorhinostomy",
+        "External Dacryocystorhinostomy",
+        "Pterygium Excision with Graft",
+        "Incision and Curettage of Chalazion",
+        "Anterior Vitrectomy",
+        "Vitreous Tapping with Intravitreal Antibiotic Injection",
+        "Evisceration",
+        "Enucleation",
+        "Exenteration",
+        "Repair of Globe",
+        "Repair of Eyelid Laceration",
+        "Repair of Conjunctival Laceration",
+        "Canaliculus Repair",
+        "Levator Advancement for Ptosis",
+        "Blepharoplasty",
+        "Lateral Tarsal Strip",
+        "Scleral Fixation Intraocular Lens",
+        "Entropion Repair",
+        "Ectropion Repair",
+        "Temporary / Definitive Tarsorrhaphy",
+        "Corneal Scraping and Culture",
+        "Amniotic Membrane Transplantation",
+        "Penetrating Keratoplasty",
+        "Descemet’s Stripping Endothelial Keratoplasty",
+        "Corneal Cross-Linking",
+        "Scleral Buckling",
+        "Pars Plana Vitrectomy",
+        "Endolaser Photocoagulation",
+        "Retinal Membrane Peeling",
+        "Macular Hole Surgery",
+        "Silicone Oil Injection / Removal",
+        "Orbitotomy for Mass",
+        "Dacryocystectomy",
+        "Punctoplasty with Intubation",
+        "Canaliculo-DCR",
+        "Müller Muscle Conjunctival Resection",
+        "Brow Ptosis Repair",
+        "Ptosis Sling with Fascia Lata",
+        "Enucleation with Implant",
+        "Secondary Intraocular Lens Implantation",
+        "Strabismus Surgery",
+        "Conjunctival Autograft for Pterygium",
+        "Symblepharon Release",
+        "Orbital Decompression",
+        "Eyelid Tumor Excision with Reconstruction",
+    ],
+    "Maxillofacial": [
+        "Open Reduction and Internal Fixation of Facial Fracture",
+        "Closed Reduction of Nasal Bone Fracture",
+        "Closed Reduction of Le Fort Fracture",
+        "Arch Bar / Maxillomandibular Fixation",
+        "Mini Plate and Screw Fixation",
+        "Removal of Mini Plate and Screw",
+        "Debridement of Facial Wound",
+        "Repair and Suturing of Facial Wound",
+        "Enucleation of Mandibular Cyst",
+        "Surgical Extraction of Impacted Third Molar",
+        "Alveoloplasty",
+        "Incision and Drainage of Odontogenic Abscess",
+        "Excision of Oral Lesion",
+        "Wide Excision of Oral–Maxillofacial Lesion",
+        "Incisional Biopsy (Oral–Maxillofacial)",
+        "Open Reduction of Mandibular Fracture",
+        "Open Reduction of ZMC Fracture",
+        "Orbital Floor Reconstruction",
+        "Le Fort I Osteotomy",
+        "Bilateral Sagittal Split Osteotomy",
+        "Reconstruction with Local Flap",
+        "Skin Graft (Facial/Oral)",
+        "Bone Graft (Mandible/Maxilla)",
+        "TMJ Ankylosis Release",
+        "TMJ Arthroplasty",
+        "Maxillary Sinus Lift",
+        "Closure of Oroantral Fistula",
+        "Closure of Oronasal Fistula",
+        "Facial Scar Revision",
+        "Septorhinoplasty (OMFS scope)",
+        "Submandibular Gland Excision",
+        "Parotid Duct Stone Removal",
+        "Sialolithotomy",
+        "Ranula Excision",
+        "Mucocele Excision",
+        "Fibroma Excision (Oral Mucosa)",
+        "Cleft Lip Repair (Secondary)",
+        "Cleft Palate Repair (Secondary)",
+        "Alveolar Bone Graft",
+        "Free Fibula Flap Mandibular Reconstruction",
+        "Distraction Osteogenesis (Mandible/Maxilla)",
+        "Genioplasty",
+        "Orbital Wall Reconstruction with Mesh",
+        "Condylectomy",
+        "Coronoidectomy",
+        "Lingual/Inferior Alveolar Nerve Repair",
+        "Dental Implant Placement (Hospital Setting)",
+        "Removal of Foreign Body (Face/Oral Cavity)",
+        "Drainage of Submandibular Space Infection",
+        "Tracheostomy (Airway for OMFS)",
+    ],
+}
+
+_SPECIALTY_DIAGNOSES: Dict[str, List[str]] = {
+    "Surgery": [
+        "Acute appendicitis",
+        "Acute cholecystitis",
+        "Choledocholithiasis",
+        "Biliary obstruction",
+        "Inguinal hernia",
+        "Ventral (incisional) hernia",
+        "Hemorrhoids",
+        "Colorectal cancer",
+        "Rectal cancer",
+        "Gastrointestinal bleeding",
+        "Small bowel obstruction",
+        "Large bowel obstruction",
+        "Perforated peptic ulcer",
+        "Acute pancreatitis (surgical consult)",
+        "Breast cancer",
+        "Benign breast tumor (fibroadenoma)",
+        "Soft-tissue abscess",
+        "Cellulitis with fluctuance",
+        "Diabetic foot infection",
+        "Critical limb ischemia",
+        "Peritonitis",
+        "Intestinal ischemia (suspected)",
+        "Gastric cancer",
+        "Gastric outlet obstruction",
+        "Dysphagia with feeding difficulty",
+        "Perianal abscess",
+        "Anal fissure (refractory)",
+        "Anal fistula",
+        "Bowel perforation",
+        "Post-operative intra-abdominal collection",
+        "Acute abdomen (undifferentiated)",
+        "Appendiceal mass/abscess",
+        "Diverticulitis with complication",
+        "Adhesive small bowel obstruction",
+        "Toxic megacolon",
+        "Mesenteric ischemia",
+        "Esophageal perforation",
+        "Achalasia (surgical)",
+        "Thyroglossal duct cyst",
+        "Lipoma (trunk/extremity)",
+        "Soft-tissue sarcoma",
+        "Splenic rupture",
+        "Pancreatic pseudocyst",
+        "Bile leak after cholecystectomy",
+        "Stoma complication",
+        "Short bowel syndrome",
+        "Malnutrition requiring enteral access",
+        "Necrotizing soft tissue infection",
+        "Fournier gangrene",
+    ],
+    "Urology": [
+        "Benign prostatic hyperplasia",
+        "Bladder tumor",
+        "Kidney stone",
+        "Ureteric stone",
+        "Bladder stone",
+        "Hematuria (evaluation)",
+        "Prostate cancer",
+        "Renal cell carcinoma",
+        "Obstructive uropathy",
+        "Hydronephrosis",
+        "Pyonephrosis",
+        "Acute urinary retention",
+        "Complicated urinary tract infection",
+        "Acute pyelonephritis",
+        "Urethral stricture",
+        "Neurogenic bladder",
+        "Testicular tumor",
+        "Epididymo-orchitis (complicated)",
+        "Phimosis",
+        "Refractory balanitis",
+        "Vesicoureteral reflux",
+        "Renal colic",
+        "Non-functioning kidney",
+        "Staghorn calculus",
+        "Upper tract urothelial carcinoma",
+        "Carcinoma in situ of bladder",
+        "Ureteropelvic junction obstruction",
+        "Perineal abscess",
+        "Post-operative hematuria",
+        "Iatrogenic ureteral injury",
+        "Bladder neck contracture",
+        "Stress urinary incontinence",
+        "Refractory urge incontinence",
+        "Urethral diverticulum",
+        "Ureteral stricture",
+        "Retroperitoneal fibrosis (obstructive)",
+        "Renal angiomyolipoma (surgical)",
+        "Testicular torsion (post-fixation care)",
+        "Hydrocele",
+        "Varicocele",
+        "Spermatocele",
+        "Penile fracture",
+        "Peyronie disease (surgical)",
+        "Penile carcinoma",
+        "Neurogenic detrusor overactivity (procedural)",
+        "Chronic catheter dependency",
+        "Bladder perforation (iatrogenic)",
+        "Urachal remnant lesion",
+        "Recurrent prostatitis (procedural)",
+    ],
+    "ENT": [
+        "Chronic tonsillitis",
+        "Adenoid hypertrophy",
+        "Chronic rhinosinusitis",
+        "Nasal polyposis",
+        "Deviated nasal septum",
+        "Otitis media with effusion",
+        "Tympanic membrane perforation",
+        "Epistaxis",
+        "Benign vocal cord lesion",
+        "Laryngeal cancer",
+        "OSA due to adenotonsillar hypertrophy",
+        "Thyroid nodule",
+        "Thyroid cancer",
+        "Parotid gland tumor",
+        "Primary hyperparathyroidism",
+        "Neck mass",
+        "Nasolacrimal duct obstruction",
+        "Foreign body in ear",
+        "Foreign body in nose",
+        "Foreign body in esophagus",
+        "Peritonsillar abscess",
+        "Retropharyngeal abscess",
+        "Chronic otitis media",
+        "Cholesteatoma",
+        "Sinonasal inverted papilloma",
+        "Hoarseness due to vocal cord lesion",
+        "Subglottic stenosis",
+        "Tracheal stenosis",
+        "Recurrent epistaxis",
+        "Sinonasal mucocele",
+        "Vocal cord paralysis",
+        "Supraglottic lesion",
+        "Oropharyngeal cancer",
+        "Hypopharyngeal cancer",
+        "Mandibular osteomyelitis",
+        "Sialolithiasis",
+        "Chronic sialadenitis",
+        "Branchial cleft cyst",
+        "Thyroglossal duct cyst",
+        "Head-and-neck hemangioma/vascular malformation",
+        "Nasal valve collapse",
+        "Eustachian tube dysfunction",
+        "Otosclerosis",
+        "Menière disease (procedural)",
+        "Skull base CSF leak",
+        "Facial nerve schwannoma",
+        "Parapharyngeal space tumor",
+        "Zenker diverticulum",
+    ],
+    "OBGYN": [
+        "Cesarean delivery",
+        "Incomplete abortion",
+        "Missed abortion",
+        "High-grade cervical intraepithelial neoplasia",
+        "Uterine fibroids",
+        "Ovarian cyst",
+        "Adnexal mass",
+        "Ectopic pregnancy",
+        "Ovarian torsion",
+        "Ovarian cancer",
+        "Endometriosis (surgical management)",
+        "Pelvic adhesive disease",
+        "Complicated pelvic inflammatory disease",
+        "Endometrial polyp",
+        "Abnormal uterine bleeding due to fibroids",
+        "Postpartum hemorrhage (surgical control)",
+        "Perineal tear (repair)",
+        "Vulvovaginal hematoma",
+        "Bartholin cyst",
+        "Bartholin abscess",
+        "Infertility due to tubal factor (surgical)",
+        "Chronic pelvic pain (surgical evaluation)",
+        "Ovarian endometrioma",
+        "Ruptured ectopic pregnancy",
+        "Uterine prolapse",
+        "Cystocele",
+        "Rectocele",
+        "Iatrogenic uterine perforation",
+        "Acute abdomen in gynecology",
+        "Ovarian hyperstimulation complication",
+        "Adenomyosis (surgical)",
+        "Cervical polyp",
+        "Uterine septum",
+        "Cesarean scar defect (isthmocele)",
+        "Retained products of conception",
+        "Placenta accreta spectrum",
+        "Cervical incompetence",
+        "Vulvar intraepithelial neoplasia",
+        "Vulvar cyst/tumor (excision)",
+        "Vaginal vault prolapse",
+        "Stress urinary incontinence (urogynecologic)",
+        "Vesicovaginal fistula",
+        "Rectovaginal fistula",
+        "Ovarian dermoid cyst",
+        "Paraovarian cyst",
+        "Broad ligament fibroid",
+        "Tubo-ovarian abscess",
+        "Hydrosalpinx",
+        "Post-abortal sepsis",
+    ],
+    "Orthopedics": [
+        "Intertrochanteric femur fracture",
+        "Femoral neck fracture",
+        "Subtrochanteric femur fracture",
+        "Femoral shaft fracture",
+        "Tibial shaft fracture",
+        "Distal tibia (pilon) fracture",
+        "Distal radius fracture",
+        "Humeral shaft fracture",
+        "Supracondylar humerus fracture",
+        "Ankle fracture",
+        "Clavicle fracture",
+        "Olecranon fracture",
+        "Patellar fracture",
+        "Acetabular fracture",
+        "Proximal humerus fracture",
+        "Scaphoid fracture",
+        "Knee osteoarthritis",
+        "Hip osteoarthritis",
+        "ACL tear",
+        "Meniscal tear",
+        "Rotator cuff tear",
+        "Recurrent shoulder instability",
+        "Lumbar disc herniation",
+        "Cervical spondylosis with radiculopathy",
+        "Thoracic vertebral compression fracture",
+        "Carpal tunnel syndrome",
+        "De Quervain tenosynovitis",
+        "Trigger finger",
+        "Ulnar neuropathy at elbow",
+        "Achilles tendon rupture",
+        "Plantar fasciitis (surgical)",
+        "Hallux valgus",
+        "Adult acquired flatfoot",
+        "Charcot arthropathy (foot)",
+        "Osteomyelitis (long bone)",
+        "Symptomatic heterotopic ossification",
+        "Benign bone tumor (excision)",
+        "Bone metastasis (stabilization)",
+        "Avascular necrosis of femoral head",
+        "Nonunion fracture",
+        "Malunion fracture",
+        "Acute compartment syndrome of limb",
+        "Tendon injury of hand",
+        "Peripheral nerve laceration",
+        "Prosthesis loosening (hip/knee)",
+        "Periprosthetic joint infection",
+        "Periprosthetic fracture",
+        "Patellar tendon tear",
+        "Quadriceps tendon tear",
+        "Lateral epicondylitis (surgical)",
+    ],
+    "Ophthalmology": [
+        "Age-related cataract",
+        "Primary open-angle glaucoma",
+        "Primary angle-closure glaucoma",
+        "Pterygium",
+        "Nasolacrimal duct obstruction",
+        "Chalazion",
+        "Hordeolum",
+        "Endophthalmitis",
+        "Globe rupture",
+        "Eyelid laceration",
+        "Conjunctival laceration",
+        "Canalicular laceration",
+        "Ptosis",
+        "Dermatochalasis",
+        "Entropion",
+        "Ectropion",
+        "Corneal ulcer",
+        "Complicated corneal abrasion",
+        "Traumatic hyphema",
+        "Rhegmatogenous retinal detachment",
+        "Epiretinal membrane",
+        "Macular hole",
+        "Diabetic vitreous hemorrhage",
+        "Proliferative diabetic retinopathy (surgical)",
+        "Thyroid eye disease (surgical)",
+        "Orbital tumor",
+        "Chronic dacryocystitis",
+        "Trichiasis",
+        "Symblepharon",
+        "Severe dry eye with punctal stenosis",
+        "Corneal dystrophy (keratoplasty)",
+        "Keratoconus (CXL/keratoplasty)",
+        "Traumatic cataract",
+        "Pseudophakic bullous keratopathy",
+        "Iris coloboma (repair)",
+        "Dislocated intraocular lens",
+        "Angle-recession glaucoma",
+        "Neovascular glaucoma",
+        "Uveitic cataract",
+        "Pediatric cataract",
+        "Congenital nasolacrimal duct obstruction",
+        "Congenital ptosis",
+        "Orbital cellulitis (surgical drainage)",
+        "Canalicular stenosis",
+        "Eyelid tumor",
+        "Orbital dermoid cyst",
+        "Retinal detachment with PVR",
+        "Macular pucker",
+        "Ocular surface squamous neoplasia",
+        "Chemical ocular injury (surgical care)",
+    ],
+    "Maxillofacial": [
+        "Nasal bone fracture",
+        "Mandibular fracture",
+        "Le Fort fracture",
+        "Zygomaticomaxillary complex fracture",
+        "Orbital floor fracture",
+        "Panfacial fracture",
+        "Post-traumatic malocclusion",
+        "Facial laceration",
+        "Facial soft-tissue loss",
+        "Odontogenic cyst",
+        "Impacted third molar",
+        "Odontogenic tumor",
+        "Oral cavity cancer",
+        "Leukoplakia with dysplasia",
+        "Mandibular osteomyelitis",
+        "TMJ ankylosis",
+        "TMJ internal derangement (surgical)",
+        "Maxillary sinusitis of dental origin (surgical)",
+        "Sialolithiasis",
+        "Chronic sialadenitis",
+        "Post-traumatic facial deformity",
+        "Nonunion mandibular fracture",
+        "Malunion facial fracture",
+        "Oroantral fistula",
+        "Oronasal fistula",
+        "Trismus due to fibrosis",
+        "Oral mucosal fibroma",
+        "Mucocele of minor salivary gland",
+        "Ranula",
+        "Cleft alveolus (secondary)",
+        "Alveolar ridge deficiency",
+        "Mandibular defect after tumor resection",
+        "Zygomatic arch fracture",
+        "Frontal sinus fracture (anterior table)",
+        "Orbital wall defect (post-trauma)",
+        "Condylar process fracture",
+        "Coronoid impingement",
+        "Inferior alveolar/lingual nerve injury",
+        "Parotid duct injury/stone",
+        "Submandibular space infection",
+        "Ludwig angina (surgical drainage)",
+        "Hemifacial atrophy (reconstruction)",
+        "Perioral scar contracture",
+        "Upper lip oncologic defect",
+        "Mandibular prognathism/retrognathism",
+        "Maxillary hypoplasia",
+        "Failed dental implant (removal/revision)",
+        "Peri-implantitis (surgical)",
+        "Osteoradionecrosis of jaw",
+        "Facial nerve weakness sequelae (reanimation planning)",
+    ],
+}
+
+_OPERATION_TO_DIAGNOSES: Dict[str, List[str]] = {
+    "Appendectomy": ["Acute appendicitis"],
+    "Laparoscopic Cholecystectomy (LC)": ["Acute cholecystitis", "Choledocholithiasis"],
+    "Open Cholecystectomy (OC)": ["Acute cholecystitis"],
+    "Herniorrhaphy / Hernioplasty": ["Inguinal hernia", "Ventral (incisional) hernia"],
+    "Hemorrhoidectomy": ["Hemorrhoids"],
+    "Low Anterior Resection": ["Rectal cancer"],
+    "Hartmann’s Procedure": ["Perforated diverticulitis", "Obstructing sigmoid cancer"],
+    "Colostomy (Creation/Revision)": ["Obstructive colorectal cancer", "Fistula requiring diversion"],
+    "Ileostomy (Creation/Revision)": ["Ulcerative colitis with complication"],
+    "Small Bowel Resection": ["Small bowel obstruction", "Bowel perforation"],
+    "Percutaneous Drainage (Intra-abdominal)": ["Post-operative intra-abdominal collection"],
+    "Transurethral Resection of the Prostate (TURP)": ["Benign prostatic hyperplasia"],
+    "Transurethral Resection of Bladder Tumor (TURBT)": ["Bladder tumor"],
+    "Percutaneous Nephrolithotomy (PCNL)": ["Kidney stone", "Staghorn calculus"],
+    "Retrograde Intrarenal Surgery (RIRS)": ["Kidney stone"],
+    "Ureteroscopy with Lithotripsy (URSL)": ["Ureteric stone"],
+    "Cesarean Section": ["Cesarean delivery"],
+    "Dilatation and Curettage": ["Incomplete abortion", "Missed abortion"],
+    "Loop Electrosurgical Excision Procedure (LEEP)": ["High-grade cervical intraepithelial neoplasia"],
+    "Myomectomy": ["Uterine fibroids"],
+    "Total Abdominal Hysterectomy": ["Uterine fibroids", "Abnormal uterine bleeding due to fibroids"],
+    "Phacoemulsification with Intraocular Lens": ["Age-related cataract"],
+    "Trabeculectomy": ["Primary open-angle glaucoma", "Primary angle-closure glaucoma"],
+    "Pterygium Excision with Graft": ["Pterygium"],
+    "Open Reduction and Internal Fixation (ORIF)": ["Fracture (site-specific)", "Intertrochanteric femur fracture"],
+    "Total Knee Arthroplasty": ["Knee osteoarthritis"],
+    "Total Hip Replacement": ["Hip osteoarthritis", "Avascular necrosis of femoral head"],
+    "Closed Reduction of Nasal Bone Fracture": ["Nasal bone fracture"],
+    "Open Reduction and Internal Fixation of Facial Fracture": ["Mandibular fracture", "Zygomaticomaxillary complex fracture"],
 }
 
 
-def _pack_list_from_sheet(rows: List[List[str]]) -> List[str]:
-    if not rows:
-        return []
+# ---------------------------------------------------------------------------
+# Helper utilities
+# ---------------------------------------------------------------------------
 
-    header = [cell.lower() for cell in rows[0]]
-
-    def _col(names: List[str]) -> int:
-        for name in names:
-            if name in header:
-                return header.index(name)
-        return -1
-
-    code_idx = _col(["code", "codeplain", "icd-10", "icd10", "icd9", "รหัส", "code "])
-    term_idx = _col([
-        "term",
-        "long description (valid icd-9 fy2025)",
-        "long description",
-        "รายละเอียด",
-        "name",
-    ])
-
-    start_row = 1 if code_idx != -1 or term_idx != -1 else 0
-    packed: List[str] = []
-
-    for row in rows[start_row:]:
-        if not row:
-            continue
-        code = row[code_idx].strip() if 0 <= code_idx < len(row) else ""
-        desc = row[term_idx].strip() if 0 <= term_idx < len(row) else ""
-        if code and desc:
-            packed.append(f"{code} - {desc}")
-        elif desc:
-            packed.append(desc)
-        elif code:
-            packed.append(code)
-
-    unique: List[str] = []
-    seen: Set[str] = set()
-    for item in packed:
-        if item and item not in seen:
-            seen.add(item)
-            unique.append(item)
-    return unique
-
-
-def load_specialty_catalog(specialty: str) -> Tuple[List[str], List[str]]:
-    if os.getenv("USE_SPECIALTY_CATALOG", "0").strip() != "1":
-        return [], []
-
-    catalog_path = _resolve_portable_path(
-        "SPECIALTY_CATALOG_PATH", default_rel="ICD9_ICD10_by_Specialty.xlsx"
-    )
-    sheets = _SPECIALTY_SHEETS.get(specialty)
-    if not sheets or not catalog_path.exists():
-        return [], []
-
-    icd10_sheet, icd9_sheet = sheets
-    icd10_rows = _xlsx_rows(catalog_path, icd10_sheet)
-    icd9_rows = _xlsx_rows(catalog_path, icd9_sheet)
-    return _pack_list_from_sheet(icd10_rows), _pack_list_from_sheet(icd9_rows)
+_SPECIALTY_ALIASES: Dict[str, str] = {
+    "surgery": "Surgery",
+    "orthopedics": "Orthopedics",
+    "orthopaedics": "Orthopedics",
+    "urology": "Urology",
+    "ent": "ENT",
+    "otolaryngology": "ENT",
+    "obgyn": "OBGYN",
+    "obstetrics-gynecology": "OBGYN",
+    "obstetrics & gynecology": "OBGYN",
+    "ophthalmology": "Ophthalmology",
+    "maxillofacial": "Maxillofacial",
+    "oral and maxillofacial": "Maxillofacial",
+}
 
 
 def _normalize_specialty(key: str) -> str:
-    return (key or "Surgery").strip().title()
-
-
-@lru_cache(maxsize=None)
-def all_operations() -> List[str]:
-    ops: Set[str] = set()
-    for values in _SPECIALTY_OPERATIONS.values():
-        ops.update(values)
-    return sorted(ops)
-
-
-ALL_OPERATIONS: List[str] = all_operations()
+    candidate = (key or "Surgery").strip()
+    direct = _SPECIALTY_ALIASES.get(candidate.lower())
+    if direct:
+        return direct
+    # Already stored using canonical names above
+    return candidate if candidate in _SPECIALTY_OPERATIONS else "Surgery"
 
 
 def operation_suggestions(specialty_key: str) -> List[str]:
@@ -329,7 +879,9 @@ def operation_suggestions(specialty_key: str) -> List[str]:
     return list(ALL_OPERATIONS)
 
 
-def diagnosis_suggestions(specialty_key: str, operations: Sequence[str] | None = None) -> List[str]:
+def diagnosis_suggestions(
+    specialty_key: str, operations: Sequence[str] | None = None
+) -> List[str]:
     key = _normalize_specialty(specialty_key)
     suggestions: Set[str] = set(_SPECIALTY_DIAGNOSES.get(key, []))
     for op in operations or []:
@@ -337,178 +889,21 @@ def diagnosis_suggestions(specialty_key: str, operations: Sequence[str] | None =
     return sorted(suggestions)
 
 
-# ---------------------------------------------------------------------------
-# Excel loader for ICD-10-TM
-# ---------------------------------------------------------------------------
-
-def load_icd10tm_xlsx(xlsx_path: str) -> List[str]:
-    """Load ICD-10-TM entries from the given Excel file.
-
-    Returns a list of strings formatted as ``"CODE - Description"``.
-    When :mod:`openpyxl` is missing or the file cannot be read, an empty
-    list is returned so the caller can fall back to the in-memory catalog.
-    """
-
-    try:
-        import openpyxl  # type: ignore
-    except Exception:
-        return []
-
-    path = Path(xlsx_path)
-    if not path.exists():
-        return []
-
-    try:
-        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        sheet = workbook.active
-        results: List[str] = []
-        for row in sheet.iter_rows(min_row=1, values_only=True):
-            if not row:
-                continue
-            values = [str(cell).strip() for cell in row if cell is not None]
-            if not values:
-                continue
-
-            code = ""
-            label = ""
-            for value in values:
-                if not code:
-                    code = value
-                    continue
-                if not label:
-                    label = value
-                    break
-
-            if not code or not label:
-                continue
-
-            lower_code = code.lower()
-            lower_label = label.lower()
-            if lower_code in {
-                "code",
-                "icd",
-                "icd10",
-                "icd-10",
-                "icd10tm",
-                "รหัส",
-                "codeid",
-                "diag",
-                "diagnosis",
-                "ชื่อโรค",
-                "รายละเอียด",
-            }:
-                continue
-            if lower_label in {
-                "code",
-                "icd",
-                "icd10",
-                "icd-10",
-                "icd10tm",
-                "รหัส",
-                "codeid",
-                "diag",
-                "diagnosis",
-                "ชื่อโรค",
-                "รายละเอียด",
-            }:
-                continue
-
-            results.append(f"{code} - {label}")
-
-        return sorted({item for item in results if item}, key=str.lower)
-    except Exception:
-        return []
+ALL_OPERATIONS: List[str] = sorted({item for values in _SPECIALTY_OPERATIONS.values() for item in values})
 
 
 # ---------------------------------------------------------------------------
-# Excel loader for ICD-9 operations (valid + excluded)
+# Compatibility stubs (Excel loaders no longer used)
 # ---------------------------------------------------------------------------
 
-
-def _read_xlsx_rows_icd9(xlsx_path: str):
-    """Yield trimmed string rows from an Excel worksheet used for ICD-9 lists."""
-
-    try:  # pragma: no cover - optional dependency
-        import openpyxl  # type: ignore
-    except Exception:
-        return []
-
-    path = Path(xlsx_path)
-    if not path.exists():
-        return []
-
-    try:
-        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        sheet = workbook.active
-        for row in sheet.iter_rows(min_row=1, values_only=True):
-            if not row:
-                continue
-            yield [str(cell).strip() for cell in row if cell is not None]
-    except Exception:
-        return []
+def load_specialty_catalog(_specialty: str) -> Tuple[List[str], List[str]]:
+    return [], []
 
 
-def load_icd9_ops(valid_path: str, exclude_path: str) -> List[str]:
-    """Load ICD-9 operations from Excel workbooks.
-
-    ``valid_path`` should point to the workbook that contains the canonical
-    operation list, while ``exclude_path`` lists codes that must be removed.
-    Returned values follow the ``"CODE - Description"`` format and are sorted
-    by the normalized code for a consistent experience.
-    """
-
-    excluded: Set[str] = set()
-    for values in _read_xlsx_rows_icd9(exclude_path):
-        if not values:
-            continue
-        code = values[0].split()[0] if values else ""
-        normalized = code.replace(".", "").strip().upper()
-        if not normalized:
-            continue
-        if normalized in {"CODE", "ICD9", "ICD-9", "รหัส"}:
-            continue
-        excluded.add(normalized)
-
-    items: Dict[str, str] = {}
-    for values in _read_xlsx_rows_icd9(valid_path):
-        if not values:
-            continue
-        raw_code = (values[0] if len(values) >= 1 else "").strip()
-        raw_desc = (values[1] if len(values) >= 2 else "").strip()
-        if not raw_code or not raw_desc:
-            continue
-
-        lowered = raw_code.lower()
-        if lowered in {"code", "icd9", "icd-9", "operation", "รหัส", "หัตถการ"}:
-            continue
-
-        key = raw_code.replace(".", "").strip().upper()
-        if key in excluded:
-            continue
-
-        items[key] = f"{raw_code} - {raw_desc}"
-
-    return [items[idx] for idx in sorted(items.keys())]
+def load_icd10tm_xlsx(_xlsx_path: str) -> List[str]:
+    return []
 
 
-def _merge_icd9_from_env_into_all_operations() -> None:
-    """Append ICD-9 operations from environment-provided workbooks."""
+def load_icd9_ops(_valid_path: str, _exclude_path: str) -> List[str]:
+    return []
 
-    valid_path = os.getenv("ICD9_VALID_XLSX_PATH", "")
-    exclude_path = os.getenv("ICD9_EXCLUDED_XLSX_PATH", "")
-    if not valid_path or not exclude_path:
-        return
-
-    try:
-        extra_ops = load_icd9_ops(valid_path, exclude_path)
-    except Exception:
-        extra_ops = []
-
-    if not extra_ops:
-        return
-
-    merged: List[str] = list(dict.fromkeys(ALL_OPERATIONS + extra_ops))
-    globals()["ALL_OPERATIONS"] = merged
-
-
-_merge_icd9_from_env_into_all_operations()
