@@ -2550,12 +2550,16 @@ class SearchSelectAdder(QtWidgets.QWidget):
         self.list.setStyleSheet("QListWidget{ border:1px dashed #e6eaf2; border-radius:12px; background:#fff; }")
         v.addWidget(self.list)
 
+        self._completer: Optional[QtWidgets.QCompleter] = None
+
         self.set_suggestions(suggestions or [])
+
+        if self.search_line:
+            self.search_line.returnPressed.connect(self._add_current)
 
         self.btn_add.clicked.connect(self._add_current)
         self.btn_persist.clicked.connect(self._persist_current)
-        if self.search_line:
-            self.search_line.returnPressed.connect(self._add_current)
+        self.combo.activated.connect(self._on_combo_activated)
 
         self.list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._ctx_menu)
@@ -2575,13 +2579,25 @@ class SearchSelectAdder(QtWidgets.QWidget):
             self.list.clear()
         self._emit_items_changed()
 
-    def _add_current(self):
-        text = self.combo.currentText().strip()
-        if text and text.lower() not in [self.list.item(i).text().lower() for i in range(self.list.count())]:
+    def _on_combo_activated(self, index: int):
+        text = (self.combo.itemText(index) or "").strip()
+        self._add_text(text)
+
+    def _on_completer_activated(self, text: str):
+        self._add_text((text or "").strip())
+
+    def _add_text(self, text: str):
+        if not text:
+            return
+        current_lower = [self.list.item(i).text().lower().strip() for i in range(self.list.count())]
+        if text.lower().strip() not in current_lower:
             self.list.addItem(text)
         self.combo.setCurrentIndex(0)
         self.combo.setEditText("")
         self._emit_items_changed()
+
+    def _add_current(self):
+        self._add_text(self.combo.currentText().strip())
 
     def _persist_current(self):
         text = self.combo.currentText().strip()
@@ -2606,21 +2622,35 @@ class SearchSelectAdder(QtWidgets.QWidget):
                 continue
             seen.add(val)
             options.append(val)
+
         current_text = self.search_line.text() if self.search_line else ""
+
         self.combo.blockSignals(True)
         self.combo.clear()
         self.combo.addItem("")
         self.combo.addItems(options)
         self.combo.blockSignals(False)
+
         if self.search_line is not None:
             self.search_line.blockSignals(True)
             self.search_line.setText(current_text)
             self.search_line.setCursorPosition(len(current_text))
             self.search_line.blockSignals(False)
-        comp = QtWidgets.QCompleter(options)
-        comp.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
-        comp.setFilterMode(QtCore.Qt.MatchContains)
-        self.combo.setCompleter(comp)
+
+        completer = QtWidgets.QCompleter(options)
+        completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        completer.setFilterMode(QtCore.Qt.MatchContains)
+
+        if self._completer is not None:
+            try:
+                self._completer.activated.disconnect(self._on_completer_activated)
+            except Exception:
+                pass
+
+        self._completer = completer
+        self._completer.activated.connect(self._on_completer_activated)
+        self.combo.setCompleter(self._completer)
+
         # ปิดการเลื่อนด้วยล้อเมาส์บนคอมโบ (กันเปลี่ยนค่าเวลาเลื่อนหน้า)
         self.combo.setFocusPolicy(QtCore.Qt.StrongFocus)
 
