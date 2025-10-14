@@ -474,11 +474,20 @@ class SweetAlert:
         QtWidgets.QMessageBox.information(parent, title, text)
 
     @staticmethod
-    def success(parent: QtWidgets.QWidget, title: str, text: str) -> None:
+    def success(
+        parent: QtWidgets.QWidget,
+        title: str,
+        text: str,
+        auto_close_msec: Optional[int] = None,
+    ) -> None:
         box = QtWidgets.QMessageBox(parent)
         box.setIcon(QtWidgets.QMessageBox.Information)
         box.setWindowTitle(title)
         box.setText(f"✅ {text}")
+        box.setStandardButtons(QtWidgets.QMessageBox.Ok)
+        box.setDefaultButton(QtWidgets.QMessageBox.Ok)
+        if auto_close_msec and auto_close_msec > 0:
+            QtCore.QTimer.singleShot(auto_close_msec, box.accept)
         box.exec()
 
     @staticmethod
@@ -988,6 +997,91 @@ class QueueSelectWidget(QtWidgets.QWidget):
     def _emit_changed(self, _i): self.changed.emit(int(self.combo.currentData() or 0))
     def value(self)->int: return int(self.combo.currentData() or 0)
 
+
+# --------------------------- Fixed Excel import helpers ---------------------------
+FIXED_MAPPING_TH = {
+    "time": "สั่งผ่าตัดเวลา",
+    "hn": "HN",
+    "name": "ชื่อ",
+    "age": "อายุ",
+    "diags": "ICD Name",
+    "ops": "ชื่อการผ่าตัด",
+    "doctor": "แพทย์ผู้สั่ง",
+    "ward": "Ward",
+}
+
+_time_re = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*$")
+_year_re = re.compile(r"(\d+)\s*ปี")
+
+
+def parse_time_hhmm(txt: str) -> str:
+    """รับ '13:30' หรือ ' 13:30 ' -> '13:30'. ถ้าไม่ตรงฟอร์แมตให้คืน '' """
+    if not txt:
+        return ""
+    m = _time_re.match(str(txt))
+    if not m:
+        return ""
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    if 0 <= hh <= 23 and 0 <= mm <= 59:
+        return f"{hh:02d}:{mm:02d}"
+    return ""
+
+
+def parse_age_years(txt: str) -> int:
+    """ดึงเฉพาะจำนวน 'ปี' เช่น '23 ปี 4 เดือน 30 วัน' -> 23; '23' -> 23; อื่นๆ -> 0"""
+    if not txt:
+        return 0
+    s = str(txt)
+    m = _year_re.search(s)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return 0
+    try:
+        return int(float(s))
+    except Exception:
+        return 0
+
+
+def normalize_doctor(txt: str) -> str:
+    """คงคำนำหน้าแพทย์ไว้ เช่น 'ทพญ.' / 'นพ.' ถ้ามีช่องว่างซ้อนให้เกลาให้เรียบ"""
+    return " ".join(str(txt or "").split())
+
+
+def map_to_known_ward(src: str, known_wards: List[str]) -> str:
+    """
+    จับคู่ชื่อวอร์ดให้ตรงกับรายการที่แอปมีอยู่แล้ว
+    กลไก: เทียบแบบ case-insensitive + ตัดช่องว่างเกิน + หา 'คีย์เวิร์ดหลัก'
+    คุณสามารถปรับ synonyms ได้ตามชื่อในระบบจริง
+    """
+
+    s = " ".join((src or "").lower().split())
+    synonyms = {
+        "หูคอจมูก": ["หู คอ จมูก", "ent", "โสตศอนาสิก"],
+    }
+
+    for w in known_wards:
+        if s == " ".join(w.lower().split()):
+            return w
+
+    for canonical, words in synonyms.items():
+        for kw in words:
+            if kw.replace(" ", "") in s.replace(" ", ""):
+                for w in known_wards:
+                    if canonical.replace(" ", "") in w.replace(" ", "").lower():
+                        return w
+                return src
+
+    for w in known_wards:
+        lowered = w.lower()
+        if any(token and token in s for token in lowered.split()):
+            return w
+
+    return src
+
+
 class Main(QtWidgets.QWidget):
     def __init__(self, host, port, token):
         super().__init__()
@@ -1309,6 +1403,17 @@ class Main(QtWidgets.QWidget):
         self.tree2.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.tree2.customContextMenuRequested.connect(self._result_ctx_menu)
         gr2.addWidget(self.tree2,0,0,1,1)
+
+        import_bar = QtWidgets.QHBoxLayout()
+        import_bar.setContentsMargins(0, 6, 0, 0)
+        import_bar.setSpacing(10)
+        self.btn_import_excel = QtWidgets.QPushButton("📥 นำเข้าจาก Excel")
+        self.btn_import_excel.setProperty("variant", "ghost")
+        import_bar.addWidget(self.btn_import_excel, 0)
+        import_bar.addStretch(1)
+        gr2.addLayout(import_bar,1,0,1,1)
+        gr2.setRowStretch(0, 1)
+        gr2.setRowStretch(1, 0)
         t2.addWidget(self.card_result, 1)
         self.tabs.addTab(tab2, "Result Schedule")
 
@@ -1359,6 +1464,7 @@ class Main(QtWidgets.QWidget):
         self.btn_refresh.clicked.connect(lambda: self._refresh(True))
         self.btn_export.clicked.connect(self._export_csv)
         self.btn_export_deid.clicked.connect(self._export_deid_csv)
+        self.btn_import_excel.clicked.connect(self._on_import_excel)
         self.btn_manage_or.clicked.connect(self._manage_or)
         self.cb_dept.currentTextChanged.connect(self._on_dept_changed)
         self.btn_add.clicked.connect(self._on_add_or_update)
@@ -1571,6 +1677,222 @@ class Main(QtWidgets.QWidget):
         def save():
             rooms=[lst.item(i).text() for i in range(lst.count())]; self.sched.set_or_rooms(rooms); self._refresh_or_cb(self.cb_or); dlg.accept()
         ok.clicked.connect(save); dlg.exec()
+
+    def _on_import_excel(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "เลือกไฟล์นำเข้าตารางผ่าตัด",
+            str(Path.home()),
+            "Excel/CSV (*.xlsx *.xlsm *.xls *.csv)"
+        )
+        if not path:
+            return
+
+        loader = SweetAlert.loading(self, "กำลังอ่านไฟล์นำเข้า...")
+        loader.setLabelText("กำลังอ่านไฟล์นำเข้า...")
+        loader.show()
+        QtWidgets.QApplication.processEvents()
+
+        error_title: Optional[str] = None
+        error_message: Optional[str] = None
+        empty_rows = False
+        ok = 0
+        skipped: List[Tuple[str, str]] = []
+
+        try:
+            rows = self._load_fixed_excel_rows(path)
+            if not rows:
+                empty_rows = True
+            else:
+                loader.setLabelText("กำลังนำเข้าข้อมูลเข้าสู่ตาราง...")
+                QtWidgets.QApplication.processEvents()
+                ok, skipped = self._import_from_fixed_excel_rows(rows)
+        except ImportError as exc:
+            error_title = "นำเข้าไม่ได้"
+            error_message = str(exc)
+        except Exception as exc:
+            error_title = "นำเข้าล้มเหลว"
+            error_message = str(exc)
+        finally:
+            loader.close()
+
+        if error_message:
+            QtWidgets.QMessageBox.critical(self, error_title or "ผิดพลาด", error_message)
+            return
+
+        if empty_rows:
+            SweetAlert.warning(self, "เตือน", "ไม่พบข้อมูลในไฟล์ที่เลือก")
+            return
+
+        if ok <= 0:
+            SweetAlert.warning(self, "เตือน", "ไม่สามารถนำเข้าแถวใดได้")
+            if skipped:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "รายละเอียดแถวที่ข้าม",
+                    "\n".join([f"HN {hn}: {reason}" for hn, reason in skipped[:20]])
+                    + ("\n… (มีมากกว่านี้)" if len(skipped) > 20 else ""),
+                )
+            return
+
+        msg = f"นำเข้าสำเร็จ {ok} แถว"
+        if skipped:
+            msg += f" • ข้าม {len(skipped)} แถว"
+        SweetAlert.success(self, "สำเร็จ", msg, auto_close_msec=1500)
+
+        if skipped:
+            QtWidgets.QMessageBox.information(
+                self,
+                "รายละเอียดแถวที่ข้าม",
+                "\n".join([f"HN {hn}: {reason}" for hn, reason in skipped[:20]])
+                + ("\n… (มีมากกว่านี้)" if len(skipped) > 20 else ""),
+            )
+
+    def _load_fixed_excel_rows(self, path: str) -> List[dict]:
+        suffix = Path(path).suffix.lower()
+        if suffix in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+            try:
+                from openpyxl import load_workbook  # type: ignore
+            except Exception as exc:  # pragma: no cover - runtime dependency
+                raise ImportError("ต้องติดตั้ง openpyxl เพื่ออ่านไฟล์ Excel") from exc
+
+            wb = load_workbook(path, data_only=True)
+            sheet = wb.active
+            rows_iter = sheet.iter_rows(values_only=True)
+            header = next(rows_iter, None)
+            if not header:
+                return []
+
+            headers = [str(col).strip() if col is not None else "" for col in header]
+            results: List[dict] = []
+            for row in rows_iter:
+                row_dict: Dict[str, object] = {}
+                has_value = False
+                for key, value in zip(headers, row):
+                    if not key:
+                        continue
+                    row_dict[key] = value if value is not None else ""
+                    if not has_value and str(value or "").strip():
+                        has_value = True
+                if row_dict and has_value:
+                    results.append(row_dict)
+            return results
+
+        if suffix == ".csv":
+            results: List[dict] = []
+            with open(path, newline="", encoding="utf-8-sig") as fh:
+                reader = csv.DictReader(fh)
+                if reader.fieldnames is None:
+                    return []
+                for row in reader:
+                    row_dict: Dict[str, object] = {}
+                    has_value = False
+                    for key, value in row.items():
+                        if not key:
+                            continue
+                        key_clean = str(key).strip()
+                        row_dict[key_clean] = value if value is not None else ""
+                        if not has_value and str(value or "").strip():
+                            has_value = True
+                    if row_dict and has_value:
+                        results.append(row_dict)
+            return results
+
+        raise ValueError("รองรับเฉพาะไฟล์ Excel (.xlsx/.xlsm) หรือ CSV")
+
+    def _import_from_fixed_excel_rows(self, rows: List[dict]) -> Tuple[int, List[Tuple[str, str]]]:
+        ok = 0
+        skipped: List[Tuple[str, str]] = []
+
+        known_wards: List[str] = []
+        if hasattr(self, "cb_ward") and isinstance(self.cb_ward, QtWidgets.QComboBox):
+            for i in range(self.cb_ward.count()):
+                text = self.cb_ward.itemText(i).strip()
+                if text:
+                    known_wards.append(text)
+        else:
+            known_wards = [w for w in WARD_LIST if w and w != WARD_PLACEHOLDER]
+
+        qdate = self.date.date() if hasattr(self, "date") else QtCore.QDate.currentDate()
+        if hasattr(qdate, "toPython"):
+            base_date = qdate.toPython()
+        else:  # pragma: no cover - fallback for older Qt bindings
+            base_date = datetime(qdate.year(), qdate.month(), qdate.day()).date()
+
+        default_period = self._update_period_info()
+
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+
+            lookup: Dict[str, object] = {}
+            for key, value in raw.items():
+                key_str = str(key or "").strip()
+                if not key_str:
+                    continue
+                lookup[key_str] = value
+                lookup[key_str.lower()] = value
+
+            def get(field: str) -> str:
+                header = FIXED_MAPPING_TH[field]
+                val = lookup.get(header)
+                if val is None:
+                    val = lookup.get(header.strip())
+                if val is None:
+                    val = lookup.get(header.lower())
+                return str(val or "").strip()
+
+            time_str = parse_time_hhmm(get("time"))
+            hn = get("hn")
+            name = get("name")
+
+            if not (time_str and hn and name):
+                skipped.append((hn or "-", "ต้องมี เวลา, HN, ชื่อ"))
+                continue
+
+            try:
+                hh, mm = [int(x) for x in time_str.split(":", 1)]
+                period_code = _now_period(datetime(base_date.year, base_date.month, base_date.day, hh, mm))
+            except Exception:
+                period_code = default_period
+
+            diag_txt = get("diags")
+            op_txt = get("ops")
+
+            entry = ScheduleEntry(
+                or_room="",
+                dt=base_date,
+                time_str=time_str,
+                hn=hn,
+                name=" ".join(name.split()),
+                age=parse_age_years(get("age")),
+                dept="",
+                doctor=normalize_doctor(get("doctor")),
+                diags=[diag_txt] if diag_txt else [],
+                ops=[op_txt] if op_txt else [],
+                ward=map_to_known_ward(get("ward"), known_wards),
+                case_size="",
+                period=period_code,
+                urgency="Elective",
+                assist1="",
+                assist2="",
+                scrub="",
+                circulate="",
+                time_start="",
+                time_end="",
+            )
+
+            self.sched.add(entry)
+            try:
+                self.db_logger.append_entry(entry)
+            except Exception:
+                pass
+            ok += 1
+
+        self._set_result_title()
+        self._render_tree2()
+
+        return ok, skipped
 
     def _update_period_info(self):
         qd = self.date.date()
