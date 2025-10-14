@@ -2531,6 +2531,7 @@ class SearchSelectAdder(QtWidgets.QWidget):
         self.combo.setEditable(True)
         self.combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
         self.combo.setMinimumWidth(280)
+        self.combo.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.search_line = self.combo.lineEdit()
         if self.search_line:
             self.search_line.setPlaceholderText(placeholder)
@@ -2561,22 +2562,10 @@ class SearchSelectAdder(QtWidgets.QWidget):
         self.btn_add.clicked.connect(self._add_current)
         self.btn_persist.clicked.connect(self._persist_current)
 
-        try:
-            self.combo.activated[int].connect(self._on_combo_activated)
-        except Exception:
-            pass
-        try:
-            self.combo.activated[str].connect(self._on_combo_activated_text)
-        except Exception:
-            pass
-        try:
-            self.combo.highlighted[int].connect(self._on_combo_activated)
-        except Exception:
-            pass
-        try:
-            self.combo.highlighted[str].connect(self._on_combo_activated_text)
-        except Exception:
-            pass
+        self.combo.activated[int].connect(self._on_combo_activated)
+        self.combo.activated[str].connect(self._on_combo_activated_text)
+        self.combo.highlighted[int].connect(self._on_combo_activated)
+        self.combo.highlighted[str].connect(self._on_combo_activated_text)
 
         self.list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._ctx_menu)
