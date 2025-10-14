@@ -1028,21 +1028,60 @@ FIXED_MAPPING_TH = {
     "ward": "Ward",
 }
 
-_time_re = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*$")
+_re_hhmm = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*$")
+_re_hhmmss = re.compile(r"^\s*(\d{1,2}):(\d{2}):(\d{2})\s*$")
+_re_dt_hhmm = re.compile(r".*?(\d{1,2}):(\d{2})(?::\d{2})?\s*$")
 _year_re = re.compile(r"(\d+)\s*ปี")
 
 
-def parse_time_hhmm_or_tf(txt: str) -> str:
-    """รับ '13:30' หรือ ' 13:30 ' -> '13:30'. ถ้าไม่ตรงฟอร์แมตให้คืน 'TF'"""
-    if not txt or not str(txt).strip():
+def _excel_time_to_hhmm(value: float) -> str:
+    try:
+        fraction = float(value)
+    except Exception:
+        return ""
+    if not (0 <= fraction < 1.1):
+        return ""
+    total_seconds = int(round(fraction * 24 * 3600))
+    hours = (total_seconds // 3600) % 24
+    minutes = (total_seconds // 60) % 60
+    return f"{hours:02d}:{minutes:02d}"
+
+
+def parse_time_hhmm_or_tf(raw_value) -> str:
+    """แปลงค่าจาก Excel/ข้อความให้เป็น HH:MM หรือ 'TF' หากไม่ทราบเวลา"""
+    if raw_value is None:
         return "TF"
-    m = _time_re.match(str(txt).strip())
-    if not m:
+
+    if isinstance(raw_value, (int, float)):
+        return _excel_time_to_hhmm(raw_value) or "TF"
+
+    if isinstance(raw_value, datetime):
+        return f"{raw_value.hour:02d}:{raw_value.minute:02d}"
+    if isinstance(raw_value, dtime):
+        return f"{raw_value.hour:02d}:{raw_value.minute:02d}"
+
+    text = str(raw_value).strip()
+    if not text:
         return "TF"
-    hh = int(m.group(1))
-    mm = int(m.group(2))
-    if 0 <= hh <= 23 and 0 <= mm <= 59:
-        return f"{hh:02d}:{mm:02d}"
+
+    match = _re_hhmmss.match(text)
+    if match:
+        hh, mm = int(match.group(1)), int(match.group(2))
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return f"{hh:02d}:{mm:02d}"
+
+    match = _re_hhmm.match(text)
+    if match:
+        hh, mm = int(match.group(1)), int(match.group(2))
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return f"{hh:02d}:{mm:02d}"
+
+    match = _re_dt_hhmm.match(text)
+    if match:
+        hh, mm = int(match.group(1)), int(match.group(2))
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return f"{hh:02d}:{mm:02d}"
+
     return "TF"
 
 
@@ -1110,20 +1149,20 @@ def map_to_known_ward(src: str, known_wards: List[str]) -> str:
 WEEKLY_DOCTOR_OR_PLAN: Dict[int, Dict[str, List[Dict[str, object]]]] = {
     0: {
         "OR1": [
-            {"doctor": "นพ.สุริยา", "when": "ALLDAY", "weeks": [1]},
-            {"doctor": "พญ.รัฐพร", "when": "ALLDAY", "weeks": [2]},
-            {"doctor": "นพ.พิชัย", "when": "ALLDAY", "weeks": [3]},
-            {"doctor": "นพ.ธนวัฒน์", "when": "ALLDAY", "weeks": [4]},
+            {"doctor": "นพ.สุริยา คุณาชน", "when": "ALLDAY", "weeks": [1]},
+            {"doctor": "พญ.รัฐพร ตั้งเพียร", "when": "ALLDAY", "weeks": [2]},
+            {"doctor": "พญ.พิชัย สุวัฒนพูนลาภ", "when": "ALLDAY", "weeks": [3]},
+            {"doctor": "นพ.ธนวัฒน์ พันธุ์พรหม", "when": "ALLDAY", "weeks": [4]},
         ],
         "OR2": [],
-        "OR3": [{"doctor": "พญ.พิริยา", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR3": [{"doctor": "พญ.พิรุณยา แสนวันดี", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
         "OR5": [{"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
         "OR6": [{"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
         "OR8": [{"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
     },
     1: {
-        "OR1": [{"doctor": "พญ.สายฝน", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR2": [{"doctor": "นพ.ชัชพล", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR1": [{"doctor": "พญ.สายฝน บรรณจิตร์", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR2": [{"doctor": "นพ.ชัชพล องค์โฆษิต", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
         "OR3": [
             {"doctor": "SUR_ANY", "when": "AM", "weeks": [1, 2, 3, 4]},
             {"doctor": "MAXILO_ANY", "when": "PM", "weeks": [1, 2, 3, 4]},
@@ -1133,33 +1172,33 @@ WEEKLY_DOCTOR_OR_PLAN: Dict[int, Dict[str, List[Dict[str, object]]]] = {
         "OR8": [{"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
     },
     2: {
-        "OR1": [{"doctor": "นพ.สุริยา", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR2": [{"doctor": "นพ.วิษณุ", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR1": [{"doctor": "นพ.สุริยา คุณาชน", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR2": [{"doctor": "นพ.วิษณุ ผูกพันธ์", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
         "OR3": [{"doctor": "CLOSE", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
         "OR5": [{"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
         "OR6": [{"doctor": "SUR_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
         "OR8": [{"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
     },
     3: {
-        "OR1": [{"doctor": "พญ.สายฝน", "when": "AM", "weeks": [1, 2, 3, 4]}],
+        "OR1": [{"doctor": "พญ.สายฝน บรรณจิตร์", "when": "AM", "weeks": [1, 2, 3, 4]}],
         "OR2": [
-            {"doctor": "นพ.ชัชพล", "when": "PM", "weeks": [1]},
-            {"doctor": "นพ.ณัฐพงศ์", "when": "PM", "weeks": [2]},
-            {"doctor": "นพ.วิษณุ", "when": "PM", "weeks": [3]},
-            {"doctor": "นพ.กฤษฎา", "when": "PM", "weeks": [4]},
+            {"doctor": "นพ.ชัชพล องค์โฆษิต", "when": "PM", "weeks": [1]},
+            {"doctor": "นพ.ณัฐพงศ์ ศรีโพนทอง", "when": "PM", "weeks": [2]},
+            {"doctor": "นพ.วิษณุ ผูกพันธ์", "when": "PM", "weeks": [3]},
+            {"doctor": "นพ.กฤษฎา อิ้งอำพร", "when": "PM", "weeks": [4]},
         ],
         "OR3": [
             {"doctor": "SUR_ANY", "when": "AM", "weeks": [1, 2, 3, 4]},
             {"doctor": "MAXILO_ANY", "when": "PM", "weeks": [1, 2, 3, 4]},
         ],
         "OR5": [{"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR6": [{"doctor": "นพ.ธนวัฒน์", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR6": [{"doctor": "นพ.ธนวัฒน์ พันธุ์พรหม", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
         "OR8": [{"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
     },
     4: {
-        "OR1": [{"doctor": "พญ.สุภาภรณ์", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR1": [{"doctor": "พญ.สุภาภรณ์ พิณพาทย์", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
         "OR2": [{"doctor": "ORTHO_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR3": [{"doctor": "พญ.สุทธิพร", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR3": [{"doctor": "พญ.สุทธิพร หมวดไธสง", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
         "OR5": [{"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
         "OR6": [{"doctor": "CLOSE", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
         "OR8": [{"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
@@ -1226,6 +1265,19 @@ GROUPS: Dict[str, List[str]] = {
 DOCTOR_ALIASES: Dict[str, str] = {
     # ยกตัวอย่างสะกด/วรรคต่างกัน/พิมพ์ผิดที่เจอบ่อย
     "นพ.สุริยะ คุณาชน": "นพ.สุริยา คุณาชน",
+    "นพ.สุริยา": "นพ.สุริยา คุณาชน",
+    "นพ.ธนวัฒน์": "นพ.ธนวัฒน์ พันธุ์พรหม",
+    "พญ.รัฐพร": "พญ.รัฐพร ตั้งเพียร",
+    "พญ.พิชัย": "พญ.พิชัย สุวัฒนพูนลาภ",
+    "พญ.พิริยา": "พญ.พิรุณยา แสนวันดี",
+    "พญ.พิรุณยา": "พญ.พิรุณยา แสนวันดี",
+    "พญ.สายฝน": "พญ.สายฝน บรรณจิตร์",
+    "นพ.ชัชพล": "นพ.ชัชพล องค์โฆษิต",
+    "นพ.ณัฐพงศ์": "นพ.ณัฐพงศ์ ศรีโพนทอง",
+    "นพ.วิษณุ": "นพ.วิษณุ ผูกพันธ์",
+    "นพ.กฤษฎา": "นพ.กฤษฎา อิ้งอำพร",
+    "พญ.สุภาภรณ์": "พญ.สุภาภรณ์ พิณพาทย์",
+    "พญ.สุทธิพร": "พญ.สุทธิพร หมวดไธสง",
     "พญ.สุภาภรณ์ พิณพาท": "พญ.สุภาภรณ์ พิณพาทย์",
     "พญ.พิชัย สุวัฒนพูนลาภ": "พญ.พิชัย สุวัฒนพูนลาภ",
     "นพ.วิษณุ ผูกพัน": "นพ.วิษณุ ผูกพันธ์",
@@ -2187,7 +2239,7 @@ class Main(QtWidgets.QWidget):
             or_room = pick_or_by_doctor(base_date, time_str, doctor)
 
             entry = ScheduleEntry(
-                or_room=or_room,
+                or_room=or_room or "-",
                 dt=base_date,
                 time_str=time_str,
                 hn=hn,
