@@ -1356,6 +1356,12 @@ def normalize_doctor_name(name: str) -> str:
     return DOCTOR_ALIASES.get(s, s)
 
 
+GROUP_MEMBER_LOOKUP: Dict[str, Set[str]] = {
+    token: {normalize_doctor_name(member) for member in members}
+    for token, members in GROUPS.items()
+}
+
+
 def week_of_month(d: date) -> int:
     first = d.replace(day=1)
     return ((d.day + first.weekday() - 1) // 7) + 1
@@ -1373,7 +1379,7 @@ def time_to_period(hhmm_or_tf: str) -> str:
 
 def doctor_in_group(doc: str, token: str) -> bool:
     normalized = normalize_doctor_name(doc)
-    return any(normalize_doctor_name(item) == normalized for item in GROUPS.get(token, []))
+    return normalized in GROUP_MEMBER_LOOKUP.get(token, set())
 
 
 def match_doctor(token_or_name: str, doctor_name: str) -> bool:
@@ -1385,6 +1391,40 @@ def match_doctor(token_or_name: str, doctor_name: str) -> bool:
     if token in GROUPS or token in {"SUR_ANY", "ORTHO_ANY", "ENT_ANY", "EYE_ANY", "MAXILO_ANY", "OBGYN_ANY"}:
         return doctor_in_group(doctor_name, token)
     return normalize_doctor_name(token) == normalize_doctor_name(doctor_name)
+
+
+def doctor_service_token(doctor_name: str) -> str:
+    normalized = normalize_doctor_name(doctor_name)
+    for token, members in GROUP_MEMBER_LOOKUP.items():
+        if normalized in members:
+            return token
+    return ""
+
+
+def _rule_tokens(rule: Dict[str, object]) -> List[str]:
+    doctor_token = rule.get("doctor")
+    if isinstance(doctor_token, list):
+        return [str(tok or "") for tok in doctor_token]
+    return [str(doctor_token or "")]
+
+
+def _rule_matches_service(rule: Dict[str, object], service_token: str) -> bool:
+    if not service_token:
+        return False
+    members = GROUP_MEMBER_LOOKUP.get(service_token, set())
+    if not members and service_token in GROUPS:
+        members = {normalize_doctor_name(name) for name in GROUPS.get(service_token, [])}
+
+    for token in _rule_tokens(rule):
+        if not token or token in CLOSED_TOKENS:
+            continue
+        if token == service_token:
+            return True
+        if token in GROUP_MEMBER_LOOKUP and token == service_token:
+            return True
+        if normalize_doctor_name(token) in members:
+            return True
+    return False
 
 
 def _describe_doctor_token(token: str) -> str:
@@ -1492,8 +1532,25 @@ def pick_or_by_doctor(case_date: date, time_str: str, doctor_name: str) -> str:
         doctors = doctor_token if isinstance(doctor_token, list) else [doctor_token]
         if any(tok in CLOSED_TOKENS for tok in doctors):
             continue
-        if any(match_doctor(doc, doctor_name) for doc in doctors):
+        # ตรงชื่อแพทย์แบบเฉพาะเจาะจงเท่านั้น (ไม่จับคู่ token ระดับแผนก)
+        explicit_tokens = [tok for tok in doctors if tok not in GROUPS]
+        if not explicit_tokens:
+            continue
+        if any(match_doctor(doc, doctor_name) for doc in explicit_tokens):
             return or_room
+
+    service_token = doctor_service_token(doctor_name)
+    if service_token:
+        for or_room, rule in iter_rules():
+            weeks = rule.get("weeks", [1, 2, 3, 4, 5])
+            when = (rule.get("when") or "ALLDAY").upper()
+            if current_week in weeks and (when == "ALLDAY" or period == "ANY" or period == when):
+                if _rule_matches_service(rule, service_token):
+                    return or_room
+
+        for or_room, rule in iter_rules():
+            if _rule_matches_service(rule, service_token):
+                return or_room
 
     return ""
 
@@ -3009,9 +3066,15 @@ class Main(QtWidgets.QWidget):
                 for idx, entry in rows_sorted:
                     diag_txt = " with ".join(entry.diags) if entry.diags else "-"
                     op_txt = " with ".join(entry.ops) if entry.ops else "-"
+                    or_label = entry.or_room or "-"
+                    time_label = entry.time if entry.time else "-"
+                    if time_label == "-":
+                        or_time_text = or_label
+                    else:
+                        or_time_text = f"{or_label} • {time_label}"
                     row = QtWidgets.QTreeWidgetItem([
                         _period_label(entry.period),
-                        entry.time or "-",
+                        or_time_text,
                         entry.hn,
                         entry.name or "-",
                         str(entry.age or 0),
