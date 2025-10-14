@@ -1032,18 +1032,18 @@ _time_re = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*$")
 _year_re = re.compile(r"(\d+)\s*ปี")
 
 
-def parse_time_hhmm(txt: str) -> str:
-    """รับ '13:30' หรือ ' 13:30 ' -> '13:30'. ถ้าไม่ตรงฟอร์แมตให้คืน '' """
-    if not txt:
-        return ""
-    m = _time_re.match(str(txt))
+def parse_time_hhmm_or_tf(txt: str) -> str:
+    """รับ '13:30' หรือ ' 13:30 ' -> '13:30'. ถ้าไม่ตรงฟอร์แมตให้คืน 'TF'"""
+    if not txt or not str(txt).strip():
+        return "TF"
+    m = _time_re.match(str(txt).strip())
     if not m:
-        return ""
+        return "TF"
     hh = int(m.group(1))
     mm = int(m.group(2))
     if 0 <= hh <= 23 and 0 <= mm <= 59:
         return f"{hh:02d}:{mm:02d}"
-    return ""
+    return "TF"
 
 
 def parse_age_years(txt: str) -> int:
@@ -1064,8 +1064,8 @@ def parse_age_years(txt: str) -> int:
 
 
 def normalize_doctor(txt: str) -> str:
-    """คงคำนำหน้าแพทย์ไว้ เช่น 'ทพญ.' / 'นพ.' ถ้ามีช่องว่างซ้อนให้เกลาให้เรียบ"""
-    return " ".join(str(txt or "").split())
+    """คงคำนำหน้าและจัดการ alias ชื่อแพทย์ให้สะอาด"""
+    return normalize_doctor_name(txt)
 
 
 def map_to_known_ward(src: str, known_wards: List[str]) -> str:
@@ -1100,149 +1100,171 @@ def map_to_known_ward(src: str, known_wards: List[str]) -> str:
     return src
 
 
-# ====== Service detection & OR plan helpers ======
-SERVICE: Dict[str, str] = {
-    "SUR": "ศัลยกรรมทั่วไป",
-    "ORTHO": "ศัลยกรรมกระดูก",
-    "ENT": "โสต ศอ นาสิก (หูคอจมูก)",
-    "URO": "ศัลยกรรมระบบปัสสาวะ",
-    "OBGYN": "สูติ-นรีเวช",
-    "EYE": "จักษุ",
-    "MAXILO": "ศัลยกรรมช่องปาก/แมกซิลโลฯ",
-    "CLOSE": "ปิดห้อง",
-}
-
-SERVICE_ALIASES: Dict[str, List[str]] = {
-    "SUR": ["sur", "ศัลยกรรม", "ศัลยกรรมทั่วไป", "general surgery"],
-    "ORTHO": ["ortho", "ศัลยกรรมกระดูก", "ออร์โธ"],
-    "ENT": ["ent", "หูคอจมูก", "โสตศอนาสิก", "โสต ศอ นาสิก"],
-    "URO": ["uro", "ระบบทางเดินปัสสาวะ", "ยูโร"],
-    "OBGYN": ["obgyn", "สูติ-นรีเวช", "สูติ", "นรีเวช"],
-    "EYE": ["eye", "จักษุ", "ตา", "ophthalmology"],
-    "MAXILO": ["maxilo", "แมกซิลโล", "ช่องปาก", "omfs", "ศัลยกรรมช่องปาก"],
-}
-
-
-def detect_service_from_text(txt: str) -> str:
-    s = (txt or "").strip().lower().replace(" ", "")
-    if not s:
-        return ""
-    for key, words in SERVICE_ALIASES.items():
-        for word in words:
-            if word.replace(" ", "") in s:
-                return key
-    return ""
-
-
-WEEKLY_OR_PLAN: Dict[int, Dict[str, object]] = {
+# ================== CONFIG: ตารางแพทย์ประจำ OR ==================
+# ฟอร์แมต:
+# WEEKLY_DOCTOR_OR_PLAN[weekday]["ORx"] = [
+#   {"doctor": "ชื่อแพทย์", "when": "ALLDAY|AM|PM", "weeks": [1,2,3,4]},
+#   {"doctor": ["ดร.ก", "ดร.ข"], ...}
+# ]
+# หมายเหตุ: Monday=0 ... Sunday=6
+WEEKLY_DOCTOR_OR_PLAN: Dict[int, Dict[str, List[Dict[str, object]]]] = {
     0: {
-        "OR1": "SUR",
-        "OR2": "ORTHO",
-        "OR3": "ENT",
-        "OR5": "OBGYN",
-        "OR6": "OBGYN",
-        "OR8": "EYE",
+        "OR1": [
+            {"doctor": "นพ.สุริยา", "when": "ALLDAY", "weeks": [1]},
+            {"doctor": "พญ.รัฐพร", "when": "ALLDAY", "weeks": [2]},
+            {"doctor": "นพ.พิชัย", "when": "ALLDAY", "weeks": [3]},
+            {"doctor": "นพ.ธนวัฒน์", "when": "ALLDAY", "weeks": [4]},
+        ],
+        "OR2": [],
+        "OR3": [{"doctor": "พญ.พิริยา", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR5": [{"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR6": [{"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR8": [{"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
     },
     1: {
-        "OR1": "URO",
-        "OR2": "ORTHO",
-        "OR3": {"AM": "SUR", "PM": "MAXILO"},
-        "OR5": "OBGYN",
-        "OR6": "SUR",
-        "OR8": "EYE",
+        "OR1": [{"doctor": "พญ.สายฝน", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR2": [{"doctor": "นพ.ชัชพล", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR3": [
+            {"doctor": "SUR_ANY", "when": "AM", "weeks": [1, 2, 3, 4]},
+            {"doctor": "MAXILO_ANY", "when": "PM", "weeks": [1, 2, 3, 4]},
+        ],
+        "OR5": [{"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR6": [{"doctor": "SUR_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR8": [{"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
     },
     2: {
-        "OR1": "SUR",
-        "OR2": "ORTHO",
-        "OR3": "CLOSE",
-        "OR5": "OBGYN",
-        "OR6": "SUR",
-        "OR8": "EYE",
+        "OR1": [{"doctor": "นพ.สุริยา", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR2": [{"doctor": "นพ.วิษณุ", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR3": [{"doctor": "CLOSE", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR5": [{"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR6": [{"doctor": "SUR_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR8": [{"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
     },
     3: {
-        "OR1": "URO",
-        "OR2": "ORTHO",
-        "OR3": {"AM": "SUR", "PM": "MAXILO"},
-        "OR5": "OBGYN",
-        "OR6": "SUR",
-        "OR8": "EYE",
+        "OR1": [{"doctor": "พญ.สายฝน", "when": "AM", "weeks": [1, 2, 3, 4]}],
+        "OR2": [
+            {"doctor": "นพ.ชัชพล", "when": "PM", "weeks": [1]},
+            {"doctor": "นพ.ณัฐพงศ์", "when": "PM", "weeks": [2]},
+            {"doctor": "นพ.วิษณุ", "when": "PM", "weeks": [3]},
+            {"doctor": "นพ.กฤษฎา", "when": "PM", "weeks": [4]},
+        ],
+        "OR3": [
+            {"doctor": "SUR_ANY", "when": "AM", "weeks": [1, 2, 3, 4]},
+            {"doctor": "MAXILO_ANY", "when": "PM", "weeks": [1, 2, 3, 4]},
+        ],
+        "OR5": [{"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR6": [{"doctor": "นพ.ธนวัฒน์", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR8": [{"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
     },
     4: {
-        "OR1": "SUR",
-        "OR2": "ORTHO",
-        "OR3": "ENT",
-        "OR5": "OBGYN",
-        "OR6": "",
-        "OR8": "EYE",
+        "OR1": [{"doctor": "พญ.สุภาภรณ์", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR2": [{"doctor": "ORTHO_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR3": [{"doctor": "พญ.สุทธิพร", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR5": [{"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR6": [{"doctor": "CLOSE", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
+        "OR8": [{"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
     },
 }
 
+GROUPS: Dict[str, List[str]] = {
+    "OBGYN_ANY": ["นพ.สุรัตน์ตล", "พญ.ชัชชนก", "พญ.วิชุตา", "พญ.รุ้งลดา", "พญ.ฐิติมน", "พญ.สุภาภรณ์"],
+    "SUR_ANY": ["นพ.สุริยา", "พญ.รัฐพร", "นพ.พิชัย", "นพ.ธนวัฒน์", "พญ.สุภาภรณ์"],
+    "ORTHO_ANY": ["นพ.ชัชพล", "นพ.วิษณุ", "นพ.ณัฐพงศ์", "นพ.กฤษฎา"],
+    "ENT_ANY": ["พญ.พิริยา", "พญ.สุทธิพร", "นพ.วรวัช"],
+    "EYE_ANY": ["รายชื่อจักษุ"],
+    "MAXILO_ANY": ["ทพญ.อรฌณภา", "ทพ.ฉลองรัฐ"],
+}
 
-def _parse_hhmm_to_minutes(hhmm: str) -> int:
+DOCTOR_ALIASES: Dict[str, str] = {
+    "นพ.สุริยะ": "นพ.สุริยา",
+    "ทพญ.อรุณนภา": "ทพญ.อรฌณภา",
+}
+# ================================================================
+
+
+def normalize_doctor_name(name: str) -> str:
+    s = " ".join(str(name or "").split())
+    return DOCTOR_ALIASES.get(s, s)
+
+
+def week_of_month(d: date) -> int:
+    first = d.replace(day=1)
+    return ((d.day + first.weekday() - 1) // 7) + 1
+
+
+def time_to_period(hhmm_or_tf: str) -> str:
+    if hhmm_or_tf == "TF":
+        return "ANY"
     try:
-        if hhmm and hhmm.upper() == "TF":
-            return -1
-        hh, mm = hhmm.split(":")
-        return int(hh) * 60 + int(mm)
+        hour = int(hhmm_or_tf.split(":", 1)[0])
     except Exception:
-        return -1
+        return "ANY"
+    return "AM" if hour < 12 else "PM"
 
 
-def pick_or_by_plan(case_date, case_time_hhmm: str, service_key: str) -> str:
-    if not service_key:
+def doctor_in_group(doc: str, token: str) -> bool:
+    normalized = normalize_doctor_name(doc)
+    return any(normalize_doctor_name(item) == normalized for item in GROUPS.get(token, []))
+
+
+def match_doctor(token_or_name: str, doctor_name: str) -> bool:
+    token = token_or_name
+    if not token:
+        return False
+    if token == "CLOSE":
+        return False
+    if token in GROUPS or token in {"SUR_ANY", "ORTHO_ANY", "ENT_ANY", "EYE_ANY", "MAXILO_ANY", "OBGYN_ANY"}:
+        return doctor_in_group(doctor_name, token)
+    return normalize_doctor_name(token) == normalize_doctor_name(doctor_name)
+
+
+def pick_or_by_doctor(case_date: date, time_str: str, doctor_name: str) -> str:
+    if not doctor_name:
         return ""
 
     weekday = case_date.weekday()
-    plan = WEEKLY_OR_PLAN.get(weekday) or {}
+    plan = WEEKLY_DOCTOR_OR_PLAN.get(weekday, {})
     if not plan:
         return ""
 
-    minutes = _parse_hhmm_to_minutes(case_time_hhmm)
-    has_time = minutes >= 0
-    is_am = has_time and minutes < (12 * 60)
+    current_week = week_of_month(case_date)
+    period = time_to_period(time_str)
 
-    if has_time:
-        for or_room, svc in plan.items():
-            if not svc or svc == "CLOSE":
-                continue
-            if isinstance(svc, dict):
-                target = svc.get("AM") if is_am else svc.get("PM")
-                if target == service_key:
-                    return or_room
-            elif svc == service_key:
-                return or_room
+    def iter_rules():
+        for or_room, rules in plan.items():
+            for rule in rules or []:
+                yield or_room, rule
 
-    for or_room, svc in plan.items():
-        if not svc or svc == "CLOSE":
+    for or_room, rule in iter_rules():
+        doctor_token = rule.get("doctor")
+        if not doctor_token:
             continue
-        if isinstance(svc, dict):
-            if service_key in (svc.get("AM"), svc.get("PM")):
+        weeks = rule.get("weeks", [1, 2, 3, 4, 5])
+        when = (rule.get("when") or "ALLDAY").upper()
+        doctors = doctor_token if isinstance(doctor_token, list) else [doctor_token]
+        if current_week in weeks and (when == "ALLDAY" or period == "ANY" or period == when):
+            if any(match_doctor(doc, doctor_name) for doc in doctors):
                 return or_room
-        elif svc == service_key:
+
+    if period == "ANY":
+        for or_room, rule in iter_rules():
+            doctor_token = rule.get("doctor")
+            if not doctor_token or rule.get("doctor") == "CLOSE":
+                continue
+            weeks = rule.get("weeks", [1, 2, 3, 4, 5])
+            if current_week not in weeks:
+                continue
+            doctors = doctor_token if isinstance(doctor_token, list) else [doctor_token]
+            if any(match_doctor(doc, doctor_name) for doc in doctors):
+                return or_room
+
+    for or_room, rule in iter_rules():
+        doctor_token = rule.get("doctor")
+        if not doctor_token or doctor_token == "CLOSE":
+            continue
+        doctors = doctor_token if isinstance(doctor_token, list) else [doctor_token]
+        if any(match_doctor(doc, doctor_name) for doc in doctors):
             return or_room
-
-    return ""
-
-
-def _service_from_row(raw: Dict[str, object]) -> str:
-    if not raw:
-        return ""
-
-    def _lookup(key: str) -> str:
-        if key in raw:
-            return str(raw.get(key) or "")
-        lower = key.lower()
-        return str(raw.get(lower, ""))
-
-    ward_txt = _lookup("Ward")
-    svc = detect_service_from_text(ward_txt)
-    if svc:
-        return svc
-
-    for key in ("ชื่อการผ่าตัด", "ICD Name", "แพทย์ผู้สั่ง"):
-        svc = detect_service_from_text(_lookup(key))
-        if svc:
-            return svc
 
     return ""
 
@@ -2021,12 +2043,13 @@ class Main(QtWidgets.QWidget):
                 return str(val or "").strip()
 
             time_raw = lookup.get(FIXED_MAPPING_TH["time"])
-            time_str = parse_time_hhmm(time_raw) or "TF"
+            time_str = parse_time_hhmm_or_tf(time_raw)
             hn = get("hn")
             name = get("name")
+            doctor = get("doctor")
 
-            if not (time_str and hn and name):
-                skipped.append((hn or "-", "ต้องมี เวลา, HN, ชื่อ"))
+            if not (hn and name and doctor):
+                skipped.append((hn or "-", "ต้องมี HN, ชื่อ, แพทย์ผู้สั่ง"))
                 continue
 
             if time_str != "TF":
@@ -2041,8 +2064,7 @@ class Main(QtWidgets.QWidget):
             diag_txt = get("diags")
             op_txt = get("ops")
 
-            service_key = _service_from_row(lookup)
-            or_room = pick_or_by_plan(base_date, time_str, service_key)
+            or_room = pick_or_by_doctor(base_date, time_str, doctor)
 
             entry = ScheduleEntry(
                 or_room=or_room,
@@ -2052,7 +2074,7 @@ class Main(QtWidgets.QWidget):
                 name=" ".join(name.split()),
                 age=parse_age_years(get("age")),
                 dept="",
-                doctor=normalize_doctor(get("doctor")),
+                doctor=normalize_doctor(doctor),
                 diags=[diag_txt] if diag_txt else [],
                 ops=[op_txt] if op_txt else [],
                 ward=map_to_known_ward(get("ward"), known_wards),
