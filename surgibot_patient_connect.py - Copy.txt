@@ -1,0 +1,215 @@
+"""Helper components for surgibot_patient_connect UI.
+
+This file contains the updated SearchSelectAdder widget that ensures
+selecting a suggestion (via dropdown, completer, or pressing Enter)
+immediately adds the entry to the current case list without persisting it to
+the shared catalog. A dedicated "save" button can still trigger
+requestPersist when the host application wants to store new vocabulary.
+"""
+
+from __future__ import annotations
+
+from typing import List, Optional
+
+from PySide6 import QtCore, QtGui, QtWidgets
+
+
+class NoWheelComboBox(QtWidgets.QComboBox):
+    """Combo box that ignores wheel events to avoid accidental value changes."""
+
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
+        event.ignore()
+
+
+class SearchSelectAdder(QtWidgets.QWidget):
+    """Searchable selector with staged multi-select support.
+
+    * Enter / "➕ เพิ่ม" adds the current text into the staged list only.
+    * "💾 บันทึกเป็นรายการใหม่" emits `requestPersist` so the host can
+      update its persistent catalog explicitly.
+    * Selecting an item from the dropdown or completer also stages the text
+      immediately, matching the behaviour required for Diagnosis / Operation
+      fields.
+    """
+
+    itemsChanged = QtCore.Signal(list)
+    requestPersist = QtCore.Signal(str)
+
+    def __init__(self, placeholder: str = "ค้นหา...", suggestions: Optional[List[str]] = None, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+
+        self._completer: Optional[QtWidgets.QCompleter] = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(6)
+
+        self.combo = NoWheelComboBox()
+        self.combo.setEditable(True)
+        self.combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.combo.setMinimumWidth(280)
+        self.search_line = self.combo.lineEdit()
+        if self.search_line:
+            self.search_line.setPlaceholderText(placeholder)
+
+        self.btn_add = QtWidgets.QPushButton("➕ เพิ่ม")
+        self.btn_add.setProperty("variant", "ghost")
+        self.btn_persist = QtWidgets.QPushButton("💾 บันทึกเป็นรายการใหม่")
+        self.btn_persist.setProperty("variant", "ghost")
+
+        row.addWidget(self.combo, 1)
+        row.addWidget(self.btn_add)
+        row.addWidget(self.btn_persist)
+        layout.addLayout(row)
+
+        self.list = QtWidgets.QListWidget()
+        self.list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        layout.addWidget(self.list)
+
+        self.set_suggestions(suggestions or [])
+
+        if self.search_line:
+            self.search_line.returnPressed.connect(self._add_current)
+        self.btn_add.clicked.connect(self._add_current)
+        self.btn_persist.clicked.connect(self._persist_current)
+
+        for signal in (self.combo.activated[int], self.combo.highlighted[int]):
+            try:
+                signal.connect(self._on_combo_activated)
+            except Exception:
+                pass
+        for signal in (self.combo.activated[str], self.combo.highlighted[str]):
+            try:
+                signal.connect(self._on_combo_activated_text)
+            except Exception:
+                pass
+
+        self.list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._ctx_menu)
+        model = self.list.model()
+        model.rowsInserted.connect(lambda *_: self._emit_items_changed())
+        model.rowsRemoved.connect(lambda *_: self._emit_items_changed())
+
+    # ------------------------------------------------------------------
+    # Context menu helpers
+    # ------------------------------------------------------------------
+    def _ctx_menu(self, pos: QtCore.QPoint) -> None:
+        menu = QtWidgets.QMenu(self)
+        remove_action = menu.addAction("ลบรายการที่เลือก")
+        clear_action = menu.addAction("ลบทั้งหมด")
+        selected = menu.exec(self.list.mapToGlobal(pos))
+        if selected == remove_action:
+            for item in self.list.selectedItems():
+                self.list.takeItem(self.list.row(item))
+        elif selected == clear_action:
+            self.list.clear()
+        self._emit_items_changed()
+
+    # ------------------------------------------------------------------
+    # Selection & completer hooks
+    # ------------------------------------------------------------------
+    def _on_combo_activated(self, index: int) -> None:
+        text = (self.combo.itemText(index) or "").strip()
+        self._add_text(text)
+
+    def _on_combo_activated_text(self, text: str) -> None:
+        self._add_text((text or "").strip())
+
+    def _on_completer_activated(self, text: str) -> None:
+        self._add_text((text or "").strip())
+
+    def _on_completer_index_activated(self, index: QtCore.QModelIndex) -> None:
+        try:
+            model = index.model()
+            text = model.data(index, QtCore.Qt.DisplayRole)
+        except Exception:
+            text = ""
+        self._add_text((text or "").strip())
+
+    def _add_current(self) -> None:
+        self._add_text(self.combo.currentText().strip())
+
+    def _persist_current(self) -> None:
+        text = self.combo.currentText().strip()
+        if text:
+            self.requestPersist.emit(text)
+
+    def _add_text(self, text: str) -> None:
+        if not text:
+            return
+        existing = {self.list.item(i).text().lower().strip() for i in range(self.list.count())}
+        lower = text.lower().strip()
+        if lower not in existing:
+            self.list.addItem(text)
+        self.combo.setCurrentIndex(0)
+        self.combo.setEditText("")
+        self._emit_items_changed()
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+    def items(self) -> List[str]:
+        return [self.list.item(i).text().strip() for i in range(self.list.count())]
+
+    def clear(self) -> None:
+        self.list.clear()
+        self.combo.setCurrentIndex(0)
+        self.combo.setEditText("")
+        self._emit_items_changed()
+
+    def set_suggestions(self, suggestions: List[str]) -> None:
+        seen = set()
+        options: List[str] = []
+        for value in suggestions or []:
+            val = (value or "").strip()
+            if val and val not in seen:
+                seen.add(val)
+                options.append(val)
+
+        current_text = self.search_line.text() if self.search_line else ""
+
+        self.combo.blockSignals(True)
+        self.combo.clear()
+        self.combo.addItem("")
+        self.combo.addItems(options)
+        self.combo.blockSignals(False)
+
+        if self.search_line is not None:
+            self.search_line.blockSignals(True)
+            self.search_line.setText(current_text)
+            self.search_line.setCursorPosition(len(current_text))
+            self.search_line.blockSignals(False)
+
+        completer = QtWidgets.QCompleter(options)
+        completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        completer.setFilterMode(QtCore.Qt.MatchContains)
+
+        if self._completer is not None:
+            try:
+                self._completer.activated[str].disconnect(self._on_completer_activated)
+            except Exception:
+                pass
+            try:
+                self._completer.activated[QtCore.QModelIndex].disconnect(self._on_completer_index_activated)
+            except Exception:
+                pass
+
+        self._completer = completer
+        self.combo.setCompleter(self._completer)
+
+        try:
+            self._completer.activated[str].connect(self._on_completer_activated)
+        except Exception:
+            pass
+        try:
+            self._completer.activated[QtCore.QModelIndex].connect(self._on_completer_index_activated)
+        except Exception:
+            pass
+
+        self.combo.setFocusPolicy(QtCore.Qt.StrongFocus)
+
+    def _emit_items_changed(self) -> None:
+        self.itemsChanged.emit(self.items())
