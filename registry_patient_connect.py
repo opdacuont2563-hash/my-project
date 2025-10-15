@@ -3035,8 +3035,8 @@ class Main(QtWidgets.QWidget):
             indexed_entries: List[Tuple[int, ScheduleEntry]] = list(enumerate(self.sched.entries))
             if not indexed_entries:
                 empty = QtWidgets.QTreeWidgetItem(['— ไม่มีรายการ —'])
+                empty.setFirstColumnSpanned(True)
                 self.tree2.addTopLevelItem(empty)
-                self.tree2.setFirstItemColumnSpanned(empty, 0, True)
             else:
                 groups: Dict[str, List[Tuple[int, ScheduleEntry]]] = {}
                 for idx, entry in indexed_entries:
