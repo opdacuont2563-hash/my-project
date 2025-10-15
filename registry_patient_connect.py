@@ -959,6 +959,52 @@ def _period_badge(period_code: str) -> PeriodBadge:
     return PeriodBadge(label, color)
 
 
+# ---------------------- Wednesday OR ownership helpers ----------------------
+OWNER_WED_DOCTOR2OR = {
+    "นพ.สุริยา คุณาชน": "OR1",
+    "พญ.รัฐพร ตั้งเพียร": "OR6",
+}
+
+
+def _pick_doctor_from_text(entry: "ScheduleEntry") -> str:
+    """Extract the best-effort doctor name from the entry."""
+    who = (getattr(entry, "doctor", "") or "").strip()
+    if who:
+        return who
+
+    blobs: List[str] = []
+    ops = getattr(entry, "ops", None)
+    diags = getattr(entry, "diags", None)
+    if isinstance(ops, (list, tuple)):
+        blobs.append(" ".join(str(x) for x in ops))
+    elif isinstance(ops, str):
+        blobs.append(ops)
+    if isinstance(diags, (list, tuple)):
+        blobs.append(" ".join(str(x) for x in diags))
+    elif isinstance(diags, str):
+        blobs.append(diags)
+
+    text = " ".join(blobs)
+    for name in OWNER_WED_DOCTOR2OR.keys():
+        if name and name in text:
+            return name
+    return ""
+
+
+def normalize_owner_for_wednesday(entries: List["ScheduleEntry"], dt: date) -> List["ScheduleEntry"]:
+    """Ensure Wednesday cases stay with their designated room owners."""
+    if not dt or dt.weekday() != 2:
+        return entries
+
+    for entry in entries:
+        who = _pick_doctor_from_text(entry)
+        if who in OWNER_WED_DOCTOR2OR:
+            target_or = OWNER_WED_DOCTOR2OR[who]
+            if getattr(entry, "or_room", None) != target_or:
+                setattr(entry, "or_room", target_or)
+    return entries
+
+
 def _span_first_column(item: Optional[QtWidgets.QTreeWidgetItem]) -> None:
     """Helper to span the first column on a tree item (PySide6-compatible)."""
     if item is None:
@@ -3042,7 +3088,20 @@ class Main(QtWidgets.QWidget):
             self.tree2.clear()
             self._set_result_title()
 
-            indexed_entries: List[Tuple[int, ScheduleEntry]] = list(enumerate(self.sched.entries))
+            base_date = datetime.now().date()
+            try:
+                if hasattr(self, 'date'):
+                    qdate = self.date.date()
+                    if hasattr(qdate, 'toPython'):
+                        base_date = qdate.toPython()
+                    else:
+                        base_date = date(qdate.year(), qdate.month(), qdate.day())
+            except Exception:
+                base_date = datetime.now().date()
+
+            entries_snapshot: List[ScheduleEntry] = list(self.sched.entries)
+            entries_snapshot = normalize_owner_for_wednesday(entries_snapshot, base_date)
+            indexed_entries: List[Tuple[int, ScheduleEntry]] = list(enumerate(entries_snapshot))
             if not indexed_entries:
                 empty = QtWidgets.QTreeWidgetItem(['— ไม่มีรายการ —'])
                 _span_first_column(empty)
@@ -3077,17 +3136,6 @@ class Main(QtWidgets.QWidget):
                         return int(entry.queue or 0)
                     except Exception:
                         return 0
-
-                base_date = datetime.now().date()
-                try:
-                    if hasattr(self, 'date'):
-                        qdate = self.date.date()
-                        if hasattr(qdate, 'toPython'):
-                            base_date = qdate.toPython()
-                        else:
-                            base_date = date(qdate.year(), qdate.month(), qdate.day())
-                except Exception:
-                    base_date = datetime.now().date()
 
                 state_colors = {
                     'returning_to_ward': '#ede9fe',
