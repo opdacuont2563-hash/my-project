@@ -1698,9 +1698,30 @@ class Main(QtWidgets.QWidget):
         g.addWidget(self.ent_hn,r,1)
         g.addWidget(QtWidgets.QLabel("Ward"), r,2)
         self.cb_ward = QtWidgets.QComboBox(); self.cb_ward.setEditable(True)
-        self.cb_ward.addItems(WARD_LIST)
+        self.cb_ward.blockSignals(True)
+        self.cb_ward.clear()
+
+        def _safe_ward_list() -> list[str]:
+            try:
+                src = WARD_LIST() if callable(WARD_LIST) else WARD_LIST
+                items = list(src)
+            except Exception:
+                items = []
+            results: list[str] = []
+            for entry in items:
+                if isinstance(entry, (str, bytes)):
+                    text = str(entry).strip()
+                    if text:
+                        results.append(text)
+            return results
+
+        wards = _safe_ward_list()
+        self.cb_ward.addItems(wards)
+        if self.cb_ward.count() > 0:
+            self.cb_ward.setCurrentIndex(0)
+        self.cb_ward.blockSignals(False)
         self.cb_ward.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
-        ward_options = [w for w in WARD_LIST if w and w != WARD_PLACEHOLDER]
+        ward_options = [w for w in wards if w and w != WARD_PLACEHOLDER]
         comp = QtWidgets.QCompleter(ward_options)
         comp.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
         comp.setFilterMode(QtCore.Qt.MatchContains)
