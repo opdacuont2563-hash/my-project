@@ -1913,10 +1913,10 @@ class Main(QtWidgets.QWidget):
         self.card_result.title_lbl.hide()
         gr2 = self.card_result.grid
         self.tree2 = QtWidgets.QTreeWidget()
-        self.tree2.setColumnCount(16)
+        self.tree2.setColumnCount(18)
         self.tree2.setHeaderLabels([
             "OR/เวลา","HN","ชื่อ-สกุล","อายุ","Diagnosis","Operation",
-            "แพทย์","Ward","เริ่ม","จบ","ช่วงเวลา",
+            "แพทย์","Ward","ขนาดเคส","แผนก","เริ่ม","จบ","ช่วงเวลา",
             "Assist 1","Assist 2","Scrub","Cir","สถานะ"
         ])
         self.tree2.setUniformRowHeights(False)
@@ -1950,13 +1950,12 @@ class Main(QtWidgets.QWidget):
         """)
         hdr = self.tree2.header()
         hdr.setStretchLastSection(False)
-        for i in range(0, 16):
-            hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(4, QtWidgets.QHeaderView.Interactive)   # Diagnosis
-        hdr.setSectionResizeMode(5, QtWidgets.QHeaderView.Interactive)   # Operation
-        hdr.setSectionResizeMode(2, QtWidgets.QHeaderView.Interactive)   # ชื่อ-สกุล
         hdr.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         hdr.setFixedHeight(42)
+        for i in range(18):
+            hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
+        for i in (2, 4, 5):
+            hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.Interactive)
         self.tree2.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.tree2.customContextMenuRequested.connect(self._result_ctx_menu)
         gr2.addWidget(self.tree2,0,0,1,1)
@@ -3226,6 +3225,8 @@ class Main(QtWidgets.QWidget):
                         op_txt = ' ; '.join(entry.ops) if entry.ops else '-'
                         or_time = f"{or_label} • {entry.time or 'TF'}"
                         status_text = getattr(entry, 'status', '') or (entry.state or '') or '-'
+                        case_size_txt = getattr(entry, 'case_size', '') or '-'
+                        dept_txt = getattr(entry, 'dept', '') or '-'
                         row = QtWidgets.QTreeWidgetItem([
                             or_time,
                             entry.hn or '-',
@@ -3235,6 +3236,8 @@ class Main(QtWidgets.QWidget):
                             op_txt,
                             entry.doctor or '-',
                             entry.ward or '-',
+                            case_size_txt,
+                            dept_txt,
                             entry.time_start or '-',
                             entry.time_end or '-',
                             '',
@@ -3249,7 +3252,7 @@ class Main(QtWidgets.QWidget):
                         header_item.addChild(row)
 
                         badge = _period_badge(entry.period or 'in')
-                        self.tree2.setItemWidget(row, 10, badge)
+                        self.tree2.setItemWidget(row, 12, badge)
 
                         monitor_status = self._last_status_by_hn.get(str(entry.hn).strip(), '')
                         if monitor_status:
