@@ -966,9 +966,22 @@ OWNER_WED_DOCTOR2OR = {
 }
 
 
-def _pick_doctor_from_text(entry: "ScheduleEntry") -> str:
-    """Extract the best-effort doctor name from the entry."""
-    who = (getattr(entry, "doctor", "") or "").strip()
+def _owner_variants(name: str) -> Set[str]:
+    """Return a set of alias variants that should map to the canonical name."""
+    variants: Set[str] = {name}
+    normalized_target = " ".join(str(name or "").split())
+    aliases = globals().get("DOCTOR_ALIASES", {})
+    if isinstance(aliases, dict):
+        for alias, canonical in aliases.items():
+            if " ".join(str(canonical or "").split()) == normalized_target:
+                variants.add(alias)
+    return variants
+
+
+def _infer_doctor_from_entry(entry: "ScheduleEntry") -> str:
+    """Extract the best-effort normalized doctor name from the entry."""
+    raw = getattr(entry, "doctor", "") or ""
+    who = normalize_doctor_name(raw)
     if who:
         return who
 
@@ -985,9 +998,10 @@ def _pick_doctor_from_text(entry: "ScheduleEntry") -> str:
         blobs.append(diags)
 
     text = " ".join(blobs)
-    for name in OWNER_WED_DOCTOR2OR.keys():
-        if name and name in text:
-            return name
+    for canonical in OWNER_WED_DOCTOR2OR.keys():
+        variants = _owner_variants(canonical)
+        if any(var and var in text for var in variants):
+            return normalize_doctor_name(canonical)
     return ""
 
 
@@ -997,11 +1011,12 @@ def normalize_owner_for_wednesday(entries: List["ScheduleEntry"], dt: date) -> L
         return entries
 
     for entry in entries:
-        who = _pick_doctor_from_text(entry)
-        if who in OWNER_WED_DOCTOR2OR:
-            target_or = OWNER_WED_DOCTOR2OR[who]
-            if getattr(entry, "or_room", None) != target_or:
-                setattr(entry, "or_room", target_or)
+        who = _infer_doctor_from_entry(entry)
+        for owner_name, target_or in OWNER_WED_DOCTOR2OR.items():
+            if normalize_doctor_name(owner_name) == normalize_doctor_name(who):
+                if getattr(entry, "or_room", None) != target_or:
+                    setattr(entry, "or_room", target_or)
+                break
     return entries
 
 
@@ -1266,11 +1281,7 @@ WEEKLY_DOCTOR_OR_PLAN: Dict[int, Dict[str, List[Dict[str, object]]]] = {
     },
     2: {
         "OR1": [
-            {"doctor": "พญ.สายฝน บรรณจิตร์", "when": "AM", "weeks": [1, 2, 3, 4]},
-            {"doctor": "นพ.ชัชพล องค์โฆษิต", "when": "PM", "weeks": [1, 3]},
-            {"doctor": "นพ.ณัฐพงศ์ ศรีโพนทอง", "when": "PM", "weeks": [2, 4]},
-            {"doctor": "นพ.วิษณุ ผูกพันธ์", "when": "PM", "weeks": [2, 4]},
-            {"doctor": "นพ.กฤษฎา อิ้งอำพร", "when": "PM", "weeks": [2, 4]},
+            {"doctor": "นพ.สุริยา คุณาชน", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
         ],
         "OR2": [
             {"doctor": "นพ.วิษณุ ผูกพันธ์", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
@@ -3108,8 +3119,34 @@ class Main(QtWidgets.QWidget):
                 self.tree2.addTopLevelItem(empty)
             else:
                 groups: Dict[str, List[Tuple[int, ScheduleEntry]]] = {}
+                
+                def _effective_or_room(entry: ScheduleEntry) -> str:
+                    day_val = getattr(entry, 'date', None)
+                    resolved_date = base_date
+                    if isinstance(day_val, datetime):
+                        resolved_date = day_val.date()
+                    elif isinstance(day_val, date):
+                        resolved_date = day_val
+                    elif hasattr(day_val, 'toPython'):
+                        try:
+                            resolved_date = day_val.toPython()
+                        except Exception:
+                            resolved_date = base_date
+                    if resolved_date and isinstance(resolved_date, date) and resolved_date.weekday() == 2:
+                        who = _infer_doctor_from_entry(entry)
+                        if who:
+                            normalized_who = normalize_doctor_name(who)
+                            for owner_name, target_room in OWNER_WED_DOCTOR2OR.items():
+                                if normalize_doctor_name(owner_name) == normalized_who:
+                                    return target_room
+                    return entry.or_room or '-'
+
                 for idx, entry in indexed_entries:
-                    groups.setdefault(entry.or_room or '-', []).append((idx, entry))
+                    effective_room = _effective_or_room(entry) or '-'
+                    if effective_room not in ('', '-') and effective_room != (entry.or_room or ''):
+                        entry.or_room = effective_room
+                    bucket_key = effective_room or '-'
+                    groups.setdefault(bucket_key, []).append((idx, entry))
 
                 order = list(getattr(self.sched, 'or_rooms', []))
 
