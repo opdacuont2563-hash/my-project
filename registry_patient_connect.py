@@ -3034,7 +3034,7 @@ class Main(QtWidgets.QWidget):
             key = header_item.data(0, QtCore.Qt.UserRole)
             if not key:
                 key = header_item.text(0).split('•', 1)[0].strip()
-            expanded_state[str(key)] = self.tree2.isItemExpanded(header_item)
+            expanded_state[str(key)] = header_item.isExpanded()
 
         self.tree2.setUpdatesEnabled(False)
         self.tree2.blockSignals(True)
@@ -3202,7 +3202,7 @@ class Main(QtWidgets.QWidget):
                             row.setToolTip(2, '\n'.join(tip))
 
                 for or_label, header_item in headers:
-                    self.tree2.setItemExpanded(header_item, expanded_state.get(or_label, True))
+                    header_item.setExpanded(expanded_state.get(or_label, True))
         finally:
             self.tree2.blockSignals(False)
             self.tree2.setUpdatesEnabled(True)
