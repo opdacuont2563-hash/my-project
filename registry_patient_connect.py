@@ -299,6 +299,10 @@ DEFAULT_HOST = os.getenv("SURGIBOT_CLIENT_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.getenv("SURGIBOT_CLIENT_PORT", "8088"))
 DEFAULT_TOKEN = os.getenv("SURGIBOT_SECRET", "8HDYAANLgTyjbBK4JPGx1ooZbVC86_OMJ9uEXBm3EZTidUVyzhGiReaksGA0ites")
 
+# === Runner pickup service (FastAPI) ===
+RUNNER_BASE_URL = os.getenv("RUNNER_BASE_URL", "http://127.0.0.1:8777")
+RUNNER_UPDATE_API = "/runner/update"
+
 API_HEALTH = "/api/health"; API_LIST="/api/list"; API_LIST_FULL="/api/list_full"; API_WS="/api/ws"
 
 STATUS_COLORS = {
@@ -1061,6 +1065,92 @@ class ClientHTTP:
                 if isinstance(v,list): return {"items":v}
             return d
         return {"items":[]}
+
+
+class RunnerPickupClient:
+    def __init__(self, base_url: str = RUNNER_BASE_URL, timeout: float = 3.0):
+        self.base = base_url.rstrip("/")
+        self.timeout = timeout
+        self.s = requests.Session()
+        self.s.mount(
+            "http://",
+            HTTPAdapter(
+                max_retries=Retry(
+                    total=2,
+                    connect=2,
+                    read=1,
+                    backoff_factor=0.25,
+                    status_forcelist=(429, 500, 502, 503, 504),
+                    allowed_methods=frozenset(["POST"]),
+                )
+            ),
+        )
+
+    @staticmethod
+    def _coerce_time_str(hhmm_or_tf: str) -> Optional[str]:
+        txt = (hhmm_or_tf or "").strip()
+        if not txt or txt.upper() == "TF":
+            return None
+        try:
+            hh, mm = [int(x) for x in txt.split(":", 1)]
+            if 0 <= hh <= 23 and 0 <= mm <= 59:
+                return f"{hh:02d}:{mm:02d}"
+        except Exception:
+            pass
+        return None
+
+    def _row_from_entry(self, e: "ScheduleEntry") -> dict:
+        pickup_id = getattr(e, "case_uid", None) or hashlib.sha1(
+            f"{e.or_room}|{e.hn}|{e.time}|{e.date}".encode("utf-8", "ignore")
+        ).hexdigest()
+
+        start_time = self._coerce_time_str(getattr(e, "time_start", "")) or self._coerce_time_str(e.time) or ""
+
+        due_time = ""
+        if start_time:
+            try:
+                hh, mm = [int(x) for x in start_time.split(":", 1)]
+                dt0 = datetime.combine(e.date, dtime(hh, mm)) - timedelta(minutes=15)
+                due_time = dt0.strftime("%H:%M")
+            except Exception:
+                pass
+
+        return {
+            "pickup_id": pickup_id,
+            "date": str(getattr(e, "date", date.today())),
+            "hn": e.hn or "",
+            "name": e.name or "",
+            "ward_from": e.ward or "",
+            "or_to": e.or_room or "",
+            "call_time": datetime.now().strftime("%H:%M"),
+            "due_time": due_time,
+            "status": "waiting",
+            "assignee": "",
+            "ack_time": "",
+            "start_time": start_time,
+            "arrive_time": "",
+            "note": "",
+        }
+
+    def push_entries(self, entries: list["ScheduleEntry"]) -> tuple[int, list[str]]:
+        ok = 0
+        failed: list[str] = []
+        url = self.base + RUNNER_UPDATE_API
+        for e in entries:
+            payload = self._row_from_entry(e)
+            try:
+                r = self.s.post(
+                    url,
+                    json=payload,
+                    timeout=self.timeout,
+                    headers={"Accept": "application/json"},
+                )
+                r.raise_for_status()
+                ok += 1
+            except Exception:
+                failed.append(payload.get("hn") or payload.get("pickup_id") or "-")
+        return ok, failed
+
 
 def extract_rows(payload):
     if isinstance(payload,list): src=payload
@@ -1963,6 +2053,9 @@ class Main(QtWidgets.QWidget):
         import_bar = QtWidgets.QHBoxLayout()
         import_bar.setContentsMargins(0, 6, 0, 0)
         import_bar.setSpacing(10)
+        self.btn_send_runner = QtWidgets.QPushButton("🚚 ส่งให้ Runner (วันนี้)")
+        self.btn_send_runner.setProperty("variant", "primary")
+        import_bar.addWidget(self.btn_send_runner, 0)
         self.btn_import_excel = QtWidgets.QPushButton("📥 นำเข้าจาก Excel")
         self.btn_import_excel.setProperty("variant", "ghost")
         import_bar.addWidget(self.btn_import_excel, 0)
@@ -2030,6 +2123,7 @@ class Main(QtWidgets.QWidget):
         self.btn_refresh.clicked.connect(lambda: self._refresh(True))
         self.btn_export.clicked.connect(self._export_csv)
         self.btn_export_deid.clicked.connect(self._export_deid_csv)
+        self.btn_send_runner.clicked.connect(self._on_send_runner_today)
         self.btn_import_excel.clicked.connect(self._on_import_excel)
         self.btn_clear_board.clicked.connect(self._on_clear_board_clicked)
         self.btn_undo_clear.clicked.connect(self._on_undo_clear_clicked)
@@ -2245,6 +2339,36 @@ class Main(QtWidgets.QWidget):
         def save():
             rooms=[lst.item(i).text() for i in range(lst.count())]; self.sched.set_or_rooms(rooms); self._refresh_or_cb(self.cb_or); dlg.accept()
         ok.clicked.connect(save); dlg.exec()
+
+    def _entries_of_selected_date(self) -> list["ScheduleEntry"]:
+        try:
+            qdate = self.date.date()
+            day = qdate.toPython() if hasattr(qdate, "toPython") else date(qdate.year(), qdate.month(), qdate.day())
+        except Exception:
+            day = datetime.now().date()
+        return [e for e in list(getattr(self.sched, "entries", [])) if getattr(e, "date", None) == day]
+
+    def _on_send_runner_today(self):
+        rows = self._entries_of_selected_date()
+        if not rows:
+            SweetAlert.info(self, "ไม่มีรายการ", "ยังไม่มีเคสของวันที่เลือกที่จะส่งให้ Runner")
+            return
+
+        dlg = SweetAlert.loading(self, "กำลังส่งข้อมูลไป Runner ...")
+        dlg.show()
+        QtWidgets.QApplication.processEvents()
+        try:
+            client = RunnerPickupClient(RUNNER_BASE_URL, timeout=3.0)
+            ok, failed = client.push_entries(rows)
+        finally:
+            dlg.close()
+
+        if ok > 0 and not failed:
+            SweetAlert.success(self, "สำเร็จ", f"ส่งให้ Runner แล้ว {ok} รายการ", auto_close_msec=1600)
+        elif ok > 0 and failed:
+            SweetAlert.success(self, "สำเร็จบางส่วน", f"สำเร็จ {ok} • ล้มเหลว {len(failed)}\n(HN: {', '.join(failed[:10])}{' …' if len(failed) > 10 else ''})")
+        else:
+            SweetAlert.warning(self, "ไม่สำเร็จ", "ส่งให้ Runner ไม่ได้เลย — ตรวจสอบว่าเซิร์ฟเวอร์ Runner เปิดอยู่ที่ 127.0.0.1:8777 หรือไม่")
 
     def _on_import_excel(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
