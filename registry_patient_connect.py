@@ -1510,6 +1510,22 @@ def describe_or_plan_label(case_date: date, or_room: str) -> str:
     return " • ".join(labels)
 
 
+_WED = 2
+_OWNER_WED: Dict[str, str] = {
+    "OR1": "นพ.สุริยา คุณาชน",
+    "OR6": "พญ.รัฐพร ตั้งเพียร",
+}
+
+
+def resolve_or_owner(or_room: str, dt: date, fallback: str | None = None) -> str:
+    """Return the resolved owner for an OR room, overriding Wednesday defaults."""
+    room_key = (or_room or "").strip()
+    if dt and room_key and dt.weekday() == _WED and room_key in _OWNER_WED:
+        return _OWNER_WED[room_key]
+    fallback_name = normalize_doctor_name(fallback) if fallback else ""
+    return fallback_name or "-"
+
+
 def pick_or_by_doctor(case_date: date, time_str: str, doctor_name: str) -> str:
     if not doctor_name:
         return ""
@@ -1809,10 +1825,11 @@ class Main(QtWidgets.QWidget):
         self.card_result.title_lbl.hide()
         gr2 = self.card_result.grid
         self.tree2 = QtWidgets.QTreeWidget()
-        self.tree2.setColumnCount(10)
+        self.tree2.setColumnCount(16)
         self.tree2.setHeaderLabels([
             "OR/เวลา","HN","ชื่อ-สกุล","อายุ","Diagnosis","Operation",
-            "แพทย์","Ward","เริ่ม-จบ","ช่วงเวลา"
+            "แพทย์","Ward","เริ่ม","จบ","ช่วงเวลา",
+            "Assist 1","Assist 2","Scrub","Cir","สถานะ"
         ])
         self.tree2.setUniformRowHeights(False)
         self.tree2.setAlternatingRowColors(True)
@@ -1845,10 +1862,11 @@ class Main(QtWidgets.QWidget):
         """)
         hdr = self.tree2.header()
         hdr.setStretchLastSection(False)
-        for i in (0,1,2,3,6,7,8,9):
+        for i in range(0, 16):
             hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)   # Diagnosis
-        hdr.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeToContents)   # Operation
+        hdr.setSectionResizeMode(4, QtWidgets.QHeaderView.Interactive)   # Diagnosis
+        hdr.setSectionResizeMode(5, QtWidgets.QHeaderView.Interactive)   # Operation
+        hdr.setSectionResizeMode(2, QtWidgets.QHeaderView.Interactive)   # ชื่อ-สกุล
         hdr.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         hdr.setFixedHeight(42)
         self.tree2.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
@@ -2973,160 +2991,198 @@ class Main(QtWidgets.QWidget):
         return _is_postop_complete_entry(e)
 
     def _render_tree2(self):
-        self.tree2.clear()
-        self._set_result_title()
+        vbar = self.tree2.verticalScrollBar()
+        hbar = self.tree2.horizontalScrollBar()
+        vpos = vbar.value()
+        hpos = hbar.value()
 
-        indexed_entries: List[Tuple[int, ScheduleEntry]] = list(enumerate(self.sched.entries))
-        if not indexed_entries:
-            empty = QtWidgets.QTreeWidgetItem(["— ไม่มีรายการ —"])
-            self.tree2.addTopLevelItem(empty)
-            self.tree2.setFirstItemColumnSpanned(empty, 0, True)
-            return
+        expanded_state: Dict[str, bool] = {}
+        root = self.tree2.invisibleRootItem()
+        for i in range(root.childCount()):
+            header_item = root.child(i)
+            key = header_item.data(0, QtCore.Qt.UserRole)
+            if not key:
+                key = header_item.text(0).split('•', 1)[0].strip()
+            expanded_state[str(key)] = self.tree2.isItemExpanded(header_item)
 
-        groups: Dict[str, List[Tuple[int, ScheduleEntry]]] = {}
-        for idx, entry in indexed_entries:
-            groups.setdefault(entry.or_room or "-", []).append((idx, entry))
-
-        order = list(getattr(self.sched, "or_rooms", []))
-
-        def _room_sort_key(or_name: str) -> Tuple[int, int]:
-            if or_name in order:
-                return (0, order.index(or_name))
-            if str(or_name).strip() == "-":
-                return (2, 999)
-            digits = "".join(ch for ch in str(or_name) if ch.isdigit())
-            num = int(digits) if digits else 999
-            return (1, num)
-
-        def _time_tuple(hhmm: str) -> Tuple[int, int, int]:
-            if not hhmm or hhmm == "TF":
-                return (1, 99, 99)
-            try:
-                hh, mm = [int(x) for x in hhmm.split(":")]
-                return (0, hh, mm)
-            except Exception:
-                return (1, 99, 99)
-
-        def _queue_value(entry: ScheduleEntry) -> int:
-            try:
-                return int(entry.queue or 0)
-            except Exception:
-                return 0
-
-        base_date = datetime.now().date()
+        self.tree2.setUpdatesEnabled(False)
+        self.tree2.blockSignals(True)
         try:
-            if hasattr(self, "date"):
-                qdate = self.date.date()
-                if hasattr(qdate, "toPython"):
-                    base_date = qdate.toPython()
-                else:
-                    base_date = date(qdate.year(), qdate.month(), qdate.day())
-        except Exception:
-            base_date = datetime.now().date()
+            self.tree2.clear()
+            self._set_result_title()
 
-        state_colors = {
-            "returning_to_ward": "#ede9fe",
-            "postop_pending": "#fff7ed",
-            "returned_to_ward": "#ecfdf5",
-        }
-        state_icons = {
-            "returning_to_ward": "⏳",
-            "postop_pending": "⚠️",
-            "returned_to_ward": "✅",
-        }
+            indexed_entries: List[Tuple[int, ScheduleEntry]] = list(enumerate(self.sched.entries))
+            if not indexed_entries:
+                empty = QtWidgets.QTreeWidgetItem(['— ไม่มีรายการ —'])
+                self.tree2.addTopLevelItem(empty)
+                self.tree2.setFirstItemColumnSpanned(empty, 0, True)
+            else:
+                groups: Dict[str, List[Tuple[int, ScheduleEntry]]] = {}
+                for idx, entry in indexed_entries:
+                    groups.setdefault(entry.or_room or '-', []).append((idx, entry))
 
-        for or_room in sorted(groups.keys(), key=_room_sort_key):
-            bucket = groups[or_room]
+                order = list(getattr(self.sched, 'or_rooms', []))
 
-            def _row_sort(pair: Tuple[int, ScheduleEntry]) -> Tuple[int, int, int, int, int, str]:
-                entry = pair[1]
-                q = _queue_value(entry)
-                flag, hh, mm = _time_tuple(entry.time)
-                return (
-                    0 if q > 0 else 1,
-                    q if q > 0 else 0,
-                    flag,
-                    hh,
-                    mm,
-                    str(entry.hn or ""),
-                )
+                def _room_sort_key(or_name: str) -> Tuple[int, int]:
+                    if or_name in order:
+                        return (0, order.index(or_name))
+                    if str(or_name).strip() == '-':
+                        return (2, 999)
+                    digits = ''.join(ch for ch in str(or_name) if ch.isdigit())
+                    num = int(digits) if digits else 999
+                    return (1, num)
 
-            bucket_sorted = sorted(bucket, key=_row_sort)
+                def _time_tuple(hhmm: str) -> Tuple[int, int, int]:
+                    if not hhmm or hhmm == 'TF':
+                        return (1, 99, 99)
+                    try:
+                        hh, mm = [int(x) for x in hhmm.split(':')]
+                        return (0, hh, mm)
+                    except Exception:
+                        return (1, 99, 99)
 
-            header = QtWidgets.QTreeWidgetItem(["" for _ in range(self.tree2.columnCount())])
-            label = or_room or "-"
-            plan_desc = describe_or_plan_label(base_date, or_room)
-            if plan_desc:
-                label = f"{label}  •  {plan_desc}"
-            header.setText(0, label)
-            font = header.font(0); font.setBold(True)
-            header.setFont(0, font)
-            header.setFirstColumnSpanned(True)
-            header.setChildIndicatorPolicy(QtWidgets.QTreeWidgetItem.ShowIndicator)
-            self.tree2.addTopLevelItem(header)
-            header.setExpanded(True)
+                def _queue_value(entry: ScheduleEntry) -> int:
+                    try:
+                        return int(entry.queue or 0)
+                    except Exception:
+                        return 0
 
-            for idx, entry in bucket_sorted:
-                diag_txt = " ; ".join(entry.diags) if entry.diags else "-"
-                op_txt = " ; ".join(entry.ops) if entry.ops else "-"
-                or_label = or_room or "-"
-                time_label = entry.time or "TF"
-                or_time = f"{or_label} • {time_label}"
-                row = QtWidgets.QTreeWidgetItem([
-                    or_time,
-                    entry.hn or "-",
-                    entry.name or "-",
-                    str(entry.age or 0),
-                    diag_txt,
-                    op_txt,
-                    entry.doctor or "-",
-                    entry.ward or "-",
-                    f"{entry.time_start or '-'}–{entry.time_end or '-'}",
-                    "",
-                ])
-                row.setData(0, QtCore.Qt.UserRole, entry.uid())
-                row.setData(0, QtCore.Qt.UserRole + 1, idx)
-                header.addChild(row)
+                base_date = datetime.now().date()
+                try:
+                    if hasattr(self, 'date'):
+                        qdate = self.date.date()
+                        if hasattr(qdate, 'toPython'):
+                            base_date = qdate.toPython()
+                        else:
+                            base_date = date(qdate.year(), qdate.month(), qdate.day())
+                except Exception:
+                    base_date = datetime.now().date()
 
-                badge = _period_badge(entry.period or "in")
-                self.tree2.setItemWidget(row, 9, badge)
+                state_colors = {
+                    'returning_to_ward': '#ede9fe',
+                    'postop_pending': '#fff7ed',
+                    'returned_to_ward': '#ecfdf5',
+                }
+                state_icons = {
+                    'returning_to_ward': '⏳',
+                    'postop_pending': '⚠️',
+                    'returned_to_ward': '✅',
+                }
 
-                status = self._last_status_by_hn.get(str(entry.hn).strip(), "")
-                if status:
-                    color = STATUS_COLORS.get(status, "#64748b")
-                    chip = StatusChipWidget(status, color, pulse=(status in PULSE_STATUS))
-                    cell = QtWidgets.QWidget()
-                    lay = QtWidgets.QHBoxLayout(cell)
-                    lay.setContentsMargins(0, 0, 0, 0)
-                    lay.setSpacing(6)
-                    lay.addWidget(chip, 0)
-                    lbl = QtWidgets.QLabel(or_time)
-                    lay.addWidget(lbl, 0)
-                    lay.addStretch(1)
-                    self.tree2.setItemWidget(row, 0, cell)
-                else:
-                    row.setText(0, or_time)
-                    self.tree2.setItemWidget(row, 0, None)
+                headers: List[Tuple[str, QtWidgets.QTreeWidgetItem]] = []
 
-                state = entry.state or ""
-                if state in state_colors:
-                    brush = QtGui.QBrush(QtGui.QColor(state_colors[state]))
-                    for col_idx in range(self.tree2.columnCount()):
-                        row.setBackground(col_idx, brush)
-                    icon = state_icons.get(state)
-                    if icon:
-                        row.setText(2, f"{icon} {row.text(2)}")
-                if state:
-                    tip = [f"State: {state}"]
-                    if entry.returning_started_at:
-                        tip.append(f"เริ่มส่งกลับตึก: {entry.returning_started_at}")
-                    if entry.returned_to_ward_at:
-                        tip.append(f"กลับตึกเมื่อ: {entry.returned_to_ward_at}")
-                    if entry.postop_completed:
-                        tip.append("(ข้อมูลหลังผ่าตัดครบถ้วน ✓)")
-                    row.setToolTip(2, "\n".join(tip))
+                for or_room in sorted(groups.keys(), key=_room_sort_key):
+                    bucket = groups[or_room]
 
-        self.tree2.expandAll()
+                    def _row_sort(pair: Tuple[int, ScheduleEntry]) -> Tuple[int, int, int, int, int, str]:
+                        entry = pair[1]
+                        q = _queue_value(entry)
+                        flag, hh, mm = _time_tuple(entry.time)
+                        return (
+                            0 if q > 0 else 1,
+                            q if q > 0 else 0,
+                            flag,
+                            hh,
+                            mm,
+                            str(entry.hn or ''),
+                        )
+
+                    bucket_sorted = sorted(bucket, key=_row_sort)
+                    entries_only = [entry for _, entry in bucket_sorted]
+
+                    header_item = QtWidgets.QTreeWidgetItem(['' for _ in range(self.tree2.columnCount())])
+                    or_label = or_room or '-'
+                    first_entry = entries_only[0] if entries_only else None
+                    the_date = getattr(first_entry, 'date', base_date)
+                    owner = resolve_or_owner(or_label, the_date, getattr(first_entry, 'doctor', None)) or '-'
+                    header_item.setText(0, f"{or_label} • {owner}")
+                    font = header_item.font(0)
+                    font.setBold(True)
+                    header_item.setFont(0, font)
+                    header_item.setFirstColumnSpanned(True)
+                    header_item.setChildIndicatorPolicy(QtWidgets.QTreeWidgetItem.ShowIndicator)
+                    header_item.setData(0, QtCore.Qt.UserRole, or_label)
+                    self.tree2.addTopLevelItem(header_item)
+                    headers.append((or_label, header_item))
+
+                    for idx, entry in bucket_sorted:
+                        diag_txt = ' ; '.join(entry.diags) if entry.diags else '-'
+                        op_txt = ' ; '.join(entry.ops) if entry.ops else '-'
+                        or_time = f"{or_label} • {entry.time or 'TF'}"
+                        status_text = getattr(entry, 'status', '') or (entry.state or '') or '-'
+                        row = QtWidgets.QTreeWidgetItem([
+                            or_time,
+                            entry.hn or '-',
+                            entry.name or '-',
+                            str(entry.age or 0),
+                            diag_txt,
+                            op_txt,
+                            entry.doctor or '-',
+                            entry.ward or '-',
+                            entry.time_start or '-',
+                            entry.time_end or '-',
+                            '',
+                            entry.assist1 or '-',
+                            entry.assist2 or '-',
+                            entry.scrub or '-',
+                            getattr(entry, 'circulate', '') or '-',
+                            status_text,
+                        ])
+                        row.setData(0, QtCore.Qt.UserRole, entry.uid())
+                        row.setData(0, QtCore.Qt.UserRole + 1, idx)
+                        header_item.addChild(row)
+
+                        badge = _period_badge(entry.period or 'in')
+                        self.tree2.setItemWidget(row, 10, badge)
+
+                        monitor_status = self._last_status_by_hn.get(str(entry.hn).strip(), '')
+                        if monitor_status:
+                            color = STATUS_COLORS.get(monitor_status, '#64748b')
+                            chip = StatusChipWidget(monitor_status, color, pulse=(monitor_status in PULSE_STATUS))
+                            cell = QtWidgets.QWidget()
+                            lay = QtWidgets.QHBoxLayout(cell)
+                            lay.setContentsMargins(0, 0, 0, 0)
+                            lay.setSpacing(6)
+                            lay.addWidget(chip, 0)
+                            lbl = QtWidgets.QLabel(or_time)
+                            lay.addWidget(lbl, 0)
+                            lay.addStretch(1)
+                            self.tree2.setItemWidget(row, 0, cell)
+                        else:
+                            row.setText(0, or_time)
+                            self.tree2.setItemWidget(row, 0, None)
+
+                        state = entry.state or ''
+                        if state in state_colors:
+                            brush = QtGui.QBrush(QtGui.QColor(state_colors[state]))
+                            for col_idx in range(self.tree2.columnCount()):
+                                row.setBackground(col_idx, brush)
+                            icon = state_icons.get(state)
+                            if icon:
+                                row.setText(2, f"{icon} {row.text(2)}")
+                        if state:
+                            tip = [f"State: {state}"]
+                            if entry.returning_started_at:
+                                tip.append(f"เริ่มส่งกลับตึก: {entry.returning_started_at}")
+                            if entry.returned_to_ward_at:
+                                tip.append(f"กลับตึกเมื่อ: {entry.returned_to_ward_at}")
+                            if entry.postop_completed:
+                                tip.append('(ข้อมูลหลังผ่าตัดครบถ้วน ✓)')
+                            row.setToolTip(2, '\n'.join(tip))
+
+                for or_label, header_item in headers:
+                    self.tree2.setItemExpanded(header_item, expanded_state.get(or_label, True))
+        finally:
+            self.tree2.blockSignals(False)
+            self.tree2.setUpdatesEnabled(True)
+            self.tree2.clearSelection()
+            self.tree2.setCurrentItem(None)
+
+            def _restore_scroll():
+                vbar.setValue(min(vpos, vbar.maximum()))
+                hbar.setValue(min(hpos, hbar.maximum()))
+
+            QtCore.QTimer.singleShot(0, _restore_scroll)
 
     def _apply_queue_select(self, uid: str, new_q: int):
         target=None; target_idx=None
