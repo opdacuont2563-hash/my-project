@@ -958,6 +958,16 @@ def _period_badge(period_code: str) -> PeriodBadge:
     color = "#2563eb" if (period_code or "").lower() == "in" else "#64748b"
     return PeriodBadge(label, color)
 
+
+def _span_first_column(item: Optional[QtWidgets.QTreeWidgetItem]) -> None:
+    """Helper to span the first column on a tree item (PySide6-compatible)."""
+    if item is None:
+        return
+    try:
+        item.setFirstColumnSpanned(True)
+    except AttributeError:
+        pass
+
 class ClientHTTP:
     def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, token=DEFAULT_TOKEN, timeout=1.2):
         self.base, self.token, self.timeout = f"http://{host}:{port}", token, timeout
@@ -3035,7 +3045,7 @@ class Main(QtWidgets.QWidget):
             indexed_entries: List[Tuple[int, ScheduleEntry]] = list(enumerate(self.sched.entries))
             if not indexed_entries:
                 empty = QtWidgets.QTreeWidgetItem(['— ไม่มีรายการ —'])
-                empty.setFirstColumnSpanned(True)
+                _span_first_column(empty)
                 self.tree2.addTopLevelItem(empty)
             else:
                 groups: Dict[str, List[Tuple[int, ScheduleEntry]]] = {}
@@ -3120,7 +3130,7 @@ class Main(QtWidgets.QWidget):
                     font = header_item.font(0)
                     font.setBold(True)
                     header_item.setFont(0, font)
-                    header_item.setFirstColumnSpanned(True)
+                    _span_first_column(header_item)
                     header_item.setChildIndicatorPolicy(QtWidgets.QTreeWidgetItem.ShowIndicator)
                     header_item.setData(0, QtCore.Qt.UserRole, or_label)
                     self.tree2.addTopLevelItem(header_item)
