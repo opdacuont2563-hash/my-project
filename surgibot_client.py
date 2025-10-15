@@ -108,6 +108,19 @@ except Exception:  # pragma: no cover - keep UI responsive without catalog
 
     def diagnosis_suggestions(_specialty: str | None = None, _ops: list[str] | None = None) -> list[str]:
         return []
+
+# ใช้กติกา/ตัวช่วยห้อง OR เดียวกับฝั่ง patient (fallback เมื่อไฟล์ไม่พร้อมใช้)
+try:
+    from surgibot_patient_connect import (
+        describe_or_plan_label,
+        normalize_owner_for_wednesday,
+    )
+except Exception:  # pragma: no cover - optional dependency
+    def describe_or_plan_label(*_args, **_kwargs) -> str:
+        return ""
+
+    def normalize_owner_for_wednesday(entries, *_args, **_kwargs):
+        return entries
 from PySide6.QtWebSockets import QWebSocket
 
 # ---------- ENV ----------
@@ -1091,7 +1104,7 @@ class Main(QtWidgets.QWidget):
                 text = str(cached_or).strip()
         return text
 
-    def _or_card_widget(self, title: str, accent: str) -> QtWidgets.QWidget:
+    def _or_card_widget(self, title: str, accent: str, subtext: str = "ห้องผ่าตัด") -> QtWidgets.QWidget:
         w = QtWidgets.QFrame(); w.setObjectName("OrCard")
         c = QtGui.QColor(accent)
         dark = c.darker(130).name(); mid = c.name(); bar = c.lighter(110).name()
@@ -1111,7 +1124,7 @@ class Main(QtWidgets.QWidget):
         box = QtWidgets.QVBoxLayout(); box.setSpacing(0)
         lbl = QtWidgets.QLabel(title); lbl.setProperty("role", "or-title"); lbl.setWordWrap(False)
         lbl.setMinimumWidth(140); lbl.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        sub = QtWidgets.QLabel("ห้องผ่าตัด"); sub.setProperty("role", "or-sub"); sub.setWordWrap(False); sub.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        sub = QtWidgets.QLabel(subtext); sub.setProperty("role", "or-sub"); sub.setWordWrap(False); sub.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         box.addWidget(lbl); box.addWidget(sub); lay.addLayout(box, 1)
         shadow = QtWidgets.QGraphicsDropShadowEffect(w); shadow.setBlurRadius(24); shadow.setXOffset(0); shadow.setYOffset(8); shadow.setColor(QtGui.QColor(15, 23, 42, 48))
         w.setGraphicsEffect(shadow)
@@ -1549,31 +1562,6 @@ QCheckBox { color:#0f172a; }
         self.tree_sched.itemSelectionChanged.connect(self._on_sched_item_clicked_from_selection)
         self.tree_sched.setStyleSheet(self.tree_sched.styleSheet() + "\nQTreeView::item{ min-height: 34px; }")
 
-        # --- OR sticky badge overlay ---
-        self._orSticky = QtWidgets.QFrame(self.tree_sched.viewport())
-        self._orSticky.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
-        self._orSticky.hide()
-        self._orSticky.setStyleSheet("""
-QFrame {
-    background: qlineargradient(x1:0,y1:0, x2:1,y2:1, stop:0 #4f86ff, stop:1 #2f64e9);
-    border-radius: 14px;
-    padding: 6px 12px;
-    color: #fff;
-    border: 0px solid transparent;
-}
-QLabel { color:#fff; font-weight: 900; }
-""")
-        sticky_layout = QtWidgets.QHBoxLayout(self._orSticky)
-        sticky_layout.setContentsMargins(12, 6, 12, 6)
-        self._orStickyLabel = QtWidgets.QLabel("OR")
-        sticky_layout.addWidget(self._orStickyLabel)
-
-        self.tree_sched.verticalScrollBar().valueChanged.connect(self._update_or_sticky)
-        self.tree_sched.horizontalScrollBar().valueChanged.connect(self._update_or_sticky)
-        self.tree_sched.itemExpanded.connect(lambda *_: self._update_or_sticky())
-        self.tree_sched.itemCollapsed.connect(lambda *_: self._update_or_sticky())
-        self.tree_sched.viewport().installEventFilter(self)
-
         # Monitor
         self.card_table = ElevatedCard(
             "Result (Monitor) — จากเซิร์ฟเวอร์",
@@ -1896,65 +1884,10 @@ QLabel { color:#fff; font-weight: 900; }
         return False
 
     def _first_visible_item(self) -> QtWidgets.QTreeWidgetItem | None:
-        tree = getattr(self, "tree_sched", None)
-        if tree is None:
-            return None
-        viewport = tree.viewport()
-        if viewport is None:
-            return None
-        top_y = 0
-        for i in range(tree.topLevelItemCount()):
-            parent = tree.topLevelItem(i)
-            if parent is None:
-                continue
-            rect = tree.visualItemRect(parent)
-            if rect.bottom() >= top_y:
-                if rect.top() <= top_y <= rect.bottom():
-                    return parent
-                for j in range(parent.childCount()):
-                    child = parent.child(j)
-                    if child is None:
-                        continue
-                    child_rect = tree.visualItemRect(child)
-                    if child_rect.bottom() >= top_y:
-                        return child
-                return parent
         return None
 
     def _update_or_sticky(self):
-        tree = getattr(self, "tree_sched", None)
-        sticky = getattr(self, "_orSticky", None)
-        if tree is None or sticky is None:
-            return
-
-        item = self._first_visible_item()
-        if item is None:
-            sticky.hide()
-            return
-
-        parent = item
-        while parent.parent() is not None:
-            parent = parent.parent()
-
-        or_text = self._or_item_label(parent)
-        if not or_text:
-            sticky.hide()
-            return
-
-        rect = tree.visualItemRect(parent)
-        if not rect.isValid():
-            sticky.hide()
-            return
-
-        self._orStickyLabel.setText(or_text)
-        sticky.adjustSize()
-        width = max(120, sticky.sizeHint().width())
-        height = 32
-        x = 8
-        y = max(4, rect.top() + 6)
-        sticky.setGeometry(x, y, width, height)
-        sticky.show()
-        sticky.raise_()
+        return
 
     def _set_chip(self, ok: bool):
         base = getattr(self, "_status_pill_base", "background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;padding:4px 10px;font-weight:600;")
@@ -2269,17 +2202,6 @@ QLabel { color:#fff; font-weight: 900; }
             self.lbl_scan_state.setStyleSheet("color:#16a34a;font-weight:600;")
 
     def eventFilter(self, obj, event):
-        tree = getattr(self, "tree_sched", None)
-        viewport = tree.viewport() if tree else None
-        if viewport is not None and obj is viewport:
-            if event.type() in (
-                QtCore.QEvent.Resize,
-                QtCore.QEvent.Paint,
-                QtCore.QEvent.Show,
-                QtCore.QEvent.UpdateRequest,
-            ):
-                QtCore.QTimer.singleShot(0, self._update_or_sticky)
-
         if event.type() == QtCore.QEvent.KeyPress and self.scan_enabled:
             key = event.key()
             text = event.text() or ""
@@ -2407,7 +2329,12 @@ QLabel { color:#fff; font-weight: 900; }
                     return True
                 return (e.period == "off") or (e.period == "in" and e.hn and e.hn in in_monitor)
 
-            for e in self.sched.entries:
+            try:
+                normalized_entries = normalize_owner_for_wednesday(list(self.sched.entries), today)
+            except Exception:
+                normalized_entries = list(self.sched.entries)
+
+            for e in normalized_entries:
                 if should_show(e):
                     groups.setdefault(e.or_room or "-", []).append(e)
 
@@ -2438,7 +2365,11 @@ QLabel { color:#fff; font-weight: 900; }
                 parent.setFlags((parent.flags() | QtCore.Qt.ItemIsEnabled) & ~QtCore.Qt.ItemIsSelectable)
 
                 accent = OR_HEADER_COLORS.get(orr, "#64748b")
-                tree.setItemWidget(parent, 0, self._or_card_widget(orr, accent))
+                try:
+                    sublabel = describe_or_plan_label(today, orr) or "ห้องผ่าตัด"
+                except Exception:
+                    sublabel = "ห้องผ่าตัด"
+                tree.setItemWidget(parent, 0, self._or_card_widget(orr, accent, sublabel))
 
                 self._apply_or_expand_state(parent)
 
@@ -2482,7 +2413,6 @@ QLabel { color:#fff; font-weight: 900; }
             QtCore.QTimer.singleShot(0, _restore_scroll)
 
         QtCore.QTimer.singleShot(0, self._autofit_schedule_columns)
-        QtCore.QTimer.singleShot(0, self._update_or_sticky)
         QtCore.QTimer.singleShot(0, self._restore_selected_schedule_item)
         if self.monitor_ready:
             self._update_schedule_completion_markers()
