@@ -25,6 +25,8 @@ from icd10_catalog import (
     get_operations,
 )
 
+from fastapi_server import start_embedded_server
+
 try:
     from rapidfuzz import fuzz, process  # type: ignore
 
@@ -1045,6 +1047,11 @@ class Main(QtWidgets.QWidget):
         self.setWindowTitle("Registry Patient Connect — ORNBH")
         self.resize(1360, 900)
         apply_modern_theme(self)
+        try:
+            self._runner_api_thread = start_embedded_server()
+        except Exception as exc:  # pragma: no cover - startup path
+            print(f"[RunnerServer] failed to start: {exc}")
+            self._runner_api_thread = None
         self._build_ui(); self._load_settings(); self._pdpa_gate(); self._start_timers()
 
     # ---------- UI ----------

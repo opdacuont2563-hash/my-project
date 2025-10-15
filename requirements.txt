@@ -1,3 +1,6 @@
-﻿PySide6
+PySide6
 requests
 python-dotenv
+fastapi
+uvicorn[standard]
+qrcode[pil]
