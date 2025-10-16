@@ -300,8 +300,73 @@ DEFAULT_PORT = int(os.getenv("SURGIBOT_CLIENT_PORT", "8088"))
 DEFAULT_TOKEN = os.getenv("SURGIBOT_SECRET", "8HDYAANLgTyjbBK4JPGx1ooZbVC86_OMJ9uEXBm3EZTidUVyzhGiReaksGA0ites")
 
 # === Runner pickup service (FastAPI) ===
-RUNNER_BASE_URL = os.getenv("RUNNER_BASE_URL", "http://127.0.0.1:8777")
+RUNNER_BASE = os.getenv("SURGIBOT_RUNNER_BASE_URL", "http://127.0.0.1:8777").rstrip("/")
 RUNNER_UPDATE_API = "/runner/update"
+RUNNER_HEALTH_API = "/health"
+RUNNER_LIST_API = "/runner/list"
+RUNNER_ACK_API = "/runner/ack"
+RUNNER_ARRIVE_API = "/runner/arrive"
+
+
+def runner_health_ok(timeout: float = 0.8) -> bool:
+    try:
+        r = requests.get(f"{RUNNER_BASE}{RUNNER_HEALTH_API}", timeout=timeout)
+        return bool(r.ok)
+    except requests.RequestException:
+        return False
+
+
+def _pickup_id_for_row(r: dict) -> str:
+    day = str(r.get("date") or r.get("วันที่") or date.today().isoformat()).strip()
+    hn = str(r.get("HN") or r.get("hn") or r.get("patient_id") or "").strip()
+    or_room = str(r.get("OR") or r.get("or") or r.get("or_room") or "").strip()
+    return f"{day}:{hn}:{or_room}"
+
+
+RUNNER_STATUS_LABELS = {
+    "waiting": "รอรับ",
+    "picking": "กำลังไปรับ",
+    "arrived": "ถึง OR",
+}
+
+RUNNER_STATUS_COLORS = {
+    "waiting": "#64748b",
+    "picking": "#f59e0b",
+    "arrived": "#16a34a",
+}
+
+
+def _fetch_runner_status_map(day: str) -> Dict[str, dict]:
+    try:
+        resp = requests.get(
+            f"{RUNNER_BASE}{RUNNER_LIST_API}",
+            params={"date": day},
+            timeout=2.0,
+            headers={"Accept": "application/json"},
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if isinstance(payload, dict):
+            for key in ("items", "data", "rows", "list"):
+                maybe = payload.get(key)
+                if isinstance(maybe, list):
+                    payload = maybe
+                    break
+            else:
+                payload = [payload]
+        if not isinstance(payload, list):
+            return {}
+        results: Dict[str, dict] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            pid = row.get("pickup_id") or _pickup_id_for_row(row)
+            if not pid:
+                continue
+            results[str(pid)] = row
+        return results
+    except (requests.RequestException, ValueError):
+        return {}
 
 API_HEALTH = "/api/health"; API_LIST="/api/list"; API_LIST_FULL="/api/list_full"; API_WS="/api/ws"
 
@@ -1067,91 +1132,6 @@ class ClientHTTP:
         return {"items":[]}
 
 
-class RunnerPickupClient:
-    def __init__(self, base_url: str = RUNNER_BASE_URL, timeout: float = 3.0):
-        self.base = base_url.rstrip("/")
-        self.timeout = timeout
-        self.s = requests.Session()
-        self.s.mount(
-            "http://",
-            HTTPAdapter(
-                max_retries=Retry(
-                    total=2,
-                    connect=2,
-                    read=1,
-                    backoff_factor=0.25,
-                    status_forcelist=(429, 500, 502, 503, 504),
-                    allowed_methods=frozenset(["POST"]),
-                )
-            ),
-        )
-
-    @staticmethod
-    def _coerce_time_str(hhmm_or_tf: str) -> Optional[str]:
-        txt = (hhmm_or_tf or "").strip()
-        if not txt or txt.upper() == "TF":
-            return None
-        try:
-            hh, mm = [int(x) for x in txt.split(":", 1)]
-            if 0 <= hh <= 23 and 0 <= mm <= 59:
-                return f"{hh:02d}:{mm:02d}"
-        except Exception:
-            pass
-        return None
-
-    def _row_from_entry(self, e: "ScheduleEntry") -> dict:
-        pickup_id = getattr(e, "case_uid", None) or hashlib.sha1(
-            f"{e.or_room}|{e.hn}|{e.time}|{e.date}".encode("utf-8", "ignore")
-        ).hexdigest()
-
-        start_time = self._coerce_time_str(getattr(e, "time_start", "")) or self._coerce_time_str(e.time) or ""
-
-        due_time = ""
-        if start_time:
-            try:
-                hh, mm = [int(x) for x in start_time.split(":", 1)]
-                dt0 = datetime.combine(e.date, dtime(hh, mm)) - timedelta(minutes=15)
-                due_time = dt0.strftime("%H:%M")
-            except Exception:
-                pass
-
-        return {
-            "pickup_id": pickup_id,
-            "date": str(getattr(e, "date", date.today())),
-            "hn": e.hn or "",
-            "name": e.name or "",
-            "ward_from": e.ward or "",
-            "or_to": e.or_room or "",
-            "call_time": datetime.now().strftime("%H:%M"),
-            "due_time": due_time,
-            "status": "waiting",
-            "assignee": "",
-            "ack_time": "",
-            "start_time": start_time,
-            "arrive_time": "",
-            "note": "",
-        }
-
-    def push_entries(self, entries: list["ScheduleEntry"]) -> tuple[int, list[str]]:
-        ok = 0
-        failed: list[str] = []
-        url = self.base + RUNNER_UPDATE_API
-        for e in entries:
-            payload = self._row_from_entry(e)
-            try:
-                r = self.s.post(
-                    url,
-                    json=payload,
-                    timeout=self.timeout,
-                    headers={"Accept": "application/json"},
-                )
-                r.raise_for_status()
-                ok += 1
-            except Exception:
-                failed.append(payload.get("hn") or payload.get("pickup_id") or "-")
-        return ok, failed
-
-
 def extract_rows(payload):
     if isinstance(payload,list): src=payload
     elif isinstance(payload,dict):
@@ -1768,6 +1748,8 @@ class Main(QtWidgets.QWidget):
         self.tray = QtWidgets.QSystemTrayIcon(icon, self); self.tray.show()
 
         self._last_status_by_hn: dict[str, str] = {}
+        self._runner_status_cache: Dict[str, dict] = {}
+        self._last_runner_user: str = ""
 
         # form edit mode
         self._edit_idx: Optional[int] = None
@@ -2340,13 +2322,201 @@ class Main(QtWidgets.QWidget):
             rooms=[lst.item(i).text() for i in range(lst.count())]; self.sched.set_or_rooms(rooms); self._refresh_or_cb(self.cb_or); dlg.accept()
         ok.clicked.connect(save); dlg.exec()
 
-    def _entries_of_selected_date(self) -> list["ScheduleEntry"]:
+    def _entries_of_selected_date(self) -> List["ScheduleEntry"]:
         try:
             qdate = self.date.date()
-            day = qdate.toPython() if hasattr(qdate, "toPython") else date(qdate.year(), qdate.month(), qdate.day())
+            if hasattr(qdate, "toPython"):
+                day = qdate.toPython()
+            else:
+                day = date(qdate.year(), qdate.month(), qdate.day())
         except Exception:
             day = datetime.now().date()
-        return [e for e in list(getattr(self.sched, "entries", [])) if getattr(e, "date", None) == day]
+
+        matches: List[ScheduleEntry] = []
+
+        for entry in list(getattr(self.sched, "entries", [])):
+            entry_day = getattr(entry, "date", None)
+            if isinstance(entry_day, datetime):
+                entry_day = entry_day.date()
+            elif isinstance(entry_day, str):
+                try:
+                    entry_day = datetime.fromisoformat(entry_day).date()
+                except Exception:
+                    continue
+            if entry_day == day:
+                matches.append(entry)
+        return matches
+
+    def _pickup_id_for_entry(self, entry: "ScheduleEntry", override_or: Optional[str] = None) -> str:
+        entry_or = override_or if override_or is not None else getattr(entry, "or_room", "")
+        payload = {
+            "date": str(getattr(entry, "date", date.today())),
+            "HN": getattr(entry, "hn", ""),
+            "OR": entry_or,
+        }
+        return _pickup_id_for_row(payload)
+
+    def _coerce_time_value(self, value) -> str:
+        if value in (None, "", "TF"):
+            return ""
+        if isinstance(value, datetime):
+            return value.strftime("%H:%M")
+        if isinstance(value, dtime):
+            return value.strftime("%H:%M")
+        text = str(value).strip()
+        if not text or text.upper() == "TF":
+            return ""
+        parts = text.split(":")
+        if len(parts) >= 2 and all(part.isdigit() for part in parts[:2]):
+            try:
+                hh, mm = int(parts[0]), int(parts[1])
+                if 0 <= hh <= 23 and 0 <= mm <= 59:
+                    return f"{hh:02d}:{mm:02d}"
+            except Exception:
+                return ""
+        return text
+
+    def _entry_to_runner_payload(self, entry: "ScheduleEntry", override_or: Optional[str] = None) -> Optional[dict]:
+        hn = (entry.hn or "").strip()
+        or_room = (override_or if override_or is not None else entry.or_room or "").strip()
+        if not hn or not or_room:
+            return None
+
+        start_value = getattr(entry, "time_start", "") or getattr(entry, "time", "")
+        start_time = self._coerce_time_value(start_value)
+
+        pickup_id = self._pickup_id_for_entry(entry, or_room)
+
+        return {
+            "pickup_id": pickup_id,
+            "date": str(getattr(entry, "date", date.today())),
+            "hn": hn,
+            "name": getattr(entry, "name", ""),
+            "ward_from": getattr(entry, "ward", ""),
+            "or_to": or_room,
+            "call_time": datetime.now().strftime("%H:%M"),
+            "due_time": "",
+            "status": "waiting",
+            "assignee": "",
+            "ack_time": "",
+            "start_time": start_time,
+            "arrive_time": "",
+            "note": getattr(entry, "note", "") if hasattr(entry, "note") else "",
+        }
+
+    def _push_rows_to_runner(
+        self,
+        entries: List["ScheduleEntry"],
+        *,
+        runner_ready: Optional[bool] = None,
+        collect_failures: bool = False,
+    ) -> Tuple[int, List[str]]:
+        if not entries:
+            return (0, [])
+
+        if runner_ready is None:
+            runner_ready = runner_health_ok()
+        if not runner_ready:
+            return (0, [])
+
+        ok = 0
+        failed: List[str] = []
+        url = f"{RUNNER_BASE}{RUNNER_UPDATE_API}"
+
+        for entry in entries:
+            payload = self._entry_to_runner_payload(entry)
+            if not payload:
+                continue
+            try:
+                resp = requests.post(url, json=payload, timeout=2.0, headers={"Accept": "application/json"})
+                resp.raise_for_status()
+                ok += 1
+            except requests.RequestException:
+                if collect_failures:
+                    failed.append(payload.get("hn") or payload.get("pickup_id") or "-")
+        return ok, failed
+
+    def _runner_status_label(self, status: str) -> str:
+        status = (status or "").strip()
+        return RUNNER_STATUS_LABELS.get(status, status)
+
+    def _runner_status_tooltip(self, payload: dict) -> str:
+        hints: List[str] = []
+        mapping = [
+            ("status", "สถานะ"),
+            ("assignee", "ผู้รับเคส"),
+            ("ack_time", "เวลารับเคส"),
+            ("start_time", "เวลาเริ่มส่ง"),
+            ("arrive_time", "ถึง OR"),
+            ("note", "หมายเหตุ"),
+        ]
+        for key, label in mapping:
+            value = payload.get(key)
+            if value:
+                hints.append(f"{label}: {value}")
+        return "\n".join(hints)
+
+    def _ask_runner_name(self) -> str:
+        text, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "ชื่อผู้ไปรับเคส",
+            "กรุณาระบุชื่อเจ้าหน้าที่ Runner:",
+            QtWidgets.QLineEdit.Normal,
+            self._last_runner_user,
+        )
+        if not ok:
+            return ""
+        text = str(text).strip()
+        if text:
+            self._last_runner_user = text
+        return text
+
+    def _runner_ack(self, pickup_id: str, user: str) -> bool:
+        try:
+            resp = requests.post(
+                f"{RUNNER_BASE}{RUNNER_ACK_API}",
+                json={"pickup_id": pickup_id, "user": user},
+                timeout=2.0,
+                headers={"Accept": "application/json"},
+            )
+            return bool(resp.ok)
+        except requests.RequestException:
+            return False
+
+    def _runner_arrive(self, pickup_id: str, user: str) -> bool:
+        try:
+            resp = requests.post(
+                f"{RUNNER_BASE}{RUNNER_ARRIVE_API}",
+                json={"pickup_id": pickup_id, "user": user},
+                timeout=2.0,
+                headers={"Accept": "application/json"},
+            )
+            return bool(resp.ok)
+        except requests.RequestException:
+            return False
+
+    def _handle_runner_action(self, entry: "ScheduleEntry", action: str) -> None:
+        pid = self._pickup_id_for_entry(entry)
+        if not pid:
+            self.toast.show_toast("ไม่พบข้อมูล OR/HN สำหรับ Runner")
+            return
+        if not runner_health_ok():
+            self.toast.show_toast("ไม่สามารถเชื่อมต่อ Runner ได้")
+            return
+        user = self._ask_runner_name()
+        if not user:
+            return
+        if action == "ack":
+            ok = self._runner_ack(pid, user)
+            success_msg = "รับเคสเรียบร้อย"
+        else:
+            ok = self._runner_arrive(pid, user)
+            success_msg = "บันทึกถึง OR แล้ว"
+        if ok:
+            self.toast.show_toast(success_msg)
+            self._render_tree2()
+        else:
+            self.toast.show_toast("ส่งข้อมูลไป Runner ไม่สำเร็จ")
 
     def _on_send_runner_today(self):
         rows = self._entries_of_selected_date()
@@ -2354,21 +2524,35 @@ class Main(QtWidgets.QWidget):
             SweetAlert.info(self, "ไม่มีรายการ", "ยังไม่มีเคสของวันที่เลือกที่จะส่งให้ Runner")
             return
 
+        runner_ready = runner_health_ok()
+        if not runner_ready:
+            SweetAlert.warning(
+                self,
+                "ไม่สามารถเชื่อมต่อ",
+                f"เชื่อมต่อ Runner ไม่ได้ (ตรวจสอบ {RUNNER_BASE})",
+            )
+            return
+
         dlg = SweetAlert.loading(self, "กำลังส่งข้อมูลไป Runner ...")
         dlg.show()
         QtWidgets.QApplication.processEvents()
         try:
-            client = RunnerPickupClient(RUNNER_BASE_URL, timeout=3.0)
-            ok, failed = client.push_entries(rows)
+            ok, failed = self._push_rows_to_runner(rows, runner_ready=runner_ready, collect_failures=True)
         finally:
             dlg.close()
 
         if ok > 0 and not failed:
             SweetAlert.success(self, "สำเร็จ", f"ส่งให้ Runner แล้ว {ok} รายการ", auto_close_msec=1600)
         elif ok > 0 and failed:
-            SweetAlert.success(self, "สำเร็จบางส่วน", f"สำเร็จ {ok} • ล้มเหลว {len(failed)}\n(HN: {', '.join(failed[:10])}{' …' if len(failed) > 10 else ''})")
+            SweetAlert.success(
+                self,
+                "สำเร็จบางส่วน",
+                f"สำเร็จ {ok} • ล้มเหลว {len(failed)}\n(HN: {', '.join(failed[:10])}{' …' if len(failed) > 10 else ''})",
+            )
         else:
-            SweetAlert.warning(self, "ไม่สำเร็จ", "ส่งให้ Runner ไม่ได้เลย — ตรวจสอบว่าเซิร์ฟเวอร์ Runner เปิดอยู่ที่ 127.0.0.1:8777 หรือไม่")
+            SweetAlert.warning(self, "ไม่สำเร็จ", f"ส่งให้ Runner ไม่ได้เลย — ตรวจสอบว่าเซิร์ฟเวอร์ Runner เปิดอยู่ที่ {RUNNER_BASE} หรือไม่")
+
+        self._render_tree2()
 
     def _on_import_excel(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -3235,6 +3419,36 @@ class Main(QtWidgets.QWidget):
 
             entries_snapshot: List[ScheduleEntry] = list(self.sched.entries)
             entries_snapshot = normalize_owner_for_wednesday(entries_snapshot, base_date)
+
+            def _resolved_date(entry: ScheduleEntry) -> date:
+                day_val = getattr(entry, "date", None)
+                if isinstance(day_val, datetime):
+                    return day_val.date()
+                if isinstance(day_val, date):
+                    return day_val
+                if hasattr(day_val, "toPython"):
+                    try:
+                        return day_val.toPython()
+                    except Exception:
+                        return base_date
+                if isinstance(day_val, str):
+                    try:
+                        return datetime.fromisoformat(day_val).date()
+                    except Exception:
+                        return base_date
+                return base_date
+
+            entries_for_day = [entry for entry in entries_snapshot if _resolved_date(entry) == base_date]
+
+            runner_status_map: Dict[str, dict] = {}
+            runner_ready = False
+            if entries_for_day:
+                runner_ready = runner_health_ok()
+                if runner_ready:
+                    self._push_rows_to_runner(entries_for_day, runner_ready=True)
+                    runner_status_map = _fetch_runner_status_map(str(base_date))
+            self._runner_status_cache = runner_status_map
+
             indexed_entries: List[Tuple[int, ScheduleEntry]] = list(enumerate(entries_snapshot))
             if not indexed_entries:
                 empty = QtWidgets.QTreeWidgetItem(['— ไม่มีรายการ —'])
@@ -3373,10 +3587,31 @@ class Main(QtWidgets.QWidget):
                         ])
                         row.setData(0, QtCore.Qt.UserRole, entry.uid())
                         row.setData(0, QtCore.Qt.UserRole + 1, idx)
+                        pickup_id = self._pickup_id_for_entry(entry, or_label)
+                        row.setData(0, QtCore.Qt.UserRole + 2, pickup_id)
                         header_item.addChild(row)
 
                         badge = _period_badge(entry.period or 'in')
                         self.tree2.setItemWidget(row, 12, badge)
+
+                        runner_info = runner_status_map.get(pickup_id, {})
+                        runner_status = (runner_info or {}).get('status', '')
+                        runner_label = self._runner_status_label(runner_status)
+                        if runner_label:
+                            chip_color = RUNNER_STATUS_COLORS.get(runner_status, '#64748b')
+                            runner_chip = StatusChipWidget(runner_label, chip_color)
+                            self.tree2.setItemWidget(row, 17, runner_chip)
+                            row.setText(17, '')
+                            tooltip = self._runner_status_tooltip(runner_info)
+                            if tooltip:
+                                row.setToolTip(17, tooltip)
+                            name_txt = entry.name or '-'
+                            row.setText(2, f"[{runner_label}] {name_txt}")
+                        else:
+                            self.tree2.setItemWidget(row, 17, None)
+                            row.setText(17, status_text)
+                            row.setToolTip(17, '')
+                            row.setText(2, entry.name or '-')
 
                         monitor_status = self._last_status_by_hn.get(str(entry.hn).strip(), '')
                         if monitor_status:
@@ -3496,14 +3731,27 @@ class Main(QtWidgets.QWidget):
         if not it: return
         idx = it.data(0, QtCore.Qt.UserRole+1)
         if idx is None: return
+        idx_int = int(idx)
+        entry = self.sched.entries[idx_int] if 0 <= idx_int < len(self.sched.entries) else None
         menu = QtWidgets.QMenu(self)
         a_edit = menu.addAction("แก้ไขรายการ")
         a_del  = menu.addAction("ลบรายการ")
+        runner_ack_action = runner_arrive_action = None
+        if entry:
+            pickup_id = it.data(0, QtCore.Qt.UserRole + 2)
+            if pickup_id:
+                menu.addSeparator()
+                runner_ack_action = menu.addAction("📥 Runner: รับเคส")
+                runner_arrive_action = menu.addAction("✅ Runner: ถึง OR")
         act = menu.exec(self.tree2.viewport().mapToGlobal(pos))
         if act == a_edit:
             self._on_result_double_click(it, 0)
         elif act == a_del:
-            self._delete_entry_idx(int(idx))
+            self._delete_entry_idx(idx_int)
+        elif act and entry and runner_ack_action and act == runner_ack_action:
+            self._handle_runner_action(entry, "ack")
+        elif act and entry and runner_arrive_action and act == runner_arrive_action:
+            self._handle_runner_action(entry, "arrive")
 
     def _delete_entry_idx(self, idx:int):
         if 0 <= idx < len(self.sched.entries):
