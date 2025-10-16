@@ -1,8 +1,13 @@
 """Embedded FastAPI server that powers the OR runner workflow."""
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
+import shlex
+import subprocess
 import threading
 import time
 import uuid
@@ -19,6 +24,7 @@ import uvicorn
 from fastapi import (
     Body,
     FastAPI,
+    Header,
     HTTPException,
     Request,
     WebSocket,
@@ -29,6 +35,9 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 DB_PATH = Path(__file__).resolve().with_name("pickups.db")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+_AUTO_LINE_WEBHOOK_FLAG = os.getenv("AUTO_LINE_WEBHOOK", "0")
 _ROW_KEYS = [
     "pickup_id",
     "date",
@@ -50,6 +59,15 @@ _DB_LOCK = threading.Lock()
 _DB_INITIALIZED = False
 _SERVER_LOCK = threading.Lock()
 _server_thread: Optional[threading.Thread] = None
+_NGROK_STATUS_URL = "http://127.0.0.1:4040/api/tunnels"
+
+
+def _truthy(value: Optional[Any]) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
 def _default_runner_host() -> str:
@@ -71,6 +89,16 @@ def _default_runner_base_url() -> str:
     if base:
         return base.rstrip("/")
     return f"http://{_default_runner_host()}:{_default_runner_port()}"
+
+
+def _runner_port_for_tunnel() -> int:
+    override = os.getenv("RUNNER_PORT", "").strip()
+    if override:
+        try:
+            return int(override)
+        except ValueError:
+            pass
+    return _default_runner_port()
 
 
 def _conn() -> sqlite3.Connection:
@@ -105,6 +133,14 @@ def init_db() -> None:
                 """
             )
         _DB_INITIALIZED = True
+
+
+def _verify_line_signature(body: bytes, x_line_signature: str) -> bool:
+    if not LINE_CHANNEL_SECRET or not x_line_signature:
+        return False
+    mac = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
+    expected = base64.b64encode(mac).decode("utf-8")
+    return hmac.compare_digest(expected, x_line_signature)
 
 
 def _ensure_db() -> None:
@@ -251,6 +287,21 @@ live_clients: List[WebSocket] = []
 
 @app.get("/health")
 def health() -> Dict[str, bool]:
+    return {"ok": True}
+
+
+@app.post("/line/webhook")
+async def line_webhook(request: Request, x_line_signature: str = Header(default="")) -> Dict[str, Any]:
+    body = await request.body()
+    if not _verify_line_signature(body, x_line_signature):
+        raise HTTPException(status_code=400, detail="bad signature")
+
+    try:
+        payload = json.loads(body.decode("utf-8") or "{}") if body else {}
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="invalid payload") from exc
+
+    print("[LINE] event:", json.dumps(payload, ensure_ascii=False))
     return {"ok": True}
 
 
@@ -635,6 +686,108 @@ HTML_TEMPLATE = """
 """
 
 
+def _get_public_url_from_ngrok(attempts: int = 40, delay: float = 0.25) -> str:
+    for _ in range(attempts):
+        try:
+            response = requests.get(_NGROK_STATUS_URL, timeout=1)
+            data = response.json()
+        except Exception:
+            data = {}
+        tunnels = data.get("tunnels", []) if isinstance(data, dict) else []
+        for tunnel in tunnels:
+            url = tunnel.get("public_url") if isinstance(tunnel, dict) else None
+            if isinstance(url, str) and url.startswith("https://"):
+                return url
+        time.sleep(delay)
+    return ""
+
+
+def _ngrok_launch_command(port: int) -> List[str]:
+    custom = os.getenv("NGROK_COMMAND", "").strip()
+    if custom:
+        return shlex.split(custom)
+    target_host = os.getenv("NGROK_HOST", "").strip()
+    target = f"{target_host}:{port}" if target_host else str(port)
+    return ["ngrok", "http", target]
+
+
+def ensure_ngrok_and_set_webhook() -> str:
+    """Ensure ngrok is running and register the LINE webhook endpoint."""
+
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        raise RuntimeError("LINE_CHANNEL_ACCESS_TOKEN is not configured")
+
+    port = _runner_port_for_tunnel()
+    try:
+        requests.get(_NGROK_STATUS_URL, timeout=0.5)
+        ngrok_running = True
+    except requests.RequestException:
+        ngrok_running = False
+
+    if not ngrok_running:
+        command = _ngrok_launch_command(port)
+        try:
+            subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError as exc:  # pragma: no cover - environment specific
+            raise RuntimeError("ngrok executable not found") from exc
+        except Exception as exc:  # pragma: no cover - environment specific
+            raise RuntimeError(f"failed to launch ngrok: {exc}") from exc
+
+    public_url = _get_public_url_from_ngrok()
+    if not public_url:
+        raise RuntimeError("ngrok public URL not found")
+
+    endpoint = f"{public_url.rstrip('/')}/line/webhook"
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        response = requests.put(
+            "https://api.line.me/v2/bot/channel/webhook/endpoint",
+            headers=headers,
+            json={"endpoint": endpoint},
+            timeout=5,
+        )
+        print("[LINE] set webhook:", response.status_code, response.text)
+        response.raise_for_status()
+
+        test_response = requests.post(
+            "https://api.line.me/v2/bot/channel/webhook/endpoint/test",
+            headers=headers,
+            json={"endpoint": endpoint},
+            timeout=5,
+        )
+        print("[LINE] test webhook:", test_response.status_code, test_response.text)
+        test_response.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(f"failed to configure LINE webhook: {exc}") from exc
+
+    return endpoint
+
+
+def auto_configure_line_webhook(force: Optional[bool] = None) -> Optional[str]:
+    """Optionally configure the LINE webhook based on environment or override."""
+
+    should_configure: Any = force if force is not None else _AUTO_LINE_WEBHOOK_FLAG
+    if not _truthy(should_configure):
+        return None
+
+    try:
+        endpoint = ensure_ngrok_and_set_webhook()
+    except Exception as exc:  # pragma: no cover - network/environment heavy
+        print("[LINE] webhook configuration failed:", exc)
+        return None
+
+    print("[LINE] webhook set to:", endpoint)
+    return endpoint
+
+
 def _coerce_datetime(value: Any) -> Optional[datetime]:
     if isinstance(value, datetime):
         return value
@@ -830,6 +983,9 @@ __all__ = [
     "push_today_pickups",
     "set_status",
     "start_embedded_server",
+    "ensure_ngrok_and_set_webhook",
+    "auto_configure_line_webhook",
+    "boot_runner_services",
     "upsert_pickups",
 ]
 
@@ -862,3 +1018,11 @@ def start_embedded_server(
         thread.start()
         _server_thread = thread
         return thread
+
+
+def boot_runner_services(auto_line_webhook: Optional[bool] = None) -> threading.Thread:
+    """Start the embedded server and optionally configure LINE webhook."""
+
+    thread = start_embedded_server()
+    auto_configure_line_webhook(auto_line_webhook)
+    return thread
