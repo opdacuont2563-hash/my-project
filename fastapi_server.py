@@ -664,6 +664,12 @@ MOBILE_TEMPLATE = """<!doctype html>
     arrived:  'bg-success'
   };
 
+  // --- Mobile runner incremental render state ---
+  let ws = null, keepAlive = null;
+  let inflightController = null;       // ยกเลิก fetch เก่าได้
+  let debounceTimer = null;            // รวมสัญญาณ reload
+  const ROW_INDEX = new Map();         // id -> {hash, el}
+
   /* ---------- helpers ---------- */
   function todayISO(){ return new Date().toISOString().slice(0,10) }
   function saveName(){ localStorage.setItem('runnerName', elU.value.trim()); }
@@ -686,94 +692,151 @@ MOBILE_TEMPLATE = """<!doctype html>
     chipStatus.textContent = elS.value || 'ทุกสถานะ';
   }
   function setBtnLoading(loading){
-    if(loading){ btnText.classList.add('d-none'); btnWait.classList.remove('d-none'); elB.disabled=true; }
-    else { btnText.classList.remove('d-none'); btnWait.classList.add('d-none'); elB.disabled=false; }
+    if(loading){ btnText.classList.add('d-none'); btnWait.classList.remove('d-none'); elB.disabled=true; elFab.disabled=true; }
+    else { btnText.classList.remove('d-none'); btnWait.classList.add('d-none'); elB.disabled=false; elFab.disabled=false; }
   }
 
-  /* ---------- load list (ลดกระพริบ: ไม่ล้างก่อน, ค่อยแทนที่เมื่อได้ข้อมูล) ---------- */
-  async function loadList(){
-    updateChips(); setBtnLoading(true);
-    const date=elD.value||todayISO(), ward=elW.value.trim(), status=elS.value.trim();
-    const q=new URLSearchParams({date}); if(ward) q.set('ward',ward); if(status) q.set('status',status);
-    try{
-      const res=await fetch('/runner/list?'+q.toString());
-      if(!res.ok) throw new Error('โหลดรายการไม่สำเร็จ');
-      const rows=await res.json();
-      render(rows);
-    }catch(e){ toastErr('โหลดรายการไม่สำเร็จ'); console.error(e) }
-    finally{ setBtnLoading(false); }
+  function rowHash(r){
+    return [
+      r.status||'', r.hn||'', r.name||'',
+      r.ward_from||'', r.or_to||'',
+      r.call_time||'', r.due_time||''
+    ].join('|');
   }
 
-  function chip(txt){return `<span class="chip ms-1">${txt}</span>`}
-  function badgeStatus(st){ const cls=STATUS_CLS[st]||'badge-soft text-secondary'; const name=st==='arrived'?'ถึง OR':st==='picking'?'กำลังนำส่ง':st? 'รอรับ' : '-'; return `<span class="badge ${cls} status-badge">${name}</span>` }
+  function createCard(r){
+    const card=document.createElement('div');
+    card.className='cardx mb-2';
+    card.dataset.id = r.pickup_id;
+    updateCard(card, r);
+    return card;
+  }
+
+  function updateCard(card, r){
+    const due = r.due_time ? `<span class="badge text-dark bg-warning ms-2">${r.due_time}</span>` : '';
+    const cls = STATUS_CLS[r.status] || 'badge-soft text-secondary';
+    const name = r.status==='arrived' ? 'ถึง OR' : (r.status==='picking' ? 'กำลังนำส่ง' : (r.status ? 'รอรับ' : '-'));
+
+    if(!card._built){
+      card.innerHTML = `
+        <div class="d-flex justify-content-between align-items-start">
+          <div>
+            <div class="fw-bold x-name"></div>
+            <div class="subtitle mt-1 x-time"></div>
+          </div>
+          <div class="x-badge"></div>
+        </div>
+        <div class="divider"></div>
+        <div class="row g-2 small">
+          <div class="col-6 x-from"></div>
+          <div class="col-6 x-to"></div>
+        </div>
+        <div class="mt-2 d-flex gap-2">
+          <button class="btn btn-success btn-sm btn-pill x-ack"><i class="bi bi-check2-circle"></i> รับเคส</button>
+          <button class="btn btn-secondary btn-sm btn-pill x-arr"><i class="bi bi-flag"></i> ถึง OR</button>
+        </div>`;
+      const ackBtn = card.querySelector('.x-ack');
+      const arrBtn = card.querySelector('.x-arr');
+      ackBtn.onclick = async ()=>{
+        const current = card._row || r;
+        const user=ensureName(); if(!user){ toastErr('กรอกชื่อผู้ไปรับก่อน'); elU.focus(); return }
+        const ok = await confirmAction('ยืนยันรับเคส?', `${current.name||''} (${current.hn||''})`, 'รับเคส');
+        if(!ok.isConfirmed) return;
+        try{
+          await fetch('/runner/ack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pickup_id:current.pickup_id,user})});
+          toastOK('รับเคสเรียบร้อย'); scheduleReload();
+        }catch(e){ toastErr('ทำรายการไม่สำเร็จ'); }
+      };
+      arrBtn.onclick = async ()=>{
+        const current = card._row || r;
+        const user=ensureName(); if(!user){ toastErr('กรอกชื่อผู้ไปรับก่อน'); elU.focus(); return }
+        const ok = await confirmAction('ยืนยันถึง OR?', `${current.name||''} (${current.hn||''})`, 'บันทึกถึง OR');
+        if(!ok.isConfirmed) return;
+        try{
+          await fetch('/runner/arrive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pickup_id:current.pickup_id,user})});
+          toastOK('บันทึกถึง OR แล้ว'); scheduleReload();
+        }catch(e){ toastErr('ทำรายการไม่สำเร็จ'); }
+      };
+      card._built = true;
+    }
+
+    card.querySelector('.x-name').innerHTML = `${r.name||''} ${r.hn?`<span class="chip ms-1">${r.hn}</span>`:''}`;
+    card.querySelector('.x-time').innerHTML = `<i class="bi bi-stopwatch"></i> เรียก ${r.call_time||'-'} ${due}`;
+    card.querySelector('.x-badge').innerHTML = `<span class="badge ${cls} status-badge">${name}</span>`;
+    card.querySelector('.x-from').innerHTML  = `<i class="bi bi-building"></i> จาก: <span class="fw-semibold">${r.ward_from||'-'}</span>`;
+    card.querySelector('.x-to').innerHTML    = `<i class="bi bi-door-open"></i> ส่ง: <span class="fw-semibold">${r.or_to||'-'}</span>`;
+    card._row = r;
+  }
 
   function render(rows){
-    if(!rows || rows.length===0){
+    if(ROW_INDEX.size === 0){
+      const placeholder = elList.querySelector('[data-empty="1"]');
+      if(placeholder) placeholder.remove();
+    }
+
+    const seen = new Set();
+
+    rows.forEach(r=>{
+      if(!r || !r.pickup_id) return;
+      const id = r.pickup_id;
+      const h  = rowHash(r);
+      const found = ROW_INDEX.get(id);
+
+      if(!found){
+        const placeholder = elList.querySelector('[data-empty="1"]');
+        if(placeholder) placeholder.remove();
+        const el = createCard(r);
+        ROW_INDEX.set(id, {hash:h, el});
+        elList.appendChild(el);
+      }else{
+        if(found.hash !== h){
+          updateCard(found.el, r);
+        }
+        found.hash = h;
+        found.el._row = r;
+      }
+      seen.add(id);
+    });
+
+    for(const [id, rec] of Array.from(ROW_INDEX.entries())){
+      if(!seen.has(id)){
+        rec.el.remove();
+        ROW_INDEX.delete(id);
+      }
+    }
+
+    if(ROW_INDEX.size === 0){
       elList.innerHTML = `
-        <div class="cardx">
+        <div class="cardx" data-empty="1">
           <div class="text-center py-4">
             <i class="bi bi-inbox fs-1 text-secondary"></i>
             <div class="mt-2">ยังไม่มีรายการ</div>
             <div class="subtitle">ตรวจสอบวันที่/วอร์ด หรือกดรีเฟรชอีกครั้ง</div>
           </div>
         </div>`;
-      return;
     }
-    // สร้าง DOM ใหม่แล้วค่อยแทนที่ (ลดเฟลช/กระพริบ)
-    const wrapper = document.createElement('div');
-    rows.forEach(r=>{
-      const card=document.createElement('div');
-      card.className='cardx mb-2';
+  }
 
-      const due = r.due_time ? `<span class="badge text-dark bg-warning ms-2">${r.due_time}</span>` : '';
-      const top = `
-        <div class="d-flex justify-content-between">
-          <div>
-            <div class="fw-bold">${r.name||''} ${r.hn?chip(r.hn):''}</div>
-            <div class="subtitle mt-1"><i class="bi bi-stopwatch"></i> เรียก ${r.call_time||'-'} ${due}</div>
-          </div>
-          <div>${badgeStatus(r.status||'')}</div>
-        </div>`;
+  async function loadList(){
+    updateChips(); setBtnLoading(true);
 
-      const mid = `
-        <div class="divider"></div>
-        <div class="row g-2 small">
-          <div class="col-6"><i class="bi bi-building"></i> จาก: <span class="fw-semibold">${r.ward_from||'-'}</span></div>
-          <div class="col-6"><i class="bi bi-door-open"></i> ส่ง: <span class="fw-semibold">${r.or_to||'-'}</span></div>
-        </div>`;
+    if(inflightController){ inflightController.abort(); }
+    inflightController = new AbortController();
 
-      const btns = `
-        <div class="mt-2 d-flex gap-2">
-          <button class="btn btn-success btn-sm btn-pill" data-action="ack"><i class="bi bi-check2-circle"></i> รับเคส</button>
-          <button class="btn btn-secondary btn-sm btn-pill" data-action="arrive"><i class="bi bi-flag"></i> ถึง OR</button>
-        </div>`;
+    const date=elD.value||todayISO(), ward=elW.value.trim(), status=elS.value.trim();
+    const q=new URLSearchParams({date}); if(ward) q.set('ward',ward); if(status) q.set('status',status);
 
-      card.innerHTML = top + mid + btns;
-
-      // Handlers
-      card.querySelector('[data-action="ack"]').onclick = async ()=>{
-        const user=ensureName(); if(!user){ toastErr('กรอกชื่อผู้ไปรับก่อน'); elU.focus(); return }
-        const ok = await confirmAction('ยืนยันรับเคส?', `${r.name||''} (${r.hn||''})`, 'รับเคส');
-        if(!ok.isConfirmed) return;
-        try{
-          await fetch('/runner/ack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pickup_id:r.pickup_id,user})});
-          toastOK('รับเคสเรียบร้อย'); loadList();
-        }catch(e){ toastErr('ทำรายการไม่สำเร็จ'); }
-      };
-
-      card.querySelector('[data-action="arrive"]').onclick = async ()=>{
-        const user=ensureName(); if(!user){ toastErr('กรอกชื่อผู้ไปรับก่อน'); elU.focus(); return }
-        const ok = await confirmAction('ยืนยันถึง OR?', `${r.name||''} (${r.hn||''})`, 'บันทึกถึง OR');
-        if(!ok.isConfirmed) return;
-        try{
-          await fetch('/runner/arrive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pickup_id:r.pickup_id,user})});
-          toastOK('บันทึกถึง OR แล้ว'); loadList();
-        }catch(e){ toastErr('ทำรายการไม่สำเร็จ'); }
-      };
-
-      wrapper.appendChild(card);
-    });
-    elList.replaceChildren(...wrapper.childNodes);
+    try{
+      const res=await fetch('/runner/list?'+q.toString(), {signal: inflightController.signal});
+      if(!res.ok) throw new Error('โหลดรายการไม่สำเร็จ');
+      const rows=await res.json();
+      render(Array.isArray(rows) ? rows : []);
+    }catch(e){
+      if(e.name!=='AbortError'){ toastErr('โหลดรายการไม่สำเร็จ'); console.error(e); }
+    }finally{
+      setBtnLoading(false);
+      inflightController = null;
+    }
   }
 
   /* ---------- events ---------- */
@@ -790,7 +853,11 @@ MOBILE_TEMPLATE = """<!doctype html>
   updateChips();
 
   // WebSocket live update (เหมือนจอใหญ่)
-  let ws=null, keepAlive=null;
+  function scheduleReload(){
+    if(debounceTimer) return;
+    debounceTimer = setTimeout(()=>{ debounceTimer=null; loadList(); }, 350);
+  }
+
   function connectWS(){
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     ws = new WebSocket(`${proto}://${location.host}/runner/live`);
@@ -798,8 +865,8 @@ MOBILE_TEMPLATE = """<!doctype html>
       if(keepAlive) clearInterval(keepAlive);
       keepAlive = setInterval(()=>{ if(ws && ws.readyState===WebSocket.OPEN) ws.send('ping'); }, 25000);
     };
-    ws.onmessage = () => loadList();
-    ws.onclose = () => { if(keepAlive) clearInterval(keepAlive); keepAlive=null; setTimeout(connectWS, 2500); };
+    ws.onmessage = () => scheduleReload();
+    ws.onclose = () => { if(keepAlive) clearInterval(keepAlive); keepAlive=null; setTimeout(connectWS, 2000); };
     ws.onerror  = () => ws.close();
   }
   connectWS();
