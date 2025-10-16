@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -9,7 +10,7 @@ from datetime import date, datetime, timedelta, time as dtime
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import qrcode
 import requests
@@ -49,6 +50,27 @@ _DB_LOCK = threading.Lock()
 _DB_INITIALIZED = False
 _SERVER_LOCK = threading.Lock()
 _server_thread: Optional[threading.Thread] = None
+
+
+def _default_runner_host() -> str:
+    host = os.getenv("SURGIBOT_CLIENT_HOST", "127.0.0.1").strip()
+    return host or "127.0.0.1"
+
+
+def _default_runner_port() -> int:
+    raw = os.getenv("SURGIBOT_RUNNER_PORT", "8777").strip()
+    try:
+        port = int(raw)
+    except ValueError:
+        port = 8777
+    return port or 8777
+
+
+def _default_runner_base_url() -> str:
+    base = os.getenv("SURGIBOT_RUNNER_BASE_URL", "").strip()
+    if base:
+        return base.rstrip("/")
+    return f"http://{_default_runner_host()}:{_default_runner_port()}"
 
 
 def _conn() -> sqlite3.Connection:
@@ -641,12 +663,13 @@ class RunnerPickupClient:
 
     def __init__(
         self,
-        base_url: str = "http://127.0.0.1:8777",
+        base_url: Optional[str] = None,
         *,
         timeout: float = 3.0,
         session: Optional[requests.Session] = None,
     ) -> None:
-        self.base = base_url.rstrip("/")
+        resolved = base_url or _default_runner_base_url()
+        self.base = resolved.rstrip("/")
         self.timeout = timeout
         self.s = session or requests.Session()
 
@@ -668,9 +691,33 @@ class RunnerPickupClient:
             return True
 
         try:
-            start_embedded_server()
+            parsed = urlparse(self.base)
         except Exception:
-            pass
+            parsed = None
+
+        should_bootstrap = False
+        host_hint: Optional[str] = None
+        port_hint: Optional[int] = None
+
+        if parsed and parsed.scheme in {"http", "https"}:
+            host_hint = parsed.hostname
+            if parsed.port:
+                port_hint = parsed.port
+            default_host = _default_runner_host()
+            if host_hint in {None, "127.0.0.1", "localhost", default_host}:
+                should_bootstrap = True
+                if host_hint is None:
+                    host_hint = default_host
+                if port_hint is None:
+                    port_hint = _default_runner_port()
+        else:
+            should_bootstrap = True
+
+        if should_bootstrap:
+            try:
+                start_embedded_server(host_hint, port_hint)
+            except Exception:
+                pass
 
         for _ in range(10):
             if self._health_ok():
@@ -708,7 +755,7 @@ class RunnerPickupClient:
 def push_today_pickups(
     rows: Iterable[Dict[str, Any]],
     *,
-    base_url: str = "http://127.0.0.1:8777",
+    base_url: Optional[str] = None,
     timeout: float = 3.0,
 ) -> List[str]:
     """Push operating room rows into the pickup runner service.
@@ -787,16 +834,29 @@ __all__ = [
 ]
 
 
-def start_embedded_server(host: str = "127.0.0.1", port: int = 8777) -> threading.Thread:
+def start_embedded_server(
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+) -> threading.Thread:
     """Start the FastAPI server in a daemon thread and return immediately."""
     init_db()
+    resolved_host = (host or _default_runner_host()).strip() or _default_runner_host()
+    if isinstance(port, str):
+        try:
+            resolved_port = int(port)
+        except ValueError:
+            resolved_port = _default_runner_port()
+    elif isinstance(port, int):
+        resolved_port = port or _default_runner_port()
+    else:
+        resolved_port = _default_runner_port()
     global _server_thread
     with _SERVER_LOCK:
         if _server_thread and _server_thread.is_alive():
             return _server_thread
 
         def _run() -> None:
-            uvicorn.run(app, host=host, port=port, log_level="warning")
+            uvicorn.run(app, host=resolved_host, port=resolved_port, log_level="warning")
 
         thread = threading.Thread(target=_run, name="RunnerFastAPI", daemon=True)
         thread.start()
