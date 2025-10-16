@@ -9,6 +9,7 @@ SurgiBot Client — PySide6 (revamped layout)
 
 import os, sys, json, argparse
 import math
+import hashlib
 from pathlib import Path
 from typing import Union, List, Dict
 from datetime import datetime, timedelta, time as dtime, date as ddate
@@ -415,10 +416,16 @@ class SurgiBotClientHTTP:
         return data
 
     def _wrap_items(self, data):
-        if isinstance(data, list): return {"items": data}
+        if isinstance(data, list):
+            return {"items": data}
         if isinstance(data, dict):
-            for k in ("items","data","table","rows","list"):
-                if k in data and isinstance(data[k], list): return {"items": data[k]}
+            if isinstance(data.get("items"), list):
+                return data
+            for k in ("items", "data", "table", "rows", "list"):
+                if k in data and isinstance(data[k], list):
+                    payload = dict(data)
+                    payload["items"] = data[k]
+                    return payload
             for v in data.values():
                 if isinstance(v, list): return {"items": v}
             return data
@@ -1018,6 +1025,8 @@ class Main(QtWidgets.QWidget):
         self.monitor_ready = False
         self._was_in_monitor: set[str] = set()
         self._current_monitor_hn: set[str] = set()
+        self._last_monitor_signature = None
+        self._last_monitor_meta: dict | None = None
 
         self.setWindowTitle("SurgiBot Client — Modern (PySide6)")
         self.resize(1440, 900)
@@ -1029,7 +1038,7 @@ class Main(QtWidgets.QWidget):
 
         if self.rows_cache:
             self.monitor_ready = True
-            self._rebuild(self.rows_cache)
+            self._rebuild(self.rows_cache, {"force": True, "source": "persisted"})
 
         # Barcode
         self.scan_enabled = True; self._scan_buf = ""; self._scan_timeout_ms = 120
@@ -1039,7 +1048,7 @@ class Main(QtWidgets.QWidget):
         self._ensure_tray()
         self._refresh(prefer_server=True)
 
-        self._tick = QtCore.QTimer(self); self._tick.timeout.connect(lambda: self._rebuild(self.rows_cache)); self._tick.start(1000)
+        self._tick = QtCore.QTimer(self); self._tick.timeout.connect(self._update_monitor_elapsed); self._tick.start(1000)
         self._pull = QtCore.QTimer(self); self._pull.timeout.connect(lambda: self._refresh(True)); self._pull.start(2000)
         self._sched_timer = QtCore.QTimer(self); self._sched_timer.timeout.connect(self._check_schedule_seq); self._sched_timer.start(1000)
         self._start_websocket()
@@ -1203,7 +1212,10 @@ class Main(QtWidgets.QWidget):
         st = str(row.get("status") or "")
         if st not in AUTO_PURGE_STATUSES:
             return False
-        ts = _parse_iso(row.get("timestamp"))
+        ts = row.get("_ts")
+        if ts is None:
+            ts = _parse_iso(row.get("timestamp"))
+            row["_ts"] = ts
         if not ts:
             return False
         return (datetime.now() - ts) >= timedelta(minutes=AUTO_PURGE_MINUTES)
@@ -1620,7 +1632,11 @@ QCheckBox { color:#0f172a; }
     def _save_persisted_monitor_state(self, rows: List[dict]):
         try:
             s = QSettings(PERSIST_ORG, PERSIST_APP)
-            s.setValue(KEY_LAST_ROWS, json.dumps(rows, ensure_ascii=False))
+            clean_rows: list[dict] = []
+            for row in rows or []:
+                if isinstance(row, dict):
+                    clean_rows.append({k: v for k, v in row.items() if not str(k).startswith("_")})
+            s.setValue(KEY_LAST_ROWS, json.dumps(clean_rows, ensure_ascii=False))
             s.setValue(KEY_WAS_IN_MONITOR, json.dumps(sorted(list(self._was_in_monitor))))
             s.setValue(KEY_CURRENT_MONITOR, json.dumps(sorted(list(self._current_monitor_hn))))
         except Exception:
@@ -1915,9 +1931,16 @@ QCheckBox { color:#0f172a; }
     def _extract_rows(self, payload):
         """Normalize payload from API/websocket into monitor row dicts."""
         src = []
+        meta: dict[str, object] = {}
         if isinstance(payload, list):
             src = payload
         elif isinstance(payload, dict):
+            meta_candidates = {
+                "version": payload.get("version", payload.get("ver", payload.get("seq"))),
+                "updated_at": payload.get("updated_at", payload.get("ts")),
+                "hash": payload.get("hash"),
+            }
+            meta = {k: v for k, v in meta_candidates.items() if v is not None}
             for k in ("items", "data", "table", "rows", "list"):
                 if k in payload and isinstance(payload[k], list):
                     src = payload[k]
@@ -2006,21 +2029,25 @@ QCheckBox { color:#0f172a; }
 
             rid = it.get("id") or (hn_full if hn_full else pid) or i
 
-            rows.append({
+            row = {
                 "id": str(rid),
                 "hn_full": hn_full if hn_full else None,
                 "patient_id": str(pid),
                 "status": status,
                 "timestamp": ts_iso,
                 "eta_minutes": eta_minutes,
-            })
-        return rows
+            }
+            rows.append(row)
+
+        return rows, meta
 
     def _render_time_cell(self, row: dict) -> str:
         status = row.get("status", "")
-        ts_iso = row.get("timestamp")
+        ts = row.get("_ts")
+        if ts is None:
+            ts = _parse_iso(row.get("timestamp"))
+            row["_ts"] = ts
         eta_min = row.get("eta_minutes")
-        ts = _parse_iso(ts_iso)
 
         if status == "กำลังผ่าตัด" and ts:
             now = datetime.now()
@@ -2047,10 +2074,85 @@ QCheckBox { color:#0f172a; }
             self.tray.setToolTip("SurgiBot Client")
             self.tray.show()
 
-    def _rebuild(self, rows):
+    def _monitor_signature(self, rows: list[dict], meta: dict | None) -> tuple[str, str] | None:
+        meta = meta or {}
+        if meta.get("force"):
+            return None
+        version = meta.get("version")
+        if version is not None:
+            return ("version", str(version))
+        updated_at = meta.get("updated_at")
+        if updated_at is not None:
+            return ("updated_at", str(updated_at))
+        meta_hash = meta.get("hash")
+        if meta_hash is not None:
+            return ("hash", str(meta_hash))
+        try:
+            digest_src = json.dumps(rows, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            safe_rows = []
+            for row in rows:
+                if isinstance(row, dict):
+                    safe_rows.append({k: row.get(k) for k in ("id", "patient_id", "status", "timestamp", "eta_minutes")})
+            digest_src = json.dumps(safe_rows, ensure_ascii=False, sort_keys=True)
+        return ("digest", hashlib.sha1(digest_src.encode("utf-8")).hexdigest())
+
+    def _normalize_monitor_rows(self, rows: list[dict]) -> list[dict]:
+        normalized: list[dict] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            rid = str(row.get("id", row.get("patient_id", "")))
+            pid = str(row.get("patient_id", ""))
+            status = str(row.get("status", "")).strip() or "รอผ่าตัด"
+            hn_full = row.get("hn_full")
+            hn_full = str(hn_full).strip() if hn_full else None
+            ts_iso = row.get("timestamp")
+            if isinstance(ts_iso, (int, float)):
+                try:
+                    ts_iso = datetime.fromtimestamp(float(ts_iso)).isoformat(timespec="seconds")
+                except Exception:
+                    ts_iso = None
+            ts_iso = str(ts_iso) if ts_iso else ""
+            eta_val = row.get("eta_minutes")
+            try:
+                eta_minutes = int(eta_val) if eta_val not in (None, "") else None
+            except Exception:
+                eta_minutes = None
+
+            cleaned = {
+                "id": rid,
+                "patient_id": pid,
+                "status": status,
+                "timestamp": ts_iso,
+                "eta_minutes": eta_minutes,
+            }
+            if hn_full:
+                cleaned["hn_full"] = hn_full
+            ts_obj = _parse_iso(ts_iso)
+            cleaned["_ts"] = ts_obj
+            normalized.append(cleaned)
+        return normalized
+
+    def _rebuild(self, rows, meta: dict | None = None):
+        meta = meta or {}
+        normalized_rows = self._normalize_monitor_rows(rows if isinstance(rows, list) else [])
+        signature = self._monitor_signature(normalized_rows, meta)
+        if signature is not None and signature == self._last_monitor_signature:
+            self.rows_cache = normalized_rows
+            self._last_monitor_meta = meta
+            self.monitor_ready = True
+            return
+
+        if signature is not None:
+            self._last_monitor_signature = signature
+        else:
+            self._last_monitor_signature = None
+        self._last_monitor_meta = meta
+        self.rows_cache = normalized_rows
         # 1) แจ้งเตือนใน tray เมื่อสถานะเปลี่ยน
         new_map = {}
-        for r in rows or []:
+        for r in normalized_rows:
             pid, st = r.get("patient_id", ""), r.get("status", "")
             if pid:
                 new_map[pid] = st
@@ -2060,17 +2162,16 @@ QCheckBox { color:#0f172a; }
         self._last_states = new_map
 
         # 2) บันทึก cache และเปิดโหมด monitor
-        self.rows_cache = rows if isinstance(rows, list) else []
         self.monitor_ready = True
 
         # เก็บว่า HN ใดเคยอยู่ใน monitor แล้ว (ใช้กับการขีด + watermark)
-        for r in self.rows_cache:
+        for r in normalized_rows:
             hn_all = self._extract_hn_from_row(r)
             if hn_all:
                 self._was_in_monitor.add(hn_all)
 
         # ตัดรายการออกตามกติกา auto-purge (ฝั่ง client)
-        visible_rows = [r for r in self.rows_cache if not self._should_auto_purge(r)]
+        visible_rows = [r for r in normalized_rows if not self._should_auto_purge(r)]
 
         # อัปเดตรายชื่อ HN ที่ "ยังอยู่" ใน monitor ตอนนี้
         current = set()
@@ -2093,12 +2194,13 @@ QCheckBox { color:#0f172a; }
             self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(r.get("patient_id", ""))))
 
             # สถานะ + สีพื้นตามสถานะ
-            status_item = QtWidgets.QTableWidgetItem(str(r.get("status", "")))
-            col = STATUS_COLORS.get(r.get("status", ""))
+            status_val = str(r.get("status", ""))
+            status_item = QtWidgets.QTableWidgetItem(status_val)
+            col = STATUS_COLORS.get(status_val)
             if col:
                 status_item.setBackground(QtGui.QBrush(QtGui.QColor(col)))
-                fg = "#ffffff" if r.get("status") in ("กำลังผ่าตัด", "กำลังส่งกลับตึก",
-                                                      "เลื่อนการผ่าตัด") else "#000000"
+                fg = "#ffffff" if status_val in ("กำลังผ่าตัด", "กำลังส่งกลับตึก",
+                                                  "เลื่อนการผ่าตัด") else "#000000"
                 status_item.setForeground(QtGui.QBrush(QtGui.QColor(fg)))
             self.table.setItem(row, 2, status_item)
 
@@ -2112,20 +2214,33 @@ QCheckBox { color:#0f172a; }
         # 5) persist state
         self._save_persisted_monitor_state(self.rows_cache)
 
+    def _update_monitor_elapsed(self):
+        if not self.monitor_ready or not self.rows_cache:
+            return
+        row_cap = min(len(self.rows_cache), self.table.rowCount())
+        for idx in range(row_cap):
+            row = self.rows_cache[idx]
+            value = self._render_time_cell(row)
+            item = self.table.item(idx, 3)
+            if item is None:
+                self.table.setItem(idx, 3, QtWidgets.QTableWidgetItem(value))
+            elif item.text() != value:
+                item.setText(value)
+
     def _refresh(self, prefer_server=True):
         try:
             if prefer_server:
                 res = self._client().list_items()
-                rows = self._extract_rows(res)
+                rows, meta = self._extract_rows(res)
                 if rows is not None:
-                    self._rebuild(rows)
+                    self._rebuild(rows, meta)
                     self._set_chip(True)
                     return
             # ถ้า server ล้มเหลว ใช้ข้อมูล local model
-            self._rebuild(self.model.rows)
+            self._rebuild(self.model.rows, {"source": "local", "force": True})
         except requests.exceptions.RequestException:
             self._set_chip(False)
-            self._rebuild(self.model.rows)
+            self._rebuild(self.model.rows, {"source": "local", "force": True})
 
     # ---------- WebSocket ----------
     def _ws_url(self):
@@ -2169,9 +2284,9 @@ QCheckBox { color:#0f172a; }
     def _on_ws_message(self, msg: str):
         try:
             payload = json.loads(msg)
-            rows = self._extract_rows(payload)
+            rows, meta = self._extract_rows(payload)
             if rows is not None:
-                self._rebuild(rows)
+                self._rebuild(rows, meta)
         except Exception:
             pass
 

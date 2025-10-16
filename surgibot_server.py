@@ -37,7 +37,7 @@ import os
 import json
 from pathlib import Path
 import queue
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from waitress import serve
 import sys
 import time  # ใช้จับเวลารอให้เสียงเล่นจนจบ
@@ -232,23 +232,32 @@ def ms_until_next_boundary(interval_min: int) -> int:
 # ===================== Queue & API App =====================
 incoming_queue = queue.Queue()
 
-# snapshot เก็บครบ (รวม hn_full) แต่จะตัดก่อนส่งถ้า token ไม่ถูก
-server_snapshot = {"items": []}
 _snapshot_lock = threading.Lock()
+server_snapshot = {
+    "items": [],
+    "version": 0,
+    "updated_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+}
+server_snapshot_safe = {
+    "items": [],
+    "version": 0,
+    "updated_at": server_snapshot["updated_at"],
+}
+_server_snapshot_full_json = json.dumps({"ok": True, **server_snapshot}, ensure_ascii=False).encode("utf-8")
+_server_snapshot_safe_json = json.dumps({"ok": True, **server_snapshot_safe}, ensure_ascii=False).encode("utf-8")
 
-def _build_public_payload(include_hn_full: bool) -> dict:
+
+def _snapshot_payload_bytes(include_hn_full: bool) -> bytes:
     with _snapshot_lock:
-        if include_hn_full:
-            return json.loads(json.dumps(server_snapshot, ensure_ascii=False))
-        safe_items = []
-        for it in server_snapshot.get("items", []):
-            nz = dict(it)
-            nz.pop("hn_full", None)
-            safe_items.append(nz)
-        return {"items": safe_items}
+        return _server_snapshot_full_json if include_hn_full else _server_snapshot_safe_json
+
+
+def _snapshot_response(include_hn_full: bool) -> Response:
+    return Response(_snapshot_payload_bytes(include_hn_full), mimetype="application/json")
 
 def update_snapshot_from_dict(patient_data: dict):
-    rows = []
+    global server_snapshot, server_snapshot_safe, _server_snapshot_full_json, _server_snapshot_safe_json
+    rows: list[dict] = []
     now = datetime.now()
     for pid, d in patient_data.items():
         ts = d.get("timestamp")
@@ -272,8 +281,27 @@ def update_snapshot_from_dict(patient_data: dict):
             "eta_time": eta_iso,
             "eta_remaining_seconds": remaining
         })
+
+    rows_sorted = sorted(rows, key=lambda x: str(x.get("patient_id", "")))
+    safe_rows = []
+    for row in rows_sorted:
+        safe_row = dict(row)
+        safe_row.pop("hn_full", None)
+        safe_rows.append(safe_row)
+
     with _snapshot_lock:
-        server_snapshot["items"] = sorted(rows, key=lambda x: str(x.get("patient_id","")))
+        if rows_sorted == server_snapshot.get("items", []):
+            return
+        version = int(server_snapshot.get("version", 0)) + 1
+        updated_at = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        server_snapshot["items"] = rows_sorted
+        server_snapshot["version"] = version
+        server_snapshot["updated_at"] = updated_at
+        server_snapshot_safe["items"] = safe_rows
+        server_snapshot_safe["version"] = version
+        server_snapshot_safe["updated_at"] = updated_at
+        _server_snapshot_full_json = json.dumps({"ok": True, **server_snapshot}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        _server_snapshot_safe_json = json.dumps({"ok": True, **server_snapshot_safe}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 flask_app = Flask(__name__)
 
@@ -285,14 +313,14 @@ def api_health():
 def api_list():
     token = request.args.get("token", "")
     authed = token == SURGIBOT_SECRET
-    return jsonify(_build_public_payload(include_hn_full=authed))
+    return _snapshot_response(authed)
 
 @flask_app.route("/api/list_full", methods=["GET"])
 def api_list_full():
     token = request.args.get("token", "")
     if token != SURGIBOT_SECRET:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
-    return jsonify(_build_public_payload(include_hn_full=True))
+    return _snapshot_response(True)
 
 @flask_app.route("/api/update", methods=["POST"])
 def api_update():
