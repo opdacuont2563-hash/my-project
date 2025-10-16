@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import uuid
 from datetime import date, datetime, timedelta, time as dtime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import qrcode
@@ -635,6 +636,75 @@ def _coerce_datetime(value: Any) -> Optional[datetime]:
     return None
 
 
+class RunnerPickupClient:
+    """Lightweight HTTP client for the embedded runner service."""
+
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8777",
+        *,
+        timeout: float = 3.0,
+        session: Optional[requests.Session] = None,
+    ) -> None:
+        self.base = base_url.rstrip("/")
+        self.timeout = timeout
+        self.s = session or requests.Session()
+
+    # ------------------------------------------------------------------
+    # Liveness helpers
+    # ------------------------------------------------------------------
+    def _health_ok(self) -> bool:
+        try:
+            response = self.s.get(
+                f"{self.base}/health",
+                timeout=min(self.timeout, 0.8),
+            )
+            return response.ok
+        except requests.RequestException:
+            return False
+
+    def ensure_runner_alive(self) -> bool:
+        if self._health_ok():
+            return True
+
+        try:
+            start_embedded_server()
+        except Exception:
+            pass
+
+        for _ in range(10):
+            if self._health_ok():
+                return True
+            time.sleep(0.5)
+        return False
+
+    # ------------------------------------------------------------------
+    # Payload helpers
+    # ------------------------------------------------------------------
+    def push_entries(self, rows: Iterable[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
+        endpoint = f"{self.base}/runner/update"
+        succeeded: List[str] = []
+        failed: List[str] = []
+
+        for row in rows:
+            if not isinstance(row, dict):
+                failed.append("")
+                continue
+
+            pickup_id = str(row.get("pickup_id") or "")
+
+            try:
+                response = self.s.post(endpoint, json=row, timeout=self.timeout)
+                response.raise_for_status()
+            except requests.RequestException:
+                failed.append(pickup_id)
+                continue
+
+            succeeded.append(pickup_id)
+
+        return succeeded, failed
+
+
 def push_today_pickups(
     rows: Iterable[Dict[str, Any]],
     *,
@@ -652,9 +722,8 @@ def push_today_pickups(
         List of pickup IDs that were successfully upserted.
     """
 
-    endpoint = base_url.rstrip("/") + "/runner/update"
     today = date.today().isoformat()
-    created: List[str] = []
+    payloads: List[Dict[str, Any]] = []
 
     for raw in rows:
         if raw is None:
@@ -676,36 +745,41 @@ def push_today_pickups(
         if start_dt is not None:
             due_time = (start_dt - timedelta(minutes=15)).strftime("%H:%M")
 
-        payload = {
-            "pickup_id": pickup_id,
-            "date": raw.get("date") or today,
-            "hn": raw.get("HN") or raw.get("hn") or "",
-            "name": raw.get("ชื่อ-สกุล") or raw.get("name") or "",
-            "ward_from": raw.get("Ward") or raw.get("ward_from") or raw.get("ward") or "",
-            "or_to": raw.get("OR") or raw.get("or_to") or raw.get("or") or "",
-            "call_time": datetime.now().strftime("%H:%M"),
-            "due_time": due_time,
-            "status": "waiting",
-            "assignee": "",
-            "ack_time": "",
-            "start_time": start_dt.strftime("%H:%M") if start_dt else (start_candidate or ""),
-            "arrive_time": "",
-            "note": raw.get("หมายเหตุ") or raw.get("note") or "",
-        }
+        payloads.append(
+            {
+                "pickup_id": pickup_id,
+                "date": raw.get("date") or today,
+                "hn": raw.get("HN") or raw.get("hn") or "",
+                "name": raw.get("ชื่อ-สกุล") or raw.get("name") or "",
+                "ward_from": raw.get("Ward") or raw.get("ward_from") or raw.get("ward") or "",
+                "or_to": raw.get("OR") or raw.get("or_to") or raw.get("or") or "",
+                "call_time": datetime.now().strftime("%H:%M"),
+                "due_time": due_time,
+                "status": "waiting",
+                "assignee": "",
+                "ack_time": "",
+                "start_time": start_dt.strftime("%H:%M") if start_dt else (start_candidate or ""),
+                "arrive_time": "",
+                "note": raw.get("หมายเหตุ") or raw.get("note") or "",
+            }
+        )
 
-        try:
-            response = requests.post(endpoint, json=payload, timeout=timeout)
-            response.raise_for_status()
-            created.append(pickup_id)
-        except requests.RequestException:
-            continue
-    return created
+    if not payloads:
+        return []
+
+    client = RunnerPickupClient(base_url=base_url, timeout=timeout)
+    if not client.ensure_runner_alive():
+        return []
+
+    succeeded, _ = client.push_entries(payloads)
+    return succeeded
 
 
 __all__ = [
     "app",
     "init_db",
     "list_pickups",
+    "RunnerPickupClient",
     "push_today_pickups",
     "set_status",
     "start_embedded_server",
