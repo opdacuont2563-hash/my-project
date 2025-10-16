@@ -685,6 +685,145 @@ HTML_TEMPLATE = """
 </html>
 """
 
+# ======== ADD: Mobile runner view & QR ========
+
+MOBILE_TEMPLATE = """<!doctype html>
+<html lang=\"th\"><head>
+<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>Runner Mobile</title>
+<link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css\" rel=\"stylesheet\">
+<style>
+  body{background:#0b1020;color:#f5f6fb;font-family:'Sarabun','Segoe UI',sans-serif}
+  .card{background:#121833;border:none;border-radius:16px}
+  .chip{display:inline-block;padding:.1rem .5rem;border-radius:999px;background:#223; font-size:.8rem}
+  .fixed-topbar{position:sticky;top:0;z-index:50;background:#0b1020;padding:.5rem .75rem;border-bottom:1px solid #1e2644}
+  .bigbtn{min-width:110px}
+</style>
+</head>
+<body>
+<div class=\"fixed-topbar\">
+  <div class=\"row g-2 align-items-end\">
+    <div class=\"col-5\">
+      <label class=\"form-label mb-1\">วันที่</label>
+      <input id=\"d\" type=\"date\" class=\"form-control form-control-sm\">
+    </div>
+    <div class=\"col-7\">
+      <label class=\"form-label mb-1\">วอร์ด</label>
+      <input id=\"w\" class=\"form-control form-control-sm\" placeholder=\"เช่น SICU\">
+    </div>
+    <div class=\"col-6\">
+      <label class=\"form-label mb-1\">สถานะ</label>
+      <select id=\"s\" class=\"form-select form-select-sm\">
+        <option value=\"\">ทั้งหมด</option><option value=\"waiting\">รอรับ</option>
+        <option value=\"picking\">กำลังนำส่ง</option><option value=\"arrived\">ถึง OR</option>
+      </select>
+    </div>
+    <div class=\"col-6\">
+      <label class=\"form-label mb-1\">ชื่อผู้ไปรับ</label>
+      <input id=\"u\" class=\"form-control form-control-sm\" placeholder=\"เช่น สมชาย\">
+    </div>
+    <div class=\"col-12 text-end\">
+      <button id=\"b\" class=\"btn btn-primary btn-sm mt-1\">โหลดรายการ</button>
+    </div>
+  </div>
+</div>
+
+<div class=\"container-fluid py-2\" id=\"list\"></div>
+
+<script>
+  const elD=document.getElementById('d'), elW=document.getElementById('w'),
+        elS=document.getElementById('s'), elU=document.getElementById('u'),
+        elB=document.getElementById('b'), elList=document.getElementById('list');
+
+  function todayISO(){return new Date().toISOString().slice(0,10)}
+  function saveName(){ localStorage.setItem('runnerName', elU.value.trim()); }
+  function ensureName(){ let n=elU.value.trim() || localStorage.getItem('runnerName')||''; if(!elU.value) elU.value=n; return n; }
+
+  async function loadList(){
+    const date=elD.value||todayISO(), ward=elW.value.trim(), status=elS.value.trim();
+    const q=new URLSearchParams({date}); if(ward) q.set('ward',ward); if(status) q.set('status',status);
+    const res=await fetch('/runner/list?'+q.toString()); const rows=await res.json();
+    render(rows);
+  }
+
+  function chip(txt){return `<span class="chip ms-1">${txt}</span>`}
+
+  function render(rows){
+    elList.innerHTML='';
+    rows.forEach(r=>{
+      const due=r.due_time?`<span class="badge bg-warning text-dark ms-2">${r.due_time}</span>`:'';
+      const st=r.status==='arrived'?'success':(r.status==='picking'?'warning text-dark':'secondary');
+      const card=document.createElement('div');
+      card.className='card p-3 mb-2';
+      card.innerHTML=`
+        <div class="d-flex justify-content-between align-items-start">
+          <div>
+            <div class="fw-bold">${r.name||''}${r.hn?chip(r.hn):''}${r.ward_from?chip(r.ward_from):''}${r.or_to?chip(r.or_to):''}</div>
+            <div class="mt-1 small text-muted">เรียก ${r.call_time||'-'}</div>
+          </div>
+          <span class="badge bg-${st}">${r.status||'-'}</span>
+        </div>
+        <div class="mt-2 d-flex gap-2">
+          <button class="btn btn-success btn-sm bigbtn" onclick="ack('${r.pickup_id}')">รับเคส</button>
+          <button class="btn btn-secondary btn-sm bigbtn" onclick="arrive('${r.pickup_id}')">ถึง OR</button>
+        </div>`;
+      elList.appendChild(card);
+    })
+  }
+
+  async function ack(id){
+    const user=ensureName(); if(!user){ alert('กรอกชื่อผู้ไปรับก่อน'); elU.focus(); return }
+    saveName();
+    await fetch('/runner/ack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pickup_id:id,user})});
+    loadList();
+  }
+  async function arrive(id){
+    const user=ensureName(); if(!user){ alert('กรอกชื่อผู้ไปรับก่อน'); elU.focus(); return }
+    saveName();
+    await fetch('/runner/arrive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pickup_id:id,user})});
+    loadList();
+  }
+
+  elB.onclick=loadList; elD.onchange=loadList; elW.onchange=loadList; elS.onchange=loadList; elU.onchange=saveName;
+  elD.value=todayISO();
+  const p=new URLSearchParams(location.search); if(p.get('ward')) elW.value=p.get('ward');
+  if(localStorage.getItem('runnerName')) elU.value=localStorage.getItem('runnerName');
+  loadList();
+</script>
+</body></html>
+"""
+
+
+@app.get("/m", response_class=HTMLResponse)
+def mobile_page() -> str:
+    return MOBILE_TEMPLATE
+
+
+@app.get("/m/qr")
+def mobile_qr(request: Request, ward: str = "") -> StreamingResponse:
+    base = str(request.base_url).rstrip("/")
+    url = f"{base}/m"
+    if ward:
+        from urllib.parse import urlencode as _urlencode
+
+        url = f"{url}?{_urlencode({'ward': ward})}"
+    qr = qrcode.QRCode(box_size=8, border=4)
+    qr.add_data(url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="image/png",
+        headers={
+            "Content-Disposition": f"inline; filename=runner_mobile_{ward or 'all'}.png"
+        },
+    )
+
+# ======== END ADD ========
+
 
 def _get_public_url_from_ngrok(attempts: int = 40, delay: float = 0.25) -> str:
     for _ in range(attempts):
