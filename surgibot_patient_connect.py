@@ -43,6 +43,12 @@ _DEFAULT_SPECIALTY_LABELS = {
     "OR8": "ศัลยกรรมร่วม / สำรอง",
 }
 
+# Public-facing OR labels reused by both client and patient consoles.
+OR_LABELS: dict[str, str] = {
+    room: f"{room} — {_DEFAULT_SPECIALTY_LABELS.get(room, '')}".strip(" —")
+    for room in KNOWN_OR_ROOMS
+}
+
 # Keywords to infer OR ownership from free-form text.
 _OWNER_KEYWORDS = (
     ("ศัลยกรรมทั่วไป", "OR1"),
@@ -204,6 +210,119 @@ def normalize_owner_for_wednesday(entries: Sequence[Any], today: Any | None = No
     return normalised
 
 
+def _ensure_or_room(entry: Any) -> str:
+    """Ensure an entry exposes ``or_room`` / ``or`` consistently."""
+
+    room = str(_get(entry, "or_room", "") or _get(entry, "or", "")).strip()
+    if room:
+        if not room.upper().startswith("OR") and room.isdigit():
+            room = f"OR{room}"
+    else:
+        owner_hint = _room_from_owner(str(_get(entry, "owner", "") or _get(entry, "or_owner", "")))
+        if owner_hint:
+            room = owner_hint
+
+    if room:
+        _set_or(entry, room)
+    return room
+
+
+def apply_owner_rules(entries: Sequence[Any], day: Any | None = None) -> list[Any]:
+    """Normalise schedule payloads using shared OR ownership rules."""
+
+    normalised = normalize_owner_for_wednesday(entries, day)
+    for entry in normalised:
+        try:
+            _ensure_or_room(entry)
+        except Exception:
+            continue
+    return normalised
+
+
+def fetch_today_schedule() -> list[dict[str, Any]]:
+    """Return the raw schedule snapshot stored in shared settings."""
+
+    return _snapshot_entries()
+
+
+def _combine_schedule_fields(entry: dict[str, Any]) -> str:
+    period = str(entry.get("period") or "").strip()
+    slot = str(entry.get("time") or "").strip()
+    if period and slot:
+        return f"{period} — {slot}"
+    return slot or period
+
+
+def _join_list(value: Any) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(str(v) for v in value if v)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _coerce_queue(value: Any) -> Any:
+    if value in (None, ""):
+        return ""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def get_patients_for_display(day: Any | None = None) -> list[dict[str, Any]]:
+    """Return schedule rows prepared for display in client widgets."""
+
+    base_date = _ensure_date(day) or date.today()
+    raw_entries = fetch_today_schedule()
+    processed = apply_owner_rules(raw_entries, base_date)
+
+    rows: list[dict[str, Any]] = []
+    for item in processed:
+        if not isinstance(item, dict):
+            continue
+        item_date = _parse_date(item.get("date"))
+        if item_date and item_date != base_date:
+            continue
+
+        row = {
+            "queue_no": _coerce_queue(item.get("queue")),
+            "hn": str(item.get("hn") or ""),
+            "patient_name": str(item.get("name") or item.get("patient_name") or ""),
+            "procedure": _join_list(item.get("ops") or item.get("operation")),
+            "department": str(item.get("dept") or item.get("department") or ""),
+            "case_size": str(item.get("case_size") or ""),
+            "or_room": str(item.get("or_room") or item.get("or") or ""),
+            "surgeon": str(item.get("doctor") or item.get("surgeon") or ""),
+            "anesth": str(
+                item.get("anesth")
+                or item.get("anesthesiologist")
+                or item.get("anes")
+                or ""
+            ),
+            "schedule": _combine_schedule_fields(item),
+            "status": str(item.get("status") or item.get("state") or ""),
+        }
+
+        # Provide fallbacks for empty values
+        if not row["procedure"]:
+            row["procedure"] = _join_list(item.get("diags") or item.get("diagnosis"))
+        if not row["status"] and item.get("urgency"):
+            row["status"] = str(item.get("urgency"))
+
+        rows.append(row)
+
+    def _sort_key(entry: dict[str, Any]):
+        return (
+            str(entry.get("or_room") or ""),
+            entry.get("queue_no") if isinstance(entry.get("queue_no"), int) else 9999,
+            str(entry.get("schedule") or ""),
+        )
+
+    rows.sort(key=_sort_key)
+    return rows
+
+
 @lru_cache(maxsize=32)
 def _snapshot_entries() -> list[dict[str, Any]]:
     if QSettings is None:  # pragma: no cover - headless unit tests
@@ -272,6 +391,10 @@ def describe_or_plan_label(day: Any | None, room: str) -> str:
 
 
 __all__ = [
+    "OR_LABELS",
     "describe_or_plan_label",
     "normalize_owner_for_wednesday",
+    "apply_owner_rules",
+    "fetch_today_schedule",
+    "get_patients_for_display",
 ]
