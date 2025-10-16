@@ -528,105 +528,281 @@ def runner_qr(request: Request, ward: str = "") -> StreamingResponse:
 # --------- Mobile view ----------
 MOBILE_TEMPLATE = """<!doctype html>
 <html lang="th"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Runner Mobile</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
 <style>
-  body{background:#0b1020;color:#f5f6fb;font-family:'Sarabun','Segoe UI',sans-serif}
-  .card{background:#121833;border:none;border-radius:16px}
-  .chip{display:inline-block;padding:.1rem .5rem;border-radius:999px;background:#223; font-size:.8rem}
-  .fixed-topbar{position:sticky;top:0;z-index:50;background:#0b1020;padding:.5rem .75rem;border-bottom:1px solid #1e2644}
-  .bigbtn{min-width:110px}
+  :root{
+    --bg:#f5f7fb;
+    --header:#ffffff;
+    --text:#0f172a;
+    --muted:#64748b;
+    --primary:#2563eb;
+    --success:#16a34a;
+    --warning:#f59e0b;
+    --chip:#eef2ff;
+    --card:#ffffff;
+    --border:#e5e7eb;
+    --shadow:0 10px 24px rgba(2,6,23,.08);
+  }
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:"Sarabun","Segoe UI",system-ui,-apple-system,sans-serif}
+
+  /* Topbar */
+  .topbar{
+    position:sticky; top:0; z-index:1000; background:var(--header);
+    border-bottom:1px solid var(--border);
+  }
+  .brand{display:flex; align-items:center; gap:.5rem; font-weight:700}
+  .brand .dot{width:10px;height:10px;border-radius:999px;background:var(--success)}
+
+  .btn-ghost{color:var(--text);border:1px solid var(--border);background:#fff}
+  .btn-ghost:hover{background:#f8fafc}
+
+  /* Filter panel */
+  .filter-panel{padding:.75rem .75rem .5rem .75rem}
+  .chip{
+    display:inline-flex; align-items:center; gap:.35rem;
+    padding:.25rem .6rem; border-radius:999px;
+    background:var(--chip); color:#334155; font-size:.8rem;
+    border:1px solid var(--border)
+  }
+
+  /* List */
+  .page{padding:12px}
+  .cardx{
+    background:var(--card); border:1px solid var(--border);
+    border-radius:14px; padding:14px; box-shadow:var(--shadow);
+    animation:fadeIn .18s ease;
+  }
+  .subtitle{color:var(--muted);font-size:.88rem}
+  .divider{border-top:1px dashed var(--border);margin:.5rem 0}
+  .btn-pill{border-radius:12px; padding:.35rem .75rem}
+  .badge-soft{border:1px solid var(--border); background:#f8fafc}
+  .status-badge{font-size:.8rem}
+
+  /* Floating refresh */
+  .fab{
+    position:fixed; right:14px; bottom:18px; z-index:1001;
+    border-radius:999px; padding:.7rem .9rem; font-size:1.05rem;
+    background:var(--primary); border:none; color:white; box-shadow:0 10px 24px rgba(37,99,235,.35);
+  }
+
+  /* Animations (เน้นนุ่ม ไม่กระพริบ) */
+  @keyframes fadeIn{from{opacity:0; transform:translateY(4px)} to{opacity:1; transform:none}}
 </style>
 </head>
 <body>
-<div class="fixed-topbar">
-  <div class="row g-2 align-items-end">
-    <div class="col-5">
-      <label class="form-label mb-1">วันที่</label>
-      <input id="d" type="date" class="form-control form-control-sm">
+
+<!-- Topbar -->
+<div class="topbar">
+  <div class="container-fluid py-2 px-3">
+    <div class="d-flex align-items-center justify-content-between">
+      <div class="brand"><span class="dot"></span> Runner <span class="d-none d-sm-inline">Mobile</span></div>
+      <div class="d-flex gap-2">
+        <button class="btn btn-sm btn-ghost" id="btn-toggle"><i class="bi bi-sliders"></i> ตัวกรอง</button>
+      </div>
     </div>
-    <div class="col-7">
-      <label class="form-label mb-1">วอร์ด</label>
-      <input id="w" class="form-control form-control-sm" placeholder="เช่น SICU">
-    </div>
-    <div class="col-6">
-      <label class="form-label mb-1">สถานะ</label>
-      <select id="s" class="form-select form-select-sm">
-        <option value="">ทั้งหมด</option><option value="waiting">รอรับ</option>
-        <option value="picking">กำลังนำส่ง</option><option value="arrived">ถึง OR</option>
-      </select>
-    </div>
-    <div class="col-6">
-      <label class="form-label mb-1">ชื่อผู้ไปรับ</label>
-      <input id="u" class="form-control form-control-sm" placeholder="เช่น สมชาย">
-    </div>
-    <div class="col-12 text-end">
-      <button id="b" class="btn btn-primary btn-sm mt-1">โหลดรายการ</button>
+
+    <!-- Filters -->
+    <div id="filters" class="filter-panel">
+      <div class="row g-2 align-items-end">
+        <div class="col-5">
+          <label class="form-label mb-1">วันที่</label>
+          <input id="d" type="date" class="form-control form-control-sm">
+        </div>
+        <div class="col-7">
+          <label class="form-label mb-1">วอร์ด</label>
+          <input id="w" class="form-control form-control-sm" placeholder="เช่น SICU">
+        </div>
+        <div class="col-6">
+          <label class="form-label mb-1">สถานะ</label>
+          <select id="s" class="form-select form-select-sm">
+            <option value="">ทั้งหมด</option>
+            <option value="waiting">รอรับ</option>
+            <option value="picking">กำลังนำส่ง</option>
+            <option value="arrived">ถึง OR</option>
+          </select>
+        </div>
+        <div class="col-6">
+          <label class="form-label mb-1">ชื่อผู้ไปรับ</label>
+          <input id="u" class="form-control form-control-sm" placeholder="เช่น สมชาย">
+        </div>
+        <div class="col-12 text-end">
+          <button id="b" class="btn btn-primary btn-sm mt-1"><span class="btn-text"><i class="bi bi-cloud-download"></i> โหลดรายการ</span><span class="btn-wait d-none"><span class="spinner-border spinner-border-sm me-1"></span>กำลังโหลด</span></button>
+        </div>
+      </div>
+      <div class="pt-2">
+        <span class="chip me-2"><i class="bi bi-calendar-date"></i> <span id="chip-date">วันนี้</span></span>
+        <span class="chip me-2"><i class="bi bi-building"></i> <span id="chip-ward">ทุกวอร์ด</span></span>
+        <span class="chip"><i class="bi bi-activity"></i> <span id="chip-status">ทุกสถานะ</span></span>
+      </div>
     </div>
   </div>
 </div>
 
-<div class="container-fluid py-2" id="list"></div>
+<!-- List -->
+<div class="page container-fluid" id="list"></div>
+
+<!-- Floating refresh -->
+<button class="fab" id="fab"><i class="bi bi-arrow-clockwise"></i></button>
 
 <script>
   const elD=document.getElementById('d'), elW=document.getElementById('w'),
         elS=document.getElementById('s'), elU=document.getElementById('u'),
-        elB=document.getElementById('b'), elList=document.getElementById('list');
+        elB=document.getElementById('b'), elList=document.getElementById('list'),
+        elFab=document.getElementById('fab'), elToggle=document.getElementById('btn-toggle'),
+        chipDate=document.getElementById('chip-date'), chipWard=document.getElementById('chip-ward'), chipStatus=document.getElementById('chip-status'),
+        btnText=elB.querySelector('.btn-text'), btnWait=elB.querySelector('.btn-wait');
 
-  function todayISO(){return new Date().toISOString().slice(0,10)}
+  const STATUS_CLS = {
+    waiting:  'badge-soft text-secondary',
+    picking:  'bg-warning text-dark',
+    arrived:  'bg-success'
+  };
+
+  /* ---------- helpers ---------- */
+  function todayISO(){ return new Date().toISOString().slice(0,10) }
   function saveName(){ localStorage.setItem('runnerName', elU.value.trim()); }
-  function ensureName(){ let n=elU.value.trim() || localStorage.getItem('runnerName')||''; if(!elU.value) elU.value=n; return n; }
+  function ensureName(){
+    let n=elU.value.trim() || localStorage.getItem('runnerName')||'';
+    if(!elU.value) elU.value=n; return n;
+  }
+  function toastOK(msg){
+    Swal.fire({toast:true,position:'top',icon:'success',title:msg,showConfirmButton:false,timer:1300});
+  }
+  function toastErr(msg){
+    Swal.fire({toast:true,position:'top',icon:'error',title:msg,showConfirmButton:false,timer:1600});
+  }
+  function confirmAction(title, text, confirmTxt='ยืนยัน'){
+    return Swal.fire({icon:'question', title, text, showCancelButton:true, confirmButtonText:confirmTxt, cancelButtonText:'ยกเลิก', confirmButtonColor:'#2563eb'});
+  }
+  function updateChips(){
+    chipDate.textContent = elD.value ? elD.value : 'วันนี้';
+    chipWard.textContent = elW.value.trim() || 'ทุกวอร์ด';
+    chipStatus.textContent = elS.value || 'ทุกสถานะ';
+  }
+  function setBtnLoading(loading){
+    if(loading){ btnText.classList.add('d-none'); btnWait.classList.remove('d-none'); elB.disabled=true; }
+    else { btnText.classList.remove('d-none'); btnWait.classList.add('d-none'); elB.disabled=false; }
+  }
 
+  /* ---------- load list (ลดกระพริบ: ไม่ล้างก่อน, ค่อยแทนที่เมื่อได้ข้อมูล) ---------- */
   async function loadList(){
+    updateChips(); setBtnLoading(true);
     const date=elD.value||todayISO(), ward=elW.value.trim(), status=elS.value.trim();
     const q=new URLSearchParams({date}); if(ward) q.set('ward',ward); if(status) q.set('status',status);
-    const res=await fetch('/runner/list?'+q.toString()); const rows=await res.json();
-    render(rows);
+    try{
+      const res=await fetch('/runner/list?'+q.toString());
+      if(!res.ok) throw new Error('โหลดรายการไม่สำเร็จ');
+      const rows=await res.json();
+      render(rows);
+    }catch(e){ toastErr('โหลดรายการไม่สำเร็จ'); console.error(e) }
+    finally{ setBtnLoading(false); }
   }
 
   function chip(txt){return `<span class="chip ms-1">${txt}</span>`}
+  function badgeStatus(st){ const cls=STATUS_CLS[st]||'badge-soft text-secondary'; const name=st==='arrived'?'ถึง OR':st==='picking'?'กำลังนำส่ง':st? 'รอรับ' : '-'; return `<span class="badge ${cls} status-badge">${name}</span>` }
 
   function render(rows){
-    elList.innerHTML='';
-    rows.forEach(r=>{
-      const due=r.due_time?`<span class="badge bg-warning text-dark ms-2">${r.due_time}</span>`:'';
-      const st=r.status==='arrived'?'success':(r.status==='picking'?'warning text-dark':'secondary');
-      const card=document.createElement('div');
-      card.className='card p-3 mb-2';
-      card.innerHTML=`
-        <div class="d-flex justify-content-between align-items-start">
-          <div>
-            <div class="fw-bold">${r.name||''}${r.hn?chip(r.hn):''}${r.ward_from?chip(r.ward_from):''}${r.or_to?chip(r.or_to):''}</div>
-            <div class="mt-1 small text-muted">เรียก ${r.call_time||'-'}</div>
+    if(!rows || rows.length===0){
+      elList.innerHTML = `
+        <div class="cardx">
+          <div class="text-center py-4">
+            <i class="bi bi-inbox fs-1 text-secondary"></i>
+            <div class="mt-2">ยังไม่มีรายการ</div>
+            <div class="subtitle">ตรวจสอบวันที่/วอร์ด หรือกดรีเฟรชอีกครั้ง</div>
           </div>
-          <span class="badge bg-${st}">${r.status||'-'}</span>
-        </div>
-        <div class="mt-2 d-flex gap-2">
-          <button class="btn btn-success btn-sm bigbtn" onclick="ack('${r.pickup_id}')">รับเคส</button>
-          <button class="btn btn-secondary btn-sm bigbtn" onclick="arrive('${r.pickup_id}')">ถึง OR</button>
         </div>`;
-      elList.appendChild(card);
-    })
+      return;
+    }
+    // สร้าง DOM ใหม่แล้วค่อยแทนที่ (ลดเฟลช/กระพริบ)
+    const wrapper = document.createElement('div');
+    rows.forEach(r=>{
+      const card=document.createElement('div');
+      card.className='cardx mb-2';
+
+      const due = r.due_time ? `<span class="badge text-dark bg-warning ms-2">${r.due_time}</span>` : '';
+      const top = `
+        <div class="d-flex justify-content-between">
+          <div>
+            <div class="fw-bold">${r.name||''} ${r.hn?chip(r.hn):''}</div>
+            <div class="subtitle mt-1"><i class="bi bi-stopwatch"></i> เรียก ${r.call_time||'-'} ${due}</div>
+          </div>
+          <div>${badgeStatus(r.status||'')}</div>
+        </div>`;
+
+      const mid = `
+        <div class="divider"></div>
+        <div class="row g-2 small">
+          <div class="col-6"><i class="bi bi-building"></i> จาก: <span class="fw-semibold">${r.ward_from||'-'}</span></div>
+          <div class="col-6"><i class="bi bi-door-open"></i> ส่ง: <span class="fw-semibold">${r.or_to||'-'}</span></div>
+        </div>`;
+
+      const btns = `
+        <div class="mt-2 d-flex gap-2">
+          <button class="btn btn-success btn-sm btn-pill" data-action="ack"><i class="bi bi-check2-circle"></i> รับเคส</button>
+          <button class="btn btn-secondary btn-sm btn-pill" data-action="arrive"><i class="bi bi-flag"></i> ถึง OR</button>
+        </div>`;
+
+      card.innerHTML = top + mid + btns;
+
+      // Handlers
+      card.querySelector('[data-action="ack"]').onclick = async ()=>{
+        const user=ensureName(); if(!user){ toastErr('กรอกชื่อผู้ไปรับก่อน'); elU.focus(); return }
+        const ok = await confirmAction('ยืนยันรับเคส?', `${r.name||''} (${r.hn||''})`, 'รับเคส');
+        if(!ok.isConfirmed) return;
+        try{
+          await fetch('/runner/ack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pickup_id:r.pickup_id,user})});
+          toastOK('รับเคสเรียบร้อย'); loadList();
+        }catch(e){ toastErr('ทำรายการไม่สำเร็จ'); }
+      };
+
+      card.querySelector('[data-action="arrive"]').onclick = async ()=>{
+        const user=ensureName(); if(!user){ toastErr('กรอกชื่อผู้ไปรับก่อน'); elU.focus(); return }
+        const ok = await confirmAction('ยืนยันถึง OR?', `${r.name||''} (${r.hn||''})`, 'บันทึกถึง OR');
+        if(!ok.isConfirmed) return;
+        try{
+          await fetch('/runner/arrive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pickup_id:r.pickup_id,user})});
+          toastOK('บันทึกถึง OR แล้ว'); loadList();
+        }catch(e){ toastErr('ทำรายการไม่สำเร็จ'); }
+      };
+
+      wrapper.appendChild(card);
+    });
+    elList.replaceChildren(...wrapper.childNodes);
   }
 
-  async function ack(id){
-    const user=ensureName(); if(!user){ alert('กรอกชื่อผู้ไปรับก่อน'); elU.focus(); return }
-    saveName();
-    await fetch('/runner/ack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pickup_id:id,user})});
-    loadList();
-  }
-  async function arrive(id){
-    const user=ensureName(); if(!user){ alert('กรอกชื่อผู้ไปรับก่อน'); elU.focus(); return }
-    saveName();
-    await fetch('/runner/arrive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pickup_id:id,user})});
-    loadList();
-  }
+  /* ---------- events ---------- */
+  elB.onclick=loadList; elFab.onclick=loadList;
+  elD.onchange=()=>{updateChips(); loadList()}; elW.onchange=()=>{updateChips(); loadList()}; elS.onchange=()=>{updateChips(); loadList()};
+  elU.onchange=saveName;
+  elToggle.onclick=()=>{ const f=document.getElementById('filters'); f.style.display= (f.style.display==='none'?'block':'none'); };
 
-  elB.onclick=loadList; elD.onchange=loadList; elW.onchange=loadList; elS.onchange=loadList; elU.onchange=saveName;
+  // init
   elD.value=todayISO();
-  const p=new URLSearchParams(location.search); if(p.get('ward')) elW.value=p.get('ward');
+  const p=new URLSearchParams(location.search);
+  if(p.get('ward')) elW.value=p.get('ward');
   if(localStorage.getItem('runnerName')) elU.value=localStorage.getItem('runnerName');
+  updateChips();
+
+  // WebSocket live update (เหมือนจอใหญ่)
+  let ws=null, keepAlive=null;
+  function connectWS(){
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/runner/live`);
+    ws.onopen = () => {
+      if(keepAlive) clearInterval(keepAlive);
+      keepAlive = setInterval(()=>{ if(ws && ws.readyState===WebSocket.OPEN) ws.send('ping'); }, 25000);
+    };
+    ws.onmessage = () => loadList();
+    ws.onclose = () => { if(keepAlive) clearInterval(keepAlive); keepAlive=null; setTimeout(connectWS, 2500); };
+    ws.onerror  = () => ws.close();
+  }
+  connectWS();
   loadList();
 </script>
 </body></html>
