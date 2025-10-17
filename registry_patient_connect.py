@@ -322,6 +322,7 @@ RUNNER_HEALTH_API = "/health"
 RUNNER_LIST_API = "/runner/list"
 RUNNER_ACK_API = "/runner/ack"
 RUNNER_ARRIVE_API = "/runner/arrive"
+RUNNER_FINISH_API = "/runner/finish"
 
 
 def runner_health_ok(timeout: float = 0.8) -> bool:
@@ -343,12 +344,14 @@ RUNNER_STATUS_LABELS = {
     "waiting": "รอรับ",
     "picking": "กำลังไปรับ",
     "arrived": "ถึง OR",
+    "finished": "ผ่าตัดเสร็จแล้ว",
 }
 
 RUNNER_STATUS_COLORS = {
     "waiting": "#64748b",
     "picking": "#f59e0b",
     "arrived": "#16a34a",
+    "finished": "#0f172a",
 }
 
 
@@ -1871,6 +1874,7 @@ class Main(QtWidgets.QWidget):
         self._last_status_by_hn: dict[str, str] = {}
         self._runner_status_cache: Dict[str, dict] = {}
         self._last_runner_user: str = ""
+        self._runner_finished_sent: Set[str] = set()
 
         # form edit mode
         self._edit_idx: Optional[int] = None
@@ -2742,6 +2746,36 @@ class Main(QtWidgets.QWidget):
             return bool(resp.ok)
         except requests.RequestException:
             return False
+
+    def _runner_finish(self, pickup_id: str, user: str = "ระบบ") -> bool:
+        try:
+            resp = requests.post(
+                f"{RUNNER_BASE}{RUNNER_FINISH_API}",
+                json={"pickup_id": pickup_id, "user": user},
+                timeout=2.0,
+                headers={"Accept": "application/json"},
+            )
+            return bool(resp.ok)
+        except requests.RequestException:
+            return False
+
+    def _auto_finish_runner_cases(self, entries: List["ScheduleEntry"], status_map: Dict[str, dict]) -> None:
+        if not entries or not status_map:
+            return
+        for entry in entries:
+            if not self._is_entry_completed(entry):
+                continue
+            pickup_id = self._pickup_id_for_entry(entry)
+            if not pickup_id:
+                continue
+            row = status_map.get(pickup_id) or {}
+            if str(row.get("status") or "").strip() == "finished":
+                self._runner_finished_sent.discard(pickup_id)
+                continue
+            if pickup_id in self._runner_finished_sent:
+                continue
+            if self._runner_finish(pickup_id, user="ระบบ"):
+                self._runner_finished_sent.add(pickup_id)
 
     def _handle_runner_action(self, entry: "ScheduleEntry", action: str) -> None:
         pid = self._pickup_id_for_entry(entry)
@@ -3707,6 +3741,16 @@ class Main(QtWidgets.QWidget):
 
             entries_for_day = [entry for entry in entries_snapshot if _resolved_date(entry) == base_date]
 
+            valid_pickups: Set[str] = set()
+            for entry in entries_for_day:
+                pid = self._pickup_id_for_entry(entry)
+                if pid:
+                    valid_pickups.add(pid)
+            if valid_pickups:
+                self._runner_finished_sent.intersection_update(valid_pickups)
+            else:
+                self._runner_finished_sent.clear()
+
             runner_status_map: Dict[str, dict] = {}
             runner_ready = False
             if entries_for_day:
@@ -3714,6 +3758,7 @@ class Main(QtWidgets.QWidget):
                 if runner_ready:
                     self._push_rows_to_runner(entries_for_day, runner_ready=True)
                     runner_status_map = _fetch_runner_status_map(str(base_date))
+                    self._auto_finish_runner_cases(entries_for_day, runner_status_map)
             self._runner_status_cache = runner_status_map
 
             indexed_entries: List[Tuple[int, ScheduleEntry]] = list(enumerate(entries_snapshot))

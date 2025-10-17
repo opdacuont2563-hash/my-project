@@ -88,11 +88,38 @@ def init_db() -> None:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS workers(
+                  name TEXT PRIMARY KEY,
+                  active INTEGER DEFAULT 1
+                )
+                """
+            )
         _DB_INITIALIZED = True
 
 def _ensure_db() -> None:
     if not _DB_INITIALIZED:
         init_db()
+
+def list_workers() -> List[str]:
+    _ensure_db()
+    with _conn() as conn:
+        cur = conn.execute(
+            "SELECT name FROM workers WHERE active=1 ORDER BY name COLLATE NOCASE"
+        )
+        return [row[0] for row in cur.fetchall()]
+
+def add_worker(name: str) -> None:
+    _ensure_db()
+    name = (name or "").strip()
+    if not name:
+        return
+    with _conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO workers(name, active) VALUES(?, 1)",
+            (name,),
+        )
 
 def _normalize_row(row: Dict[str, Any]) -> Dict[str, str]:
     normalised: Dict[str, str] = {}
@@ -172,6 +199,30 @@ def set_status(
         row = cur.fetchone()
     return dict(row) if row else None
 
+def mark_finished(pickup_id: str, user: str = "") -> Optional[Dict[str, str]]:
+    _ensure_db()
+    pickup_id = str(pickup_id)
+    user = str(user or "")
+    stamp = datetime.now().strftime("%H:%M")
+    with _conn() as conn:
+        cur = conn.execute(
+            "SELECT * FROM pickups WHERE pickup_id=?",
+            (pickup_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        assignee = row["assignee"] or ""
+        if not assignee and user:
+            assignee = user
+        conn.execute(
+            "UPDATE pickups SET status=?, note=?, assignee=? WHERE pickup_id=?",
+            ("finished", f"finished@{stamp}", assignee, pickup_id),
+        )
+        cur = conn.execute("SELECT * FROM pickups WHERE pickup_id=?", (pickup_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
 # ------------------ Schemas ------------------
 class PickupRowPayload(BaseModel):
     pickup_id: str
@@ -194,6 +245,13 @@ class PickupRowPayload(BaseModel):
 class StatusChangePayload(BaseModel):
     pickup_id: str
     user: str
+
+class WorkerPayload(BaseModel):
+    name: str
+
+class FinishPayload(BaseModel):
+    pickup_id: str
+    user: str | None = None
 
 # ------------------ App ------------------
 
@@ -251,11 +309,14 @@ HTML_TEMPLATE = """
             <option value="waiting">รอรับ</option>
             <option value="picking">กำลังนำส่ง</option>
             <option value="arrived">ถึง OR</option>
+            <option value="finished">ผ่าตัดเสร็จ</option>
           </select>
         </div>
         <div class="col-12 col-sm-6 col-md-3 col-lg-3">
-          <label class="form-label mb-1" for="filter-user">ผู้ไปรับ</label>
-          <input type="text" class="form-control" id="filter-user" placeholder="ชื่อผู้ไปรับ">
+          <label class="form-label mb-1" for="worker-input">ผู้รับ</label>
+          <input list="worker-list" class="form-control" id="worker-input" placeholder="เลือก/พิมพ์ชื่อผู้รับ">
+          <datalist id="worker-list"></datalist>
+          <button class="btn btn-outline-primary btn-sm mt-2" id="btn-add-worker">+ เพิ่มชื่อคนงาน</button>
         </div>
         <div class="col-12 col-sm-6 col-md-3 col-lg-3 text-sm-end">
           <button class="btn btn-primary mt-3 mt-sm-0" id="btn-reload">โหลดรายการ</button>
@@ -274,6 +335,7 @@ HTML_TEMPLATE = """
             <th scope="col">เวลาเรียก</th>
             <th scope="col">ถึงกำหนด</th>
             <th scope="col">สถานะ</th>
+            <th scope="col">ผู้รับ</th>
             <th scope="col" class="text-end">การทำงาน</th>
           </tr>
         </thead>
@@ -287,13 +349,16 @@ HTML_TEMPLATE = """
   const dateInput = document.getElementById('filter-date');
   const wardInput = document.getElementById('filter-ward');
   const statusInput = document.getElementById('filter-status');
-  const userInput = document.getElementById('filter-user');
+  const workerInput = document.getElementById('worker-input');
+  const workerList = document.getElementById('worker-list');
+  const btnAddWorker = document.getElementById('btn-add-worker');
   const reloadBtn = document.getElementById('btn-reload');
 
   const STATUS_BADGES = {
     waiting: 'bg-secondary',
     picking: 'bg-warning text-dark',
-    arrived: 'bg-success'
+    arrived: 'bg-success',
+    finished: 'bg-dark'
   };
 
   function todayISO(){ return new Date().toISOString().slice(0,10); }
@@ -308,7 +373,7 @@ HTML_TEMPLATE = """
     if(statusVal){ statusInput.value = statusVal; }
     if(!dateInput.value){ dateInput.value = todayISO(); }
     const savedUser = localStorage.getItem('runnerName') || '';
-    if(savedUser){ userInput.value = savedUser; }
+    if(savedUser){ workerInput.value = savedUser; }
   }
 
   function getFilters(){
@@ -326,6 +391,25 @@ HTML_TEMPLATE = """
     if(filters.status){ params.set('status', filters.status); }
     const newUrl = `${window.location.pathname}?${params.toString()}`;
     window.history.replaceState({}, '', newUrl);
+  }
+
+  function escapeOption(text){
+    return String(text || '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+  }
+
+  async function refreshWorkers(){
+    try{
+      const res = await fetch('/runner/workers');
+      if(!res.ok) throw new Error('โหลดรายชื่อไม่สำเร็จ');
+      const items = await res.json();
+      if(Array.isArray(items)){
+        workerList.innerHTML = items.map(name => `<option value="${escapeOption(name)}"></option>`).join('');
+      }
+    }catch(err){
+      console.error(err);
+    }
+    const saved = localStorage.getItem('runnerName') || '';
+    if(saved && !workerInput.value){ workerInput.value = saved; }
   }
 
   async function loadList(){
@@ -347,25 +431,48 @@ HTML_TEMPLATE = """
 
   function renderRows(rows){
     tableBody.innerHTML = '';
+    const groups = {};
     rows.forEach(row => {
-      const tr = document.createElement('tr');
-      const dueInfo = computeDueInfo(row);
-      if(dueInfo.state === 'late'){ tr.classList.add('late-row'); }
-      if(dueInfo.state === 'over'){ tr.classList.add('overdue-row'); }
-      tr.innerHTML = `
-        <td>${row.hn || ''}</td>
-        <td>${row.name || ''}</td>
-        <td>${row.ward_from || ''}</td>
-        <td>${row.or_to || ''}</td>
-        <td>${row.call_time || ''}</td>
-        <td>${row.due_time || ''}${dueInfo.badge}</td>
-        <td>${renderStatusBadge(row.status || '')}</td>
-        <td class="text-end text-nowrap">
-          <button class="btn btn-sm btn-success me-2" onclick="ack('${row.pickup_id}')">รับเคส</button>
-          <button class="btn btn-sm btn-secondary" onclick="arrive('${row.pickup_id}')">ถึง OR</button>
-        </td>`;
-      tableBody.appendChild(tr);
+      const key = (row.or_to || '').trim() || '-';
+      (groups[key] ||= []).push(row);
     });
+
+    const keys = Object.keys(groups).sort((a,b)=>a.localeCompare(b,'th')); // กลุ่มตาม OR
+    keys.forEach(key => {
+      const head = document.createElement('tr');
+      head.innerHTML = `<td colspan="9" class="fw-bold bg-light">${key}</td>`;
+      tableBody.appendChild(head);
+
+      groups[key].forEach(row => {
+        const tr = document.createElement('tr');
+        const dueInfo = computeDueInfo(row);
+        if(dueInfo.state === 'late'){ tr.classList.add('late-row'); }
+        if(dueInfo.state === 'over'){ tr.classList.add('overdue-row'); }
+        const disabled = row.status === 'finished';
+        const disableAttr = disabled ? 'disabled' : '';
+        tr.innerHTML = `
+          <td>${row.hn || ''}</td>
+          <td>${row.name || ''}</td>
+          <td>${row.ward_from || ''}</td>
+          <td>${row.or_to || ''}</td>
+          <td>${row.call_time || ''}</td>
+          <td>${row.due_time || ''}${dueInfo.badge}</td>
+          <td>${renderStatusBadge(row.status || '')}</td>
+          <td>${row.assignee || ''}</td>
+          <td class="text-end text-nowrap">
+            <button class="btn btn-sm btn-success me-2" onclick="ack('${row.pickup_id}')" ${disableAttr}>รับเคส</button>
+            <button class="btn btn-sm btn-secondary me-2" onclick="arrive('${row.pickup_id}')" ${disableAttr}>ถึง OR</button>
+            <button class="btn btn-sm btn-outline-danger" onclick="finishCase('${row.pickup_id}')" ${disableAttr}>ผ่าตัดเสร็จ</button>
+          </td>`;
+        tableBody.appendChild(tr);
+      });
+    });
+
+    if(!tableBody.children.length){
+      const emptyRow = document.createElement('tr');
+      emptyRow.innerHTML = '<td colspan="9" class="text-center text-muted py-4">ไม่มีรายการ</td>';
+      tableBody.appendChild(emptyRow);
+    }
   }
 
   function renderStatusBadge(status){
@@ -374,6 +481,7 @@ HTML_TEMPLATE = """
     if(status === 'waiting'){ label = 'รอรับ'; }
     else if(status === 'picking'){ label = 'กำลังนำส่ง'; }
     else if(status === 'arrived'){ label = 'ถึง OR'; }
+    else if(status === 'finished'){ label = 'ผ่าตัดเสร็จแล้ว'; }
     return `<span class="badge ${cls} status-badge">${label}</span>`;
   }
 
@@ -404,17 +512,23 @@ HTML_TEMPLATE = """
   }
 
   function ensureUser(){
-    const value = userInput.value.trim();
+    const value = (workerInput.value || '').trim();
     if(value){ localStorage.setItem('runnerName', value); return value; }
-    const stored = localStorage.getItem('runnerName');
-    if(stored){ userInput.value = stored; return stored; }
-    alert('กรอกชื่อผู้ไปรับก่อนทำรายการ'); userInput.focus(); return '';
+    const stored = localStorage.getItem('runnerName') || '';
+    if(stored){ workerInput.value = stored; return stored; }
+    alert('เลือก/พิมพ์ชื่อผู้รับก่อนทำรายการ');
+    workerInput.focus();
+    return '';
   }
 
   async function ack(id){
     const user = ensureUser(); if(!user){ return; }
     try{
-      await fetch('/runner/ack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ pickup_id:id, user })});
+      await fetch('/runner/ack',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ pickup_id:id, user })
+      });
       scheduleReload();
     }catch(err){ console.error(err); }
   }
@@ -423,11 +537,29 @@ HTML_TEMPLATE = """
   async function arrive(id){
     const user = ensureUser(); if(!user){ return; }
     try{
-      await fetch('/runner/arrive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ pickup_id:id, user })});
+      await fetch('/runner/arrive',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ pickup_id:id, user })
+      });
       scheduleReload();
     }catch(err){ console.error(err); }
   }
   window.arrive = arrive;
+
+  async function finishCase(id){
+    const user = ensureUser(); if(!user){ return; }
+    if(!confirm('ยืนยันเปลี่ยนสถานะเป็น "ผ่าตัดเสร็จแล้ว"')) return;
+    try{
+      await fetch('/runner/finish',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ pickup_id:id, user })
+      });
+      scheduleReload();
+    }catch(err){ console.error(err); }
+  }
+  window.finishCase = finishCase;
 
   let reloadTimer = null;
   function scheduleReload(){ clearTimeout(reloadTimer); reloadTimer = setTimeout(loadList, 300); }
@@ -449,10 +581,27 @@ HTML_TEMPLATE = """
   dateInput.addEventListener('change', loadList);
   wardInput.addEventListener('change', loadList);
   statusInput.addEventListener('change', loadList);
-  userInput.addEventListener('change', () => { const v = userInput.value.trim(); if(v){ localStorage.setItem('runnerName', v); } });
+  workerInput.addEventListener('change', () => {
+    const v = workerInput.value.trim();
+    if(v){ localStorage.setItem('runnerName', v); }
+  });
+  btnAddWorker.addEventListener('click', async () => {
+    const name = (workerInput.value || '').trim();
+    if(!name){ alert('พิมพ์ชื่อก่อน'); workerInput.focus(); return; }
+    try{
+      await fetch('/runner/workers',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ name })
+      });
+      localStorage.setItem('runnerName', name);
+      await refreshWorkers();
+    }catch(err){ console.error(err); }
+  });
 
   restoreFiltersFromQuery();
   if(!dateInput.value){ dateInput.value = todayISO(); }
+  refreshWorkers();
   connectWS(); loadList();
   </script>
 </body></html>
@@ -494,6 +643,23 @@ async def runner_arrive(payload: StatusChangePayload) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="pickup not found")
     await _broadcast({"type": "status", "row": updated})
     return {"ok": True, "row": updated}
+
+@app.post("/runner/finish")
+async def runner_finish(payload: FinishPayload) -> Dict[str, Any]:
+    updated = mark_finished(payload.pickup_id, payload.user or "")
+    if updated is None:
+        raise HTTPException(status_code=404, detail="pickup not found")
+    await _broadcast({"type": "status", "row": updated})
+    return {"ok": True, "row": updated}
+
+@app.get("/runner/workers")
+def runner_workers() -> List[str]:
+    return list_workers()
+
+@app.post("/runner/workers")
+def runner_add_worker(payload: WorkerPayload) -> Dict[str, Any]:
+    add_worker(payload.name)
+    return {"ok": True}
 
 @app.websocket("/runner/live")
 async def runner_live(ws: WebSocket) -> None:
@@ -625,6 +791,7 @@ MOBILE_TEMPLATE = """<!doctype html>
             <option value="waiting">รอรับ</option>
             <option value="picking">กำลังนำส่ง</option>
             <option value="arrived">ถึง OR</option>
+            <option value="finished">ผ่าตัดเสร็จ</option>
           </select>
         </div>
         <div class="col-6">
@@ -661,7 +828,8 @@ MOBILE_TEMPLATE = """<!doctype html>
   const STATUS_CLS = {
     waiting:  'badge-soft text-secondary',
     picking:  'bg-warning text-dark',
-    arrived:  'bg-success'
+    arrived:  'bg-success',
+    finished: 'bg-dark text-white'
   };
 
   // --- Mobile runner incremental render state ---
@@ -700,7 +868,8 @@ MOBILE_TEMPLATE = """<!doctype html>
     return [
       r.status||'', r.hn||'', r.name||'',
       r.ward_from||'', r.or_to||'',
-      r.call_time||'', r.due_time||''
+      r.call_time||'', r.due_time||'',
+      r.assignee||''
     ].join('|');
   }
 
@@ -715,7 +884,10 @@ MOBILE_TEMPLATE = """<!doctype html>
   function updateCard(card, r){
     const due = r.due_time ? `<span class="badge text-dark bg-warning ms-2">${r.due_time}</span>` : '';
     const cls = STATUS_CLS[r.status] || 'badge-soft text-secondary';
-    const name = r.status==='arrived' ? 'ถึง OR' : (r.status==='picking' ? 'กำลังนำส่ง' : (r.status ? 'รอรับ' : '-'));
+    const name = r.status==='finished' ? 'ผ่าตัดเสร็จแล้ว'
+                : r.status==='arrived' ? 'ถึง OR (pre-op)'
+                : r.status==='picking' ? 'กำลังนำส่ง'
+                : (r.status ? 'รอรับ' : '-');
 
     if(!card._built){
       card.innerHTML = `
@@ -732,21 +904,9 @@ MOBILE_TEMPLATE = """<!doctype html>
           <div class="col-6 x-to"></div>
         </div>
         <div class="mt-2 d-flex gap-2">
-          <button class="btn btn-success btn-sm btn-pill x-ack"><i class="bi bi-check2-circle"></i> รับเคส</button>
           <button class="btn btn-secondary btn-sm btn-pill x-arr"><i class="bi bi-flag"></i> ถึง OR</button>
         </div>`;
-      const ackBtn = card.querySelector('.x-ack');
       const arrBtn = card.querySelector('.x-arr');
-      ackBtn.onclick = async ()=>{
-        const current = card._row || r;
-        const user=ensureName(); if(!user){ toastErr('กรอกชื่อผู้ไปรับก่อน'); elU.focus(); return }
-        const ok = await confirmAction('ยืนยันรับเคส?', `${current.name||''} (${current.hn||''})`, 'รับเคส');
-        if(!ok.isConfirmed) return;
-        try{
-          await fetch('/runner/ack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pickup_id:current.pickup_id,user})});
-          toastOK('รับเคสเรียบร้อย'); scheduleReload();
-        }catch(e){ toastErr('ทำรายการไม่สำเร็จ'); }
-      };
       arrBtn.onclick = async ()=>{
         const current = card._row || r;
         const user=ensureName(); if(!user){ toastErr('กรอกชื่อผู้ไปรับก่อน'); elU.focus(); return }
@@ -765,6 +925,25 @@ MOBILE_TEMPLATE = """<!doctype html>
     card.querySelector('.x-badge').innerHTML = `<span class="badge ${cls} status-badge">${name}</span>`;
     card.querySelector('.x-from').innerHTML  = `<i class="bi bi-building"></i> จาก: <span class="fw-semibold">${r.ward_from||'-'}</span>`;
     card.querySelector('.x-to').innerHTML    = `<i class="bi bi-door-open"></i> ส่ง: <span class="fw-semibold">${r.or_to||'-'}</span>`;
+    const arrBtn = card.querySelector('.x-arr');
+    if(arrBtn){
+      if(r.status === 'finished'){
+        arrBtn.disabled = true;
+        arrBtn.classList.remove('btn-secondary');
+        arrBtn.classList.add('btn-outline-secondary');
+        arrBtn.innerHTML = '<i class="bi bi-lock-fill"></i> ปิดเคส';
+      }else if(r.status === 'arrived'){
+        arrBtn.disabled = true;
+        arrBtn.classList.remove('btn-secondary');
+        arrBtn.classList.add('btn-outline-secondary');
+        arrBtn.innerHTML = '<i class="bi bi-flag-fill"></i> ถึง OR แล้ว';
+      }else{
+        arrBtn.disabled = false;
+        arrBtn.classList.add('btn-secondary');
+        arrBtn.classList.remove('btn-outline-secondary');
+        arrBtn.innerHTML = '<i class="bi bi-flag"></i> ถึง OR';
+      }
+    }
     card._row = r;
   }
 
@@ -774,9 +953,16 @@ MOBILE_TEMPLATE = """<!doctype html>
       if(placeholder) placeholder.remove();
     }
 
+    const me = ensureName();
+    const filtered = (Array.isArray(rows) ? rows : []).filter(r => {
+      if(!r || r.status === 'finished') return false;
+      if(!me) return true;
+      return (r.assignee || '').trim() === me;
+    });
+
     const seen = new Set();
 
-    rows.forEach(r=>{
+    filtered.forEach(r=>{
       if(!r || !r.pickup_id) return;
       const id = r.pickup_id;
       const h  = rowHash(r);
@@ -805,7 +991,8 @@ MOBILE_TEMPLATE = """<!doctype html>
       }
     }
 
-    if(ROW_INDEX.size === 0){
+    if(filtered.length === 0){
+      ROW_INDEX.clear();
       elList.innerHTML = `
         <div class="cardx" data-empty="1">
           <div class="text-center py-4">
@@ -814,6 +1001,7 @@ MOBILE_TEMPLATE = """<!doctype html>
             <div class="subtitle">ตรวจสอบวันที่/วอร์ด หรือกดรีเฟรชอีกครั้ง</div>
           </div>
         </div>`;
+      return;
     }
   }
 
