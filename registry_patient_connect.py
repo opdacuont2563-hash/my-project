@@ -321,6 +321,7 @@ RUNNER_UPDATE_API = "/runner/update"
 RUNNER_HEALTH_API = "/health"
 RUNNER_LIST_API = "/runner/list"
 RUNNER_ACK_API = "/runner/ack"
+RUNNER_AUTO_ASSIGN_API = "/runner/auto-assign"
 RUNNER_ARRIVE_API = "/runner/arrive"
 RUNNER_FINISH_API = "/runner/finish"
 
