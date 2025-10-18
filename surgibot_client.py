@@ -9,9 +9,10 @@ SurgiBot Client — PySide6 (revamped layout)
 
 import os, sys, json, argparse
 import math
+import hashlib
 from pathlib import Path
 from typing import Union, List, Dict
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta, time as dtime, date as ddate
 
 import requests
 from requests.adapters import HTTPAdapter, Retry
@@ -23,6 +24,104 @@ from PySide6.QtGui import (
     QLinearGradient, QColor, QImageReader
 )
 from PySide6.QtWidgets import QSystemTrayIcon, QSizePolicy, QFormLayout
+
+try:
+    from registry_patient_connect import make_search_combo, SCRUB_NURSES, SearchSelectAdder
+except Exception:  # pragma: no cover - fallback without optional dependency
+    def make_search_combo(options: list[str]) -> QtWidgets.QComboBox:
+        cb = QtWidgets.QComboBox()
+        cb.setEditable(True)
+        cb.addItems([""] + list(options))
+        cb.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        return cb
+
+    SCRUB_NURSES: list[str] = []
+
+    class SearchSelectAdder(QtWidgets.QWidget):
+        itemsChanged = QtCore.Signal(list)
+
+        def __init__(self, placeholder: str = "", suggestions: list[str] | None = None, parent=None):
+            super().__init__(parent)
+            layout = QtWidgets.QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(6)
+
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(6)
+            self.combo = QtWidgets.QComboBox()
+            self.combo.setEditable(True)
+            self.combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+            if self.combo.lineEdit():
+                self.combo.lineEdit().setPlaceholderText(placeholder)
+            row.addWidget(self.combo, 1)
+            self.btn = QtWidgets.QPushButton("➕ เพิ่ม")
+            row.addWidget(self.btn)
+            layout.addLayout(row)
+
+            self.list = QtWidgets.QListWidget()
+            self.list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+            layout.addWidget(self.list)
+
+            self.set_suggestions(suggestions or [])
+            self.btn.clicked.connect(self._add_current)
+            if self.combo.lineEdit():
+                self.combo.lineEdit().returnPressed.connect(self._add_current)
+            self.list.model().rowsInserted.connect(lambda *_: self._emit())
+            self.list.model().rowsRemoved.connect(lambda *_: self._emit())
+
+        def _add_current(self):
+            text = self.combo.currentText().strip()
+            if text and text.lower() not in [self.list.item(i).text().lower() for i in range(self.list.count())]:
+                self.list.addItem(text)
+            self.combo.setCurrentIndex(0)
+            self.combo.setEditText("")
+            self._emit()
+
+        def items(self) -> list[str]:
+            return [self.list.item(i).text().strip() for i in range(self.list.count())]
+
+        def clear(self):
+            self.list.clear()
+            self.combo.setCurrentIndex(0)
+            self.combo.setEditText("")
+            self._emit()
+
+        def set_suggestions(self, suggestions: list[str]):
+            opts = sorted({s for s in suggestions if s})
+            self.combo.blockSignals(True)
+            self.combo.clear()
+            self.combo.addItem("")
+            self.combo.addItems(opts)
+            self.combo.blockSignals(False)
+            comp = QtWidgets.QCompleter(opts)
+            comp.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+            comp.setFilterMode(QtCore.Qt.MatchContains)
+            self.combo.setCompleter(comp)
+
+        def _emit(self):
+            self.itemsChanged.emit(self.items())
+
+try:
+    from icd10_catalog import diagnosis_suggestions, operation_suggestions
+except Exception:  # pragma: no cover - keep UI responsive without catalog
+    def operation_suggestions(_specialty: str | None = None) -> list[str]:
+        return []
+
+    def diagnosis_suggestions(_specialty: str | None = None, _ops: list[str] | None = None) -> list[str]:
+        return []
+
+# ใช้กติกา/ตัวช่วยห้อง OR เดียวกับฝั่ง patient (fallback เมื่อไฟล์ไม่พร้อมใช้)
+try:
+    from registry_patient_connect import (
+        describe_or_plan_label,
+        normalize_owner_for_wednesday,
+    )
+except Exception:  # pragma: no cover - optional dependency
+    def describe_or_plan_label(*_args, **_kwargs) -> str:
+        return ""
+
+    def normalize_owner_for_wednesday(entries, *_args, **_kwargs):
+        return entries
 from PySide6.QtWebSockets import QWebSocket
 
 # ---------- ENV ----------
@@ -49,6 +148,10 @@ API_WS = "/api/ws"
 STATUS_CHOICES = ["รอผ่าตัด", "กำลังผ่าตัด", "กำลังพักฟื้น", "กำลังส่งกลับตึก", "เลื่อนการผ่าตัด"]
 OR_CHOICES     = ["OR1", "OR2", "OR3", "OR4", "OR5", "OR6", "OR8"]
 QUEUE_CHOICES  = ["0-1", "0-2", "0-3", "0-4", "0-5", "0-6", "0-7"]
+
+STATUS_OP_START = "กำลังผ่าตัด"
+STATUS_OP_END = "กำลังพักฟื้น"
+STATUS_RETURNING = "กำลังส่งกลับตึก"
 
 STATUS_COLORS = {
     "รอผ่าตัด": "#fde047",
@@ -95,12 +198,20 @@ def _period_label(code: str) -> str:
 
 class _SchedEntry:
     def __init__(self, d: Dict):
+        known_keys = {
+            "or", "date", "time", "hn", "name", "age", "dept", "doctor", "diags", "ops",
+            "ward", "queue", "period", "case_size", "urgency", "assist1", "assist2",
+            "scrub", "circulate", "time_start", "time_end", "status", "state",
+            "returning_started_at", "version", "updated_at"
+        }
         self.or_room = str(d.get("or","") or "")
         self.date = str(d.get("date","") or "")
+        self.date_obj = _parse_date(self.date)
         self.time = str(d.get("time","") or "")
         self.hn = str(d.get("hn","") or "")
         self.name = str(d.get("name","") or "")
-        self.age = int(d.get("age") or 0)
+        age_val = d.get("age")
+        self.age = str(age_val) if age_val not in (None, "") else ""
         self.dept = str(d.get("dept","") or "")
         self.doctor = str(d.get("doctor","") or "")
         self.diags = d.get("diags") or []
@@ -108,6 +219,58 @@ class _SchedEntry:
         self.ward = str(d.get("ward","") or "")
         self.queue = int(d.get("queue") or 1)
         self.period = str(d.get("period") or "in")
+        self.case_size = str(d.get("case_size", "") or "")
+        self.urgency = str(d.get("urgency", "Elective") or "Elective")
+        self.assist1 = str(d.get("assist1", "") or "")
+        self.assist2 = str(d.get("assist2", "") or "")
+        self.scrub = str(d.get("scrub", "") or "")
+        self.circulate = str(d.get("circulate", "") or "")
+        self.time_start = str(d.get("time_start", "") or "")
+        self.time_end = str(d.get("time_end", "") or "")
+        self.status = str(d.get("status", "") or "")
+        self.state = str(d.get("state", "") or "")
+        self.returning_started_at = str(d.get("returning_started_at", "") or "")
+        try:
+            self.version = int(d.get("version") or 0)
+        except Exception:
+            self.version = 0
+        self.updated_at = str(d.get("updated_at", "") or "")
+        self._extra = {k: v for k, v in d.items() if k not in known_keys}
+
+    def uid(self) -> str:
+        return f"{self.or_room}|{self.hn}|{self.time}|{self.date}"
+
+    def to_dict(self) -> Dict:
+        payload = {
+            "or": self.or_room,
+            "date": self.date or (self.date_obj.isoformat() if self.date_obj else ""),
+            "time": self.time,
+            "hn": self.hn,
+            "name": self.name,
+            "age": int(self.age) if str(self.age).isdigit() else self.age,
+            "dept": self.dept,
+            "doctor": self.doctor,
+            "diags": list(self.diags or []),
+            "ops": list(self.ops or []),
+            "ward": self.ward,
+            "queue": int(self.queue or 0),
+            "period": self.period,
+            "case_size": self.case_size,
+            "urgency": self.urgency,
+            "assist1": self.assist1,
+            "assist2": self.assist2,
+            "scrub": self.scrub,
+            "circulate": self.circulate,
+            "time_start": self.time_start,
+            "time_end": self.time_end,
+            "status": self.status,
+            "state": self.state,
+            "returning_started_at": self.returning_started_at,
+            "version": int(self.version or 0),
+            "updated_at": self.updated_at,
+        }
+        payload.update(self._extra)
+        return payload
 class SharedScheduleReader:
     def __init__(self):
         self.s = QSettings(ORG_NAME, APP_SHARED)
@@ -136,6 +299,39 @@ class SharedScheduleReader:
             return True
         return False
 
+
+class SharedScheduleModel(SharedScheduleReader):
+    def __init__(self):
+        super().__init__()
+
+    def _save(self):
+        payload = [e.to_dict() for e in self.entries]
+        next_seq = int(self.s.value(SEQ_KEY, 0) or 0) + 1
+        self.s.setValue(ENTRIES_KEY, payload)
+        self.s.setValue(SEQ_KEY, next_seq)
+        self.s.sync()
+        self._seq = next_seq
+
+    def touch_entry(self, entry: _SchedEntry):
+        if entry is None:
+            return False
+        uid = entry.uid()
+        for idx, existing in enumerate(self.entries):
+            if existing is entry or existing.uid() == uid:
+                self.entries[idx] = entry
+                self._save()
+                return True
+        # ถ้าไม่พบ ให้เพิ่มใหม่เพื่อความปลอดภัย (เช่น registry เพิ่งเพิ่ม)
+        self.entries.append(entry)
+        self._save()
+        return True
+
+    def find_by_uid(self, uid: str) -> _SchedEntry | None:
+        for entry in self.entries:
+            if entry.uid() == uid:
+                return entry
+        return None
+
 def _fmt_td(td: timedelta) -> str:
     total = int(abs(td.total_seconds()))
     h = total // 3600
@@ -149,6 +345,40 @@ def _parse_iso(ts: str):
         return datetime.fromisoformat(ts.replace("Z",""))
     except Exception:
         return None
+
+def _parse_date(date_str: str):
+    if not isinstance(date_str, str):
+        return None
+    txt = date_str.strip()
+    if not txt:
+        return None
+    cleaned = txt.replace("Z", "")
+    try:
+        return datetime.fromisoformat(cleaned).date()
+    except ValueError:
+        pass
+    formats = (
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%Y/%m/%d %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(cleaned, fmt).date()
+        except ValueError:
+            continue
+    if cleaned.startswith(datetime.now().date().isoformat()):
+        return datetime.now().date()
+    return None
 
 # ---------- HTTP ----------
 class SurgiBotClientHTTP:
@@ -186,10 +416,16 @@ class SurgiBotClientHTTP:
         return data
 
     def _wrap_items(self, data):
-        if isinstance(data, list): return {"items": data}
+        if isinstance(data, list):
+            return {"items": data}
         if isinstance(data, dict):
-            for k in ("items","data","table","rows","list"):
-                if k in data and isinstance(data[k], list): return {"items": data[k]}
+            if isinstance(data.get("items"), list):
+                return data
+            for k in ("items", "data", "table", "rows", "list"):
+                if k in data and isinstance(data[k], list):
+                    payload = dict(data)
+                    payload["items"] = data[k]
+                    return payload
             for v in data.values():
                 if isinstance(v, list): return {"items": v}
             return data
@@ -315,6 +551,33 @@ class FlowLayout(QtWidgets.QLayout):
 
         return y + line_height - rect.y() + margins.top() + margins.bottom()
 
+
+class SimpleToast(QtWidgets.QLabel):
+    def __init__(self, parent: QtWidgets.QWidget | None = None):
+        super().__init__("", parent)
+        self.setObjectName("SimpleToast")
+        self.setAlignment(QtCore.Qt.AlignCenter)
+        self.setStyleSheet(
+            "QLabel#SimpleToast{background:rgba(15,23,42,0.92);color:#fff;"
+            "padding:8px 14px;border-radius:12px;font-weight:600;}"
+        )
+        self._timer = QtCore.QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.hide)
+        self.hide()
+
+    def show_toast(self, text: str, msec: int = 2200):
+        self.setText(text)
+        self.adjustSize()
+        if self.parent():
+            parent_rect = self.parent().rect()
+            x = parent_rect.right() - self.width() - 32
+            y = parent_rect.bottom() - self.height() - 32
+            self.move(max(16, x), max(16, y))
+        self.show()
+        self.raise_()
+        self._timer.start(max(600, msec))
+
     def smartSpacing(self, pm: QtWidgets.QStyle.PixelMetric) -> int:
         parent = self.parent()
         if parent is None:
@@ -333,6 +596,88 @@ class ShadowButton(QtWidgets.QPushButton):
         self.setStyleSheet(f"QPushButton{{border:none;color:white;padding:6px 10px;border-radius:10px;font-weight:600;background:{self.base_color.name()};}}")
         sh = QtWidgets.QGraphicsDropShadowEffect(self); sh.setBlurRadius(14); sh.setXOffset(0); sh.setYOffset(4); sh.setColor(QtGui.QColor(0,0,0,64))
         self.setGraphicsEffect(sh)
+
+
+class PostOpDialog(QtWidgets.QDialog):
+    def __init__(self, entry: _SchedEntry, parent: QtWidgets.QWidget | None = None):
+        super().__init__(parent)
+        self.entry = entry
+        self.specialty_key = (entry.dept or "Surgery").strip() or "Surgery"
+        self.setWindowTitle(f"บันทึกหลังผ่าตัด — HN {entry.hn}")
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+
+        grid.addWidget(QtWidgets.QLabel("Assist 1"), 0, 0)
+        self.assist1 = make_search_combo(SCRUB_NURSES)
+        self.assist1.setEditText(entry.assist1)
+        grid.addWidget(self.assist1, 0, 1)
+
+        grid.addWidget(QtWidgets.QLabel("Assist 2"), 0, 2)
+        self.assist2 = make_search_combo(SCRUB_NURSES)
+        self.assist2.setEditText(entry.assist2)
+        grid.addWidget(self.assist2, 0, 3)
+
+        grid.addWidget(QtWidgets.QLabel("Scrub"), 1, 0)
+        self.scrub = make_search_combo(SCRUB_NURSES)
+        self.scrub.setEditText(entry.scrub)
+        grid.addWidget(self.scrub, 1, 1)
+
+        grid.addWidget(QtWidgets.QLabel("Circulate"), 1, 2)
+        self.circulate = make_search_combo(SCRUB_NURSES)
+        self.circulate.setEditText(entry.circulate)
+        grid.addWidget(self.circulate, 1, 3)
+
+        row = 2
+        op_label = QtWidgets.QLabel("Operation (หลังผ่าตัด)")
+        grid.addWidget(op_label, row, 0, 1, 4)
+        row += 1
+        self.op_adder = SearchSelectAdder(
+            "ค้นหา/เลือก Operation...",
+            suggestions=operation_suggestions(self.specialty_key),
+        )
+        for op_text in (entry.ops or []):
+            self.op_adder.list.addItem(op_text)
+        grid.addWidget(self.op_adder, row, 0, 1, 4)
+        row += 1
+
+        dx_label = QtWidgets.QLabel("Diagnosis (หลังผ่าตัด)")
+        grid.addWidget(dx_label, row, 0, 1, 4)
+        row += 1
+        self.dx_adder = SearchSelectAdder(
+            "ค้นหา ICD-10 ...",
+            suggestions=diagnosis_suggestions(self.specialty_key, entry.ops or []),
+        )
+        for dx_text in (entry.diags or []):
+            self.dx_adder.list.addItem(dx_text)
+        grid.addWidget(self.dx_adder, row, 0, 1, 4)
+
+        self.op_adder.itemsChanged.connect(self._refresh_dx_suggest)
+
+        layout.addLayout(grid)
+
+        btn = QtWidgets.QPushButton("💾 บันทึกหลังผ่าตัด")
+        btn.setProperty("variant", "primary")
+        btn.clicked.connect(self.accept)
+        layout.addWidget(btn, 0, QtCore.Qt.AlignRight)
+
+    def _refresh_dx_suggest(self, _items: list[str]):
+        suggestions = diagnosis_suggestions(self.specialty_key, self.op_adder.items())
+        self.dx_adder.set_suggestions(suggestions)
+
+    def values(self) -> Dict:
+        return {
+            "assist1": self.assist1.currentText().strip(),
+            "assist2": self.assist2.currentText().strip(),
+            "scrub": self.scrub.currentText().strip(),
+            "circulate": self.circulate.currentText().strip(),
+            "ops": self.op_adder.items(),
+            "diags": self.dx_adder.items(),
+        }
 
 class Card(QtWidgets.QFrame):
     def __init__(self, title="", parent=None):
@@ -457,74 +802,16 @@ class ElideDelegate(QtWidgets.QStyledItemDelegate):
 
 # ---------- Schedule delegate (wrap + watermark + column lines) ----------
 class ScheduleDelegate(QtWidgets.QStyledItemDelegate):
-    WRAP_COLS = {2, 4, 5, 6, 7}
-    WATERMARK = "ผ่าตัดเสร็จและส่งกลับตึกเรียบร้อยแล้ว"
     def __init__(self, tree: QtWidgets.QTreeWidget):
         super().__init__(tree)
         self._tree = tree
 
-    def _draw_wrapped_text(self, painter, option, index):
-        opt = QtWidgets.QStyleOptionViewItem(option)
-        self.initStyleOption(opt, index)
-
-        view = opt.widget
-        col_w = max(10, view.columnWidth(index.column()) - 12)
-
-        doc = QtGui.QTextDocument()
-        doc.setDefaultFont(opt.font)
-        doc.setTextWidth(col_w)
-        doc.setPlainText(opt.text)
-
-        painter.save()
-        # FIX: clear text before style painting to avoid double text
-        opt_no_text = QtWidgets.QStyleOptionViewItem(opt)
-        opt_no_text.text = ""
-        style = opt.widget.style() if isinstance(opt.widget, QtWidgets.QWidget) else QtWidgets.QApplication.style()
-        style.drawControl(QtWidgets.QStyle.CE_ItemViewItem, opt_no_text, painter, opt.widget)
-
-        painter.translate(opt.rect.topLeft())
-        clip = QtCore.QRectF(0, 0, col_w, opt.rect.height())
-        doc.drawContents(painter, clip)
-        painter.restore()
-
-    def sizeHint(self, option, index):
-        if index.column() in self.WRAP_COLS and index.model():
-            view = option.widget
-            col_w = max(10, view.columnWidth(index.column()) - 12)
-            fm = option.fontMetrics
-            doc = QtGui.QTextDocument()
-            doc.setDefaultFont(option.font)
-            doc.setTextWidth(col_w)
-            doc.setPlainText(index.data())
-            h = int(doc.size().height()) + 8
-            h = max(h, max(34, fm.height() + 12))
-            return QtCore.QSize(col_w, h)
-        return super().sizeHint(option, index)
-
     def paint(self, painter, option, index):
-        item = self._tree.itemFromIndex(index)
-        is_child = bool(item and item.parent() is not None)
-
-        if index.column() in self.WRAP_COLS and is_child:
-            self._draw_wrapped_text(painter, option, index)  # do not call super() here
-        else:
-            super().paint(painter, option, index)
+        super().paint(painter, option, index)
 
         try:
-            is_completed = (index.data(QtCore.Qt.UserRole) == "completed")
-            if is_completed and index.column() == 2:
-                painter.save()
-                painter.setRenderHint(QPainter.Antialiasing, True)
-                r = option.rect
-                f = option.font; f.setBold(True)
-                painter.setFont(f)
-                painter.setPen(QtGui.QColor(100, 116, 139, 120))
-                painter.drawText(r, QtCore.Qt.AlignCenter, self.WATERMARK)
-                painter.restore()
-        except Exception:
-            pass
-
-        try:
+            item = self._tree.itemFromIndex(index)
+            is_child = bool(item and item.parent() is not None)
             if is_child and index.column() < (self._tree.columnCount() - 1):
                 painter.save()
                 painter.setPen(QtGui.QPen(QtGui.QColor("#eef2f7")))
@@ -725,16 +1012,21 @@ class Main(QtWidgets.QWidget):
         self.cli = SurgiBotClientHTTP(host, port, token)
         self.model = LocalTableModel()
         self.rows_cache = []
-        self.sched_reader = SharedScheduleReader()
+        self.sched = SharedScheduleModel()
         self.ws: QWebSocket|None = None
         self.ws_connected = False
         self.tray = None
         self._last_states = {}
+        self._last_selected_uid = ""
+        self._suppress_status_change = False
+        self.toast = SimpleToast(self)
 
         # Monitor knowledge
         self.monitor_ready = False
         self._was_in_monitor: set[str] = set()
         self._current_monitor_hn: set[str] = set()
+        self._last_monitor_signature = None
+        self._last_monitor_meta: dict | None = None
 
         self.setWindowTitle("SurgiBot Client — Modern (PySide6)")
         self.resize(1440, 900)
@@ -746,7 +1038,7 @@ class Main(QtWidgets.QWidget):
 
         if self.rows_cache:
             self.monitor_ready = True
-            self._rebuild(self.rows_cache)
+            self._rebuild(self.rows_cache, {"force": True, "source": "persisted"})
 
         # Barcode
         self.scan_enabled = True; self._scan_buf = ""; self._scan_timeout_ms = 120
@@ -756,7 +1048,7 @@ class Main(QtWidgets.QWidget):
         self._ensure_tray()
         self._refresh(prefer_server=True)
 
-        self._tick = QtCore.QTimer(self); self._tick.timeout.connect(lambda: self._rebuild(self.rows_cache)); self._tick.start(1000)
+        self._tick = QtCore.QTimer(self); self._tick.timeout.connect(self._update_monitor_elapsed); self._tick.start(1000)
         self._pull = QtCore.QTimer(self); self._pull.timeout.connect(lambda: self._refresh(True)); self._pull.start(2000)
         self._sched_timer = QtCore.QTimer(self); self._sched_timer.timeout.connect(self._check_schedule_seq); self._sched_timer.start(1000)
         self._start_websocket()
@@ -795,7 +1087,7 @@ class Main(QtWidgets.QWidget):
             topc = self.tree_sched.topLevelItemCount()
             for i in range(topc):
                 it = self.tree_sched.topLevelItem(i)
-                key = (it.text(0) or "").strip()
+                key = self._or_item_label(it)
                 if key:
                     st[key] = it.isExpanded()
             self._or_expand_state = st
@@ -803,11 +1095,25 @@ class Main(QtWidgets.QWidget):
             pass
 
     def _apply_or_expand_state(self, item: QtWidgets.QTreeWidgetItem):
-        key = (item.text(0) or "").strip()
+        key = self._or_item_label(item)
         expanded = self._or_expand_state.get(key, True)
         item.setExpanded(bool(expanded))
 
-    def _or_card_widget(self, title: str, accent: str) -> QtWidgets.QWidget:
+    def _or_item_label(self, item: QtWidgets.QTreeWidgetItem | None) -> str:
+        if item is None:
+            return ""
+        text = (item.text(0) or "").strip()
+        if not text:
+            cached_title = item.data(0, QtCore.Qt.UserRole + 201)
+            if cached_title:
+                text = str(cached_title).strip()
+        if not text:
+            cached_or = item.data(0, QtCore.Qt.UserRole + 200)
+            if cached_or:
+                text = str(cached_or).strip()
+        return text
+
+    def _or_card_widget(self, title: str, accent: str, subtext: str = "ห้องผ่าตัด") -> QtWidgets.QWidget:
         w = QtWidgets.QFrame(); w.setObjectName("OrCard")
         c = QtGui.QColor(accent)
         dark = c.darker(130).name(); mid = c.name(); bar = c.lighter(110).name()
@@ -827,7 +1133,7 @@ class Main(QtWidgets.QWidget):
         box = QtWidgets.QVBoxLayout(); box.setSpacing(0)
         lbl = QtWidgets.QLabel(title); lbl.setProperty("role", "or-title"); lbl.setWordWrap(False)
         lbl.setMinimumWidth(140); lbl.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        sub = QtWidgets.QLabel("ห้องผ่าตัด"); sub.setProperty("role", "or-sub"); sub.setWordWrap(False); sub.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        sub = QtWidgets.QLabel(subtext); sub.setProperty("role", "or-sub"); sub.setWordWrap(False); sub.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         box.addWidget(lbl); box.addWidget(sub); lay.addLayout(box, 1)
         shadow = QtWidgets.QGraphicsDropShadowEffect(w); shadow.setBlurRadius(24); shadow.setXOffset(0); shadow.setYOffset(8); shadow.setColor(QtGui.QColor(15, 23, 42, 48))
         w.setGraphicsEffect(shadow)
@@ -906,7 +1212,10 @@ class Main(QtWidgets.QWidget):
         st = str(row.get("status") or "")
         if st not in AUTO_PURGE_STATUSES:
             return False
-        ts = _parse_iso(row.get("timestamp"))
+        ts = row.get("_ts")
+        if ts is None:
+            ts = _parse_iso(row.get("timestamp"))
+            row["_ts"] = ts
         if not ts:
             return False
         return (datetime.now() - ts) >= timedelta(minutes=AUTO_PURGE_MINUTES)
@@ -924,19 +1233,32 @@ class Main(QtWidgets.QWidget):
             if not (item.flags() & QtCore.Qt.ItemIsEnabled):
                 return
 
-            hn = (item.text(1) or "").strip()
-            if hn and hn.isdigit() and len(hn) == 9: self.ent_hn.setText(hn)
+            hn = (item.text(3) or "").strip()
+            entry = item.data(0, QtCore.Qt.UserRole)
+            if hn and hn.isdigit() and len(hn) == 9:
+                self.ent_hn.setText(hn)
+
+            if isinstance(entry, _SchedEntry):
+                self._last_selected_uid = entry.uid()
+                self._set_status_combo(entry.status or None)
+            else:
+                self._last_selected_uid = ""
 
             or_room = (item.parent().text(0) or "").strip()
             if or_room:
                 i = self.cb_or.findText(or_room)
                 if i >= 0: self.cb_or.setCurrentIndex(i)
 
-            q_raw = (item.text(8) or "").strip()
-            if q_raw:
-                q_label = q_raw if q_raw.startswith("0-") else f"0-{q_raw}"
+            q_raw = (item.text(18) or "").strip()
+            if q_raw.startswith("0-"):
+                qi = self.cb_q.findText(q_raw)
+                if qi >= 0:
+                    self.cb_q.setCurrentIndex(qi)
+            elif q_raw.isdigit():
+                q_label = f"0-{q_raw}"
                 qi = self.cb_q.findText(q_label)
-                if qi >= 0: self.cb_q.setCurrentIndex(qi)
+                if qi >= 0:
+                    self.cb_q.setCurrentIndex(qi)
 
             if self._is_hn_in_monitor(hn): self.rb_edit.setChecked(True)
             else: self.rb_add.setChecked(True)
@@ -959,12 +1281,24 @@ class Main(QtWidgets.QWidget):
         hdr = tree.header()
         if hdr is None:
             return
+        hbar = tree.horizontalScrollBar()
+        vbar = tree.verticalScrollBar()
+        old_h = hbar.value() if hbar is not None else 0
+        old_v = vbar.value() if vbar is not None else 0
         hdr.setStretchLastSection(False)
-        for c in (0, 1, 3, 8, 9):
+        for c in (0, 1, 2, 4, 9, 19):
             try:
                 tree.resizeColumnToContents(c)
             except Exception:
                 break
+        if hbar is not None or vbar is not None:
+            def _restore_after_autofit():
+                if hbar is not None:
+                    hbar.setValue(min(old_h, hbar.maximum()))
+                if vbar is not None:
+                    vbar.setValue(min(old_v, vbar.maximum()))
+
+            QtCore.QTimer.singleShot(0, _restore_after_autofit)
 
     def _build_header_frame(self) -> QtWidgets.QFrame:
         banner = WaveBanner(self)
@@ -1114,7 +1448,7 @@ QCheckBox { color:#0f172a; }
 
         form_stat.addRow(lbl_status, self.cb_status)
         form_stat.addRow(self.lbl_eta, self.ent_eta)
-        self.cb_status.currentTextChanged.connect(self._toggle_eta_visibility)
+        self.cb_status.currentTextChanged.connect(self._on_status_combo_changed)
         self._toggle_eta_visibility()
 
         # Action card
@@ -1184,16 +1518,41 @@ QCheckBox { color:#0f172a; }
         )
         gs = self.card_sched.grid(); gs.setContentsMargins(0,0,0,0)
         self.tree_sched = QtWidgets.QTreeWidget()
-        self.tree_sched.setColumnCount(10)
-        self.tree_sched.setHeaderLabels(["OR/เวลา", "HN", "ชื่อ-สกุล", "อายุ", "Diagnosis", "Operation", "แพทย์", "Ward", "คิว", "สถานะ"])
-        self.tree_sched.setWordWrap(True); self.tree_sched.setUniformRowHeights(False)
-        hdr = self.tree_sched.header(); hdr.setStretchLastSection(False)
-        hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
-        for i in range(1, 10):
-            mode = QtWidgets.QHeaderView.Stretch if i in (4, 5) else QtWidgets.QHeaderView.ResizeToContents
-            hdr.setSectionResizeMode(i, mode)
+        self.tree_sched.setColumnCount(20)
+        self.tree_sched.setHeaderLabels([
+            "บันทึก",
+            "ช่วงเวลา",
+            "OR/เวลา",
+            "HN",
+            "ชื่อ-สกุล",
+            "อายุ",
+            "Diagnosis",
+            "Operation",
+            "แพทย์",
+            "Ward",
+            "ขนาดเคส",
+            "แผนก",
+            "Assist1",
+            "Assist2",
+            "Scrub",
+            "Circulate",
+            "เริ่ม",
+            "จบ",
+            "คิว",
+            "ประเภทเคส",
+        ])
+        self.tree_sched.setUniformRowHeights(False)
+        hdr = self.tree_sched.header()
+        hdr.setStretchLastSection(False)
+        hdr.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        hdr.setFixedHeight(42)
+        for i in range(20):
+            hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
+        self.tree_sched.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.tree_sched.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
         self.tree_sched.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self.tree_sched.setTextElideMode(QtCore.Qt.ElideNone)
+        self.tree_sched.setWordWrap(False)
         self.tree_sched.setObjectName("ScheduleTree")
         self.tree_sched.setAlternatingRowColors(True)
         self.tree_sched.setStyleSheet("""
@@ -1209,19 +1568,6 @@ QCheckBox { color:#0f172a; }
         QTreeWidget#ScheduleTree::item { padding:6px 8px; border-bottom:1px solid #e9edf3; }
         QTreeWidget#ScheduleTree::item:selected { background:#e0f2fe; color:#0f172a; }
         """)
-        self.tree_sched.setUniformRowHeights(False); self.tree_sched.setWordWrap(True)
-        m = QtWidgets.QHeaderView
-        hdr.setStretchLastSection(False)
-        hdr.setSectionResizeMode(0, m.ResizeToContents)
-        hdr.setSectionResizeMode(1, m.ResizeToContents)
-        hdr.setSectionResizeMode(2, m.Stretch)
-        hdr.setSectionResizeMode(3, m.ResizeToContents)
-        hdr.setSectionResizeMode(4, m.Stretch)
-        hdr.setSectionResizeMode(5, m.Stretch)
-        hdr.setSectionResizeMode(6, m.Stretch)
-        hdr.setSectionResizeMode(7, m.Stretch)
-        hdr.setSectionResizeMode(8, m.ResizeToContents)
-        hdr.setSectionResizeMode(9, m.ResizeToContents)
         self.tree_sched.setItemDelegate(ScheduleDelegate(self.tree_sched))
         gs.addWidget(self.tree_sched, 0, 0, 1, 1)
         self.tree_sched.itemClicked.connect(self._on_sched_item_clicked)
@@ -1286,7 +1632,11 @@ QCheckBox { color:#0f172a; }
     def _save_persisted_monitor_state(self, rows: List[dict]):
         try:
             s = QSettings(PERSIST_ORG, PERSIST_APP)
-            s.setValue(KEY_LAST_ROWS, json.dumps(rows, ensure_ascii=False))
+            clean_rows: list[dict] = []
+            for row in rows or []:
+                if isinstance(row, dict):
+                    clean_rows.append({k: v for k, v in row.items() if not str(k).startswith("_")})
+            s.setValue(KEY_LAST_ROWS, json.dumps(clean_rows, ensure_ascii=False))
             s.setValue(KEY_WAS_IN_MONITOR, json.dumps(sorted(list(self._was_in_monitor))))
             s.setValue(KEY_CURRENT_MONITOR, json.dumps(sorted(list(self._current_monitor_hn))))
         except Exception:
@@ -1340,11 +1690,220 @@ QCheckBox { color:#0f172a; }
         self.lbl_eta.setVisible(is_op); self.ent_eta.setVisible(is_op); self.ent_eta.setEnabled(is_op)
         if not is_op: self.ent_eta.clear()
 
+    def _set_status_combo(self, status: str | None):
+        self._suppress_status_change = True
+        try:
+            if status:
+                idx = self.cb_status.findText(status)
+                if idx >= 0:
+                    self.cb_status.setCurrentIndex(idx)
+                    self._toggle_eta_visibility()
+                    return
+            self.cb_status.setCurrentIndex(0)
+        finally:
+            self._suppress_status_change = False
+        self._toggle_eta_visibility()
+
+    def _on_status_combo_changed(self, text: str):
+        self._toggle_eta_visibility()
+        if self._suppress_status_change:
+            return
+        entry = self._get_active_schedule_entry()
+        if entry is None:
+            return
+        self._apply_status_change(entry, text)
+
+    def _get_active_schedule_entry(self) -> _SchedEntry | None:
+        if not self._last_selected_uid:
+            return None
+        return self.sched.find_by_uid(self._last_selected_uid)
+
+    def _apply_status_change(self, entry: _SchedEntry, new_status: str):
+        changed = False
+        now_hm = datetime.now().strftime("%H:%M")
+
+        if new_status == STATUS_OP_START:
+            if not entry.time_start:
+                entry.time_start = now_hm
+                changed = True
+            if entry.state in ("scheduled", "in_or", "operation_ended", "postop_pending", "") or not entry.state:
+                entry.state = "operation_started"
+                changed = True
+
+        elif new_status == STATUS_OP_END:
+            if not entry.time_end:
+                entry.time_end = now_hm
+                changed = True
+            if entry.state in ("operation_started", "in_or", "scheduled", "") or not entry.state:
+                entry.state = "operation_ended"
+                changed = True
+
+        elif new_status == STATUS_RETURNING:
+            if not entry.time_end:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "ยังผ่าตัดไม่จบ",
+                    "ยังไม่มีเวลา 'จบผ่าตัด' ระบบฝั่งแม่จะไม่เริ่มนับ 3 นาทีจนกว่าจะมีเวลาจบ",
+                )
+            entry.state = "returning_to_ward"
+            entry.returning_started_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            changed = True
+
+        if entry.status != new_status:
+            entry.status = new_status
+            changed = True
+
+        if changed:
+            entry.version = int(entry.version or 0) + 1
+            entry.updated_at = datetime.now().isoformat()
+            self.sched.touch_entry(entry)
+            self._render_schedule_tree()
+            self._flash_row_by_uid(entry.uid())
+            self._set_status_combo(entry.status)
+
     def _reset_form(self):
         self.ent_hn.clear(); self.ent_pid.clear(); self.ent_eta.clear()
-        self.cb_status.setCurrentIndex(0); self.cb_q.setCurrentIndex(0)
-        self._toggle_eta_visibility(); self.ent_hn.setFocus()
+        self._set_status_combo(None); self.cb_q.setCurrentIndex(0)
+        self.ent_hn.setFocus()
         self.lbl_scan_state.setText("Scanner: Ready"); self.lbl_scan_state.setStyleSheet("color:#16a34a;font-weight:600;")
+
+    def _flash_row_by_uid(self, uid: str):
+        if not uid:
+            return
+        tree = getattr(self, "tree_sched", None)
+        if tree is None:
+            return
+        matches: list[QtWidgets.QTreeWidgetItem] = []
+        for i in range(tree.topLevelItemCount()):
+            parent = tree.topLevelItem(i)
+            if parent is None:
+                continue
+            for j in range(parent.childCount()):
+                child = parent.child(j)
+                entry = child.data(0, QtCore.Qt.UserRole)
+                if isinstance(entry, _SchedEntry) and entry.uid() == uid:
+                    matches.append(child)
+
+        if not matches:
+            return
+
+        highlight = QtGui.QBrush(QtGui.QColor("#fef08a"))
+        for item in matches:
+            for col in range(tree.columnCount()):
+                item.setBackground(col, highlight)
+
+        def _clear():
+            for item in matches:
+                self._style_schedule_item(item, False)
+
+        QtCore.QTimer.singleShot(1200, _clear)
+
+    def _restore_selected_schedule_item(self):
+        if not self._last_selected_uid:
+            return
+        tree = getattr(self, "tree_sched", None)
+        if tree is None:
+            return
+        for i in range(tree.topLevelItemCount()):
+            parent = tree.topLevelItem(i)
+            if parent is None:
+                continue
+            for j in range(parent.childCount()):
+                child = parent.child(j)
+                entry = child.data(0, QtCore.Qt.UserRole)
+                if isinstance(entry, _SchedEntry) and entry.uid() == self._last_selected_uid:
+                    tree.setCurrentItem(child)
+                    tree.scrollToItem(child, QtWidgets.QAbstractItemView.PositionAtCenter)
+                    return
+
+    def _on_postop_clicked(self):
+        entry = self._get_active_schedule_entry()
+        if entry is None:
+            QtWidgets.QMessageBox.information(self, "ยังไม่ได้เลือก", "กรุณาเลือกเคสจากตารางก่อน")
+            return
+        self._open_postop_dialog(entry)
+
+    def _open_postop_dialog(self, entry: _SchedEntry):
+        dlg = PostOpDialog(entry, self)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        values = dlg.values()
+        changed = False
+        for field in ("assist1", "assist2", "scrub", "circulate"):
+            new_val = values.get(field, "")
+            if getattr(entry, field, "") != new_val:
+                setattr(entry, field, new_val)
+                changed = True
+
+        diags = values.get("diags") or []
+        if diags and list(entry.diags or []) != diags:
+            entry.diags = diags
+            changed = True
+
+        ops = values.get("ops") or []
+        if ops and list(entry.ops or []) != ops:
+            entry.ops = ops
+            changed = True
+
+        if not changed:
+            return
+
+        entry.version = int(entry.version or 0) + 1
+        entry.updated_at = datetime.now().isoformat()
+        self.sched.touch_entry(entry)
+        self._render_schedule_tree()
+        self._flash_row_by_uid(entry.uid())
+        self.toast.show_toast("บันทึกหลังผ่าตัดเรียบร้อย")
+
+    def _open_postop_by_uid(self, uid: str):
+        if not uid:
+            return
+        for entry in self.sched.entries:
+            if isinstance(entry, _SchedEntry) and entry.uid() == uid:
+                self._open_postop_dialog(entry)
+                break
+
+    def _make_postop_button(self, uid: str) -> QtWidgets.QPushButton:
+        btn = QtWidgets.QPushButton("💾 บันทึก")
+        btn.setCursor(QtCore.Qt.PointingHandCursor)
+        btn.setFocusPolicy(QtCore.Qt.NoFocus)
+        btn.setStyleSheet(
+            """
+            QPushButton{
+                background:#fb923c; color:#111; border:1px solid #f97316;
+                border-radius:12px; padding:6px 10px; font-weight:800;
+            }
+            QPushButton:hover{ background:#f59e0b; }
+            """
+        )
+        effect = QtWidgets.QGraphicsOpacityEffect(btn)
+        btn.setGraphicsEffect(effect)
+        anim = QtCore.QPropertyAnimation(effect, b"opacity", btn)
+        anim.setDuration(1200)
+        anim.setStartValue(0.55)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QtCore.QEasingCurve.InOutQuad)
+        anim.setLoopCount(-1)
+        anim.start()
+        btn._pulse_anim = anim  # type: ignore[attr-defined]
+        btn._pulse_effect = effect  # type: ignore[attr-defined]
+        btn.clicked.connect(lambda *_: self._open_postop_by_uid(uid))
+        return btn
+
+    def _incomplete(self, entry: _SchedEntry) -> bool:
+        if not (entry.time_start and entry.time_end):
+            return True
+        if not (entry.scrub or entry.circulate or entry.assist1 or entry.assist2):
+            return True
+        if not (entry.ops or entry.diags):
+            return True
+        return False
+
+    def _first_visible_item(self) -> QtWidgets.QTreeWidgetItem | None:
+        return None
+
+    def _update_or_sticky(self):
+        return
 
     def _set_chip(self, ok: bool):
         base = getattr(self, "_status_pill_base", "background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;padding:4px 10px;font-weight:600;")
@@ -1372,9 +1931,16 @@ QCheckBox { color:#0f172a; }
     def _extract_rows(self, payload):
         """Normalize payload from API/websocket into monitor row dicts."""
         src = []
+        meta: dict[str, object] = {}
         if isinstance(payload, list):
             src = payload
         elif isinstance(payload, dict):
+            meta_candidates = {
+                "version": payload.get("version", payload.get("ver", payload.get("seq"))),
+                "updated_at": payload.get("updated_at", payload.get("ts")),
+                "hash": payload.get("hash"),
+            }
+            meta = {k: v for k, v in meta_candidates.items() if v is not None}
             for k in ("items", "data", "table", "rows", "list"):
                 if k in payload and isinstance(payload[k], list):
                     src = payload[k]
@@ -1463,21 +2029,25 @@ QCheckBox { color:#0f172a; }
 
             rid = it.get("id") or (hn_full if hn_full else pid) or i
 
-            rows.append({
+            row = {
                 "id": str(rid),
                 "hn_full": hn_full if hn_full else None,
                 "patient_id": str(pid),
                 "status": status,
                 "timestamp": ts_iso,
                 "eta_minutes": eta_minutes,
-            })
-        return rows
+            }
+            rows.append(row)
+
+        return rows, meta
 
     def _render_time_cell(self, row: dict) -> str:
         status = row.get("status", "")
-        ts_iso = row.get("timestamp")
+        ts = row.get("_ts")
+        if ts is None:
+            ts = _parse_iso(row.get("timestamp"))
+            row["_ts"] = ts
         eta_min = row.get("eta_minutes")
-        ts = _parse_iso(ts_iso)
 
         if status == "กำลังผ่าตัด" and ts:
             now = datetime.now()
@@ -1504,10 +2074,85 @@ QCheckBox { color:#0f172a; }
             self.tray.setToolTip("SurgiBot Client")
             self.tray.show()
 
-    def _rebuild(self, rows):
+    def _monitor_signature(self, rows: list[dict], meta: dict | None) -> tuple[str, str] | None:
+        meta = meta or {}
+        if meta.get("force"):
+            return None
+        version = meta.get("version")
+        if version is not None:
+            return ("version", str(version))
+        updated_at = meta.get("updated_at")
+        if updated_at is not None:
+            return ("updated_at", str(updated_at))
+        meta_hash = meta.get("hash")
+        if meta_hash is not None:
+            return ("hash", str(meta_hash))
+        try:
+            digest_src = json.dumps(rows, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            safe_rows = []
+            for row in rows:
+                if isinstance(row, dict):
+                    safe_rows.append({k: row.get(k) for k in ("id", "patient_id", "status", "timestamp", "eta_minutes")})
+            digest_src = json.dumps(safe_rows, ensure_ascii=False, sort_keys=True)
+        return ("digest", hashlib.sha1(digest_src.encode("utf-8")).hexdigest())
+
+    def _normalize_monitor_rows(self, rows: list[dict]) -> list[dict]:
+        normalized: list[dict] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            rid = str(row.get("id", row.get("patient_id", "")))
+            pid = str(row.get("patient_id", ""))
+            status = str(row.get("status", "")).strip() or "รอผ่าตัด"
+            hn_full = row.get("hn_full")
+            hn_full = str(hn_full).strip() if hn_full else None
+            ts_iso = row.get("timestamp")
+            if isinstance(ts_iso, (int, float)):
+                try:
+                    ts_iso = datetime.fromtimestamp(float(ts_iso)).isoformat(timespec="seconds")
+                except Exception:
+                    ts_iso = None
+            ts_iso = str(ts_iso) if ts_iso else ""
+            eta_val = row.get("eta_minutes")
+            try:
+                eta_minutes = int(eta_val) if eta_val not in (None, "") else None
+            except Exception:
+                eta_minutes = None
+
+            cleaned = {
+                "id": rid,
+                "patient_id": pid,
+                "status": status,
+                "timestamp": ts_iso,
+                "eta_minutes": eta_minutes,
+            }
+            if hn_full:
+                cleaned["hn_full"] = hn_full
+            ts_obj = _parse_iso(ts_iso)
+            cleaned["_ts"] = ts_obj
+            normalized.append(cleaned)
+        return normalized
+
+    def _rebuild(self, rows, meta: dict | None = None):
+        meta = meta or {}
+        normalized_rows = self._normalize_monitor_rows(rows if isinstance(rows, list) else [])
+        signature = self._monitor_signature(normalized_rows, meta)
+        if signature is not None and signature == self._last_monitor_signature:
+            self.rows_cache = normalized_rows
+            self._last_monitor_meta = meta
+            self.monitor_ready = True
+            return
+
+        if signature is not None:
+            self._last_monitor_signature = signature
+        else:
+            self._last_monitor_signature = None
+        self._last_monitor_meta = meta
+        self.rows_cache = normalized_rows
         # 1) แจ้งเตือนใน tray เมื่อสถานะเปลี่ยน
         new_map = {}
-        for r in rows or []:
+        for r in normalized_rows:
             pid, st = r.get("patient_id", ""), r.get("status", "")
             if pid:
                 new_map[pid] = st
@@ -1517,17 +2162,16 @@ QCheckBox { color:#0f172a; }
         self._last_states = new_map
 
         # 2) บันทึก cache และเปิดโหมด monitor
-        self.rows_cache = rows if isinstance(rows, list) else []
         self.monitor_ready = True
 
         # เก็บว่า HN ใดเคยอยู่ใน monitor แล้ว (ใช้กับการขีด + watermark)
-        for r in self.rows_cache:
+        for r in normalized_rows:
             hn_all = self._extract_hn_from_row(r)
             if hn_all:
                 self._was_in_monitor.add(hn_all)
 
         # ตัดรายการออกตามกติกา auto-purge (ฝั่ง client)
-        visible_rows = [r for r in self.rows_cache if not self._should_auto_purge(r)]
+        visible_rows = [r for r in normalized_rows if not self._should_auto_purge(r)]
 
         # อัปเดตรายชื่อ HN ที่ "ยังอยู่" ใน monitor ตอนนี้
         current = set()
@@ -1550,39 +2194,53 @@ QCheckBox { color:#0f172a; }
             self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(r.get("patient_id", ""))))
 
             # สถานะ + สีพื้นตามสถานะ
-            status_item = QtWidgets.QTableWidgetItem(str(r.get("status", "")))
-            col = STATUS_COLORS.get(r.get("status", ""))
+            status_val = str(r.get("status", ""))
+            status_item = QtWidgets.QTableWidgetItem(status_val)
+            col = STATUS_COLORS.get(status_val)
             if col:
                 status_item.setBackground(QtGui.QBrush(QtGui.QColor(col)))
-                fg = "#ffffff" if r.get("status") in ("กำลังผ่าตัด", "กำลังส่งกลับตึก",
-                                                      "เลื่อนการผ่าตัด") else "#000000"
+                fg = "#ffffff" if status_val in ("กำลังผ่าตัด", "กำลังส่งกลับตึก",
+                                                  "เลื่อนการผ่าตัด") else "#000000"
                 status_item.setForeground(QtGui.QBrush(QtGui.QColor(fg)))
             self.table.setItem(row, 2, status_item)
 
             # เวลาแสดงผล
             self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(self._render_time_cell(r)))
 
-        # 4) วาดตาราง Schedule + อัปเดต marker (เส้นขีด/ปุ่ม “ผ่าตัดเสร็จแล้ว”)
+        # 4) วาดตาราง Schedule
         self._render_schedule_tree()
         self._update_schedule_completion_markers()
 
         # 5) persist state
         self._save_persisted_monitor_state(self.rows_cache)
 
+    def _update_monitor_elapsed(self):
+        if not self.monitor_ready or not self.rows_cache:
+            return
+        row_cap = min(len(self.rows_cache), self.table.rowCount())
+        for idx in range(row_cap):
+            row = self.rows_cache[idx]
+            value = self._render_time_cell(row)
+            item = self.table.item(idx, 3)
+            if item is None:
+                self.table.setItem(idx, 3, QtWidgets.QTableWidgetItem(value))
+            elif item.text() != value:
+                item.setText(value)
+
     def _refresh(self, prefer_server=True):
         try:
             if prefer_server:
                 res = self._client().list_items()
-                rows = self._extract_rows(res)
+                rows, meta = self._extract_rows(res)
                 if rows is not None:
-                    self._rebuild(rows)
+                    self._rebuild(rows, meta)
                     self._set_chip(True)
                     return
             # ถ้า server ล้มเหลว ใช้ข้อมูล local model
-            self._rebuild(self.model.rows)
+            self._rebuild(self.model.rows, {"source": "local", "force": True})
         except requests.exceptions.RequestException:
             self._set_chip(False)
-            self._rebuild(self.model.rows)
+            self._rebuild(self.model.rows, {"source": "local", "force": True})
 
     # ---------- WebSocket ----------
     def _ws_url(self):
@@ -1626,9 +2284,9 @@ QCheckBox { color:#0f172a; }
     def _on_ws_message(self, msg: str):
         try:
             payload = json.loads(msg)
-            rows = self._extract_rows(payload)
+            rows, meta = self._extract_rows(payload)
             if rows is not None:
-                self._rebuild(rows)
+                self._rebuild(rows, meta)
         except Exception:
             pass
 
@@ -1691,10 +2349,9 @@ QCheckBox { color:#0f172a; }
             if pid:
                 self.ent_pid.setText(pid)
             if st:
-                i = self.cb_status.findText(st)
-                if i >= 0:
-                    self.cb_status.setCurrentIndex(i)
-                self._toggle_eta_visibility()
+                self._set_status_combo(st)
+            else:
+                self._set_status_combo(None)
             if hid.isdigit() and len(hid) == 9:
                 self.ent_hn.setText(hid)
 
@@ -1747,155 +2404,148 @@ QCheckBox { color:#0f172a; }
             self._reset_form()
 
     # ---------- Schedule ----------
+
+
     def _render_schedule_tree(self):
         """วาด Result Schedule ให้ตรงกับ Registry + เคารพสถานะพับ/ขยายของผู้ใช้"""
-        # 1) เก็บสถานะพับ/ขยายเดิมไว้ก่อนล้าง
+        tree = getattr(self, "tree_sched", None)
+        if tree is None:
+            return
+
         self._capture_or_expand_state()
 
-        # 2) ล้าง/รีเซ็ต
-        self._clear_sched_pulser()
-        self.tree_sched.clear()
+        hbar = tree.horizontalScrollBar()
+        vbar = tree.verticalScrollBar()
+        old_h = hbar.value() if hbar is not None else 0
+        old_v = vbar.value() if vbar is not None else 0
 
-        # 3) คำนวณช่วงเวลา/ตัวกรอง
-        now_code = _now_period(datetime.now())  # "in" | "off"
-        in_monitor = set(self._current_monitor_hn or [])
+        tree.setUpdatesEnabled(False)
+        try:
+            self._clear_sched_pulser()
+            tree.clear()
 
-        groups: dict[str, list[_SchedEntry]] = {}
+            now_code = _now_period(datetime.now())  # "in" | "off"
+            in_monitor = set(self._current_monitor_hn or [])
+            today = datetime.now().date()
 
-        def should_show(e: _SchedEntry) -> bool:
-            if now_code == "in":
+            def _is_today(entry: _SchedEntry) -> bool:
+                if entry.date_obj:
+                    return entry.date_obj == today
+                if entry.date:
+                    return entry.date.strip().startswith(today.isoformat())
                 return True
-            # นอกเวลา: แสดง off เสมอ + in เฉพาะที่ยังไม่เสร็จ (ยังเห็น HN ใน monitor)
-            return (e.period == "off") or (e.period == "in" and e.hn and e.hn in in_monitor)
 
-        for e in self.sched_reader.entries:
-            if should_show(e):
-                groups.setdefault(e.or_room or "-", []).append(e)
+            groups: dict[str, list[_SchedEntry]] = {}
 
-        order = self.sched_reader.or_rooms or []
+            def should_show(e: _SchedEntry) -> bool:
+                if not _is_today(e):
+                    return False
+                if now_code == "in":
+                    return True
+                return (e.period == "off") or (e.period == "in" and e.hn and e.hn in in_monitor)
 
-        def room_key(x: str):  # เรียงตามลำดับห้องจาก registry
-            return (order.index(x) if x in order else 999, x)
+            try:
+                normalized_entries = normalize_owner_for_wednesday(list(self.sched.entries), today)
+            except Exception:
+                normalized_entries = list(self.sched.entries)
 
-        def row_sort_key(e: _SchedEntry):
-            # คิว 1–9 มาก่อน แล้วคิว 0 ตามเวลา
-            q = int(e.queue or 0)
-            if q > 0:
-                return (0, q, "")
-            return (1, 0, e.time or "99:99")
+            for e in normalized_entries:
+                if should_show(e):
+                    groups.setdefault(e.or_room or "-", []).append(e)
 
-        # 4) สร้างหัว OR แบบการ์ด (สีตาม OR) + คืนค่าสถานะพับ/ขยาย
-        for orr in sorted(groups.keys(), key=room_key):
-            if not groups[orr]:
-                continue
+            order = self.sched.or_rooms or []
 
-            parent = QtWidgets.QTreeWidgetItem([f"{orr}"] + [""] * 9)
-            parent.setFirstColumnSpanned(True)
-            self.tree_sched.addTopLevelItem(parent)
+            def room_key(x: str):
+                return (order.index(x) if x in order else 999, x)
 
-            # หัวกลุ่มดูชัด แต่ไม่ selectable
-            self._style_or_group_header(parent, "#eef2ff")
-            parent.setFlags((parent.flags() | QtCore.Qt.ItemIsEnabled) & ~QtCore.Qt.ItemIsSelectable)
+            def row_sort_key(e: _SchedEntry):
+                q = int(e.queue or 0)
+                if q > 0:
+                    return (0, q, "")
+                return (1, 0, e.time or "99:99")
 
-            # การ์ดหัว OR ใช้สีเฉพาะของห้องนั้น (แตกต่างครบทุก OR)
-            accent = OR_HEADER_COLORS.get(orr, "#64748b")
-            self.tree_sched.setItemWidget(parent, 0, self._or_card_widget(orr, accent))
+            for orr in sorted(groups.keys(), key=room_key):
+                if not groups[orr]:
+                    continue
 
-            # คืนค่าพับ/ขยายเดิมของหัวนี้
-            self._apply_or_expand_state(parent)
+                parent = QtWidgets.QTreeWidgetItem([""] * tree.columnCount())
+                header_title = f"{orr}  ห้องผ่าตัด"
+                parent.setText(0, header_title)
+                parent.setData(0, QtCore.Qt.UserRole + 200, orr)
+                parent.setData(0, QtCore.Qt.UserRole + 201, header_title)
+                parent.setFirstColumnSpanned(True)
+                tree.addTopLevelItem(parent)
 
-            # 5) แถวลูก (ผู้ป่วย)
-            for e in sorted(groups[orr], key=row_sort_key):
-                row = QtWidgets.QTreeWidgetItem([
-                    e.time or "-", e.hn, e.name or "-", str(e.age or 0),
-                    ", ".join(e.diags) or "-", ", ".join(e.ops) or "-",
-                    e.doctor or "-", e.ward or "-", str(e.queue or 0), ""
-                ])
-                parent.addChild(row)
+                self._style_or_group_header(parent, "#eef2ff")
+                parent.setFlags((parent.flags() | QtCore.Qt.ItemIsEnabled) & ~QtCore.Qt.ItemIsSelectable)
 
-        # 6) ไม่บังคับ expandAll() เพื่อไม่ให้เด้งกลับ
+                accent = OR_HEADER_COLORS.get(orr, "#64748b")
+                try:
+                    sublabel = describe_or_plan_label(today, orr) or "ห้องผ่าตัด"
+                except Exception:
+                    sublabel = "ห้องผ่าตัด"
+                tree.setItemWidget(parent, 0, self._or_card_widget(orr, accent, sublabel))
+
+                self._apply_or_expand_state(parent)
+
+                for e in sorted(groups[orr], key=row_sort_key):
+                    row = QtWidgets.QTreeWidgetItem([
+                        "",
+                        _period_label(e.period),
+                        (e.time or "-"),
+                        e.hn,
+                        (e.name or "-"),
+                        (str(e.age) if e.age not in (None, "") else "-"),
+                        (", ".join(e.diags) if getattr(e, "diags", None) else "-"),
+                        (", ".join(e.ops) if getattr(e, "ops", None) else "-"),
+                        (e.doctor or "-"),
+                        (e.ward or "-"),
+                        (e.case_size or "-"),
+                        (e.dept or "-"),
+                        (e.assist1 or "-"),
+                        (e.assist2 or "-"),
+                        (e.scrub or "-"),
+                        (e.circulate or "-"),
+                        (e.time_start or "-"),
+                        (e.time_end or "-"),
+                        (str(e.queue) if str(getattr(e, "queue", "0")).isdigit() and int(getattr(e, "queue", "0")) > 0 else "ตามเวลา"),
+                        (e.urgency or "Elective"),
+                    ])
+                    row.setData(0, QtCore.Qt.UserRole, e)
+                    parent.addChild(row)
+
+                    if self._incomplete(e):
+                        tree.setItemWidget(row, 0, self._make_postop_button(e.uid()))
+        finally:
+            tree.setUpdatesEnabled(True)
+
+            def _restore_scroll():
+                if hbar is not None:
+                    hbar.setValue(min(old_h, hbar.maximum()))
+                if vbar is not None:
+                    vbar.setValue(min(old_v, vbar.maximum()))
+
+            QtCore.QTimer.singleShot(0, _restore_scroll)
+
         QtCore.QTimer.singleShot(0, self._autofit_schedule_columns)
+        QtCore.QTimer.singleShot(0, self._restore_selected_schedule_item)
         if self.monitor_ready:
             self._update_schedule_completion_markers()
-
-    def _create_done_button(self) -> QtWidgets.QWidget:
-        wrap = QtWidgets.QWidget()
-        lay = QtWidgets.QHBoxLayout(wrap)
-        lay.setContentsMargins(6, 4, 6, 4)  # มี margin เล็กน้อยให้ header คำนวณกว้างขึ้น
-        lay.setSpacing(0)
-
-        btn = QtWidgets.QPushButton("ผ่าตัดเสร็จแล้ว", wrap)
-        fm = QtGui.QFontMetrics(btn.font())
-        # เผื่อซ้ายขวา 24px ให้สบายตา ไม่โดนตัด
-        min_w = fm.horizontalAdvance("ผ่าตัดเสร็จแล้ว") + 24
-        min_h = max(28, fm.height() + 10)
-
-        btn.setMinimumSize(min_w, min_h)
-        btn.setSizePolicy(QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Fixed)
-
-        btn.setEnabled(False)
-        btn.setCursor(QtCore.Qt.ArrowCursor)
-        btn.setStyleSheet("""
-            QPushButton{
-                background:#10b981;
-                color:#ffffff;
-                border:none;
-                border-radius:12px;
-                padding:4px 12px;
-                font-weight:800;
-            }
-        """)
-
-        lay.addWidget(btn, 0, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        lay.addStretch(1)  # ดันให้ปุ่มชิดซ้าย เหลือที่ว่างทางขวา
-
-        return wrap
-
     def _update_schedule_completion_markers(self):
-        if not self.monitor_ready:
-            return
-        try:
-            topc = self.tree_sched.topLevelItemCount()
-            for i in range(topc):
-                parent = self.tree_sched.topLevelItem(i)
-                for j in range(parent.childCount()):
-                    item = parent.child(j)
-                    hn = (item.text(1) or "").strip()
-                    completed = (hn and (hn in self._was_in_monitor) and (hn not in self._current_monitor_hn))
-                    self._style_schedule_item(item, completed)
-        except Exception:
-            pass
-        self.tree_sched.viewport().update()
+        return
 
     def _style_schedule_item(self, item: QtWidgets.QTreeWidgetItem, completed: bool):
         cols = self.tree_sched.columnCount()
         for c in range(cols):
+            item.setForeground(c, QtGui.QBrush())
+            item.setBackground(c, QtGui.QBrush())
             f = self.tree_sched.font()
-            f.setStrikeOut(bool(completed))
+            f.setStrikeOut(False)
             item.setFont(c, f)
-
-        if completed:
-            dim_fg = QtGui.QBrush(QtGui.QColor(100, 116, 139))
-            for c in range(cols):
-                item.setForeground(c, dim_fg)
-                bg = QtGui.QColor(148, 163, 184, 40)
-                item.setBackground(c, QtGui.QBrush(bg))
-            # ไม่ให้เลือก/คลิก
-            item.setFlags(item.flags() & ~QtCore.Qt.ItemIsSelectable & ~QtCore.Qt.ItemIsEnabled)
-            # สำหรับ watermark ของ delegate (ใช้ UserRole บนคอลัมน์ชื่อ-สกุล)
-            item.setData(2, QtCore.Qt.UserRole, "completed")
-            # วางปุ่ม "ผ่าตัดเสร็จแล้ว" ในคอลัมน์สุดท้าย
-            self.tree_sched.setItemWidget(item, 9, self._create_done_button())
-        else:
-            for c in range(cols):
-                item.setForeground(c, QtGui.QBrush())
-                item.setBackground(c, QtGui.QBrush())
-            item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
-            item.setData(2, QtCore.Qt.UserRole, None)
-            self.tree_sched.setItemWidget(item, 9, None)
+        item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
 
     def _check_schedule_seq(self):
-        if self.sched_reader.refresh_if_changed():
+        if self.sched.refresh_if_changed():
             self._render_schedule_tree()
         # ไม่บังคับ expandAll เพื่อคงสถานะพับ/ขยายของผู้ใช้
         QtCore.QTimer.singleShot(0, self._autofit_schedule_columns)
