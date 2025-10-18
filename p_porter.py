@@ -32,6 +32,7 @@ from datetime import datetime, date, time
 from typing import Dict, Any, Optional, Tuple, List
 
 from flask import Flask, jsonify, request, abort, send_from_directory
+from flask_cors import CORS
 from functools import lru_cache
 from pathlib import Path
 
@@ -124,6 +125,7 @@ ROLES_WEEKEND = {
 # App / DB helpers
 # ----------------------------------------------------------------------------
 app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -699,6 +701,12 @@ def api_roster_today():
     conn.close()
     return jsonify({"date": shift_date, "shift": shift_name, "roster": data})
 
+
+@app.get("/api/lookup/hn/<hn>")
+def api_lookup_hn(hn: str):
+    return jsonify({"hn": hn, "name": lookup_patient_name(hn)})
+
+
 @app.post("/api/request_move")
 def api_request_move():
     payload = request.get_json(force=True) or {}
@@ -709,6 +717,9 @@ def api_request_move():
     target_ward = str(payload.get("target_ward") or "").strip()
     patient_name = str(payload.get("patient_name") or "").strip()
 
+    if not patient_name and hn:
+        patient_name = lookup_patient_name(hn) or ""
+
     source_area = str(payload.get("source_area") or payload.get("source_ward") or "").strip()
 
     if (not patient_name or (task_type == "OR_to_WARD" and not target_ward)) and hn:
@@ -716,9 +727,6 @@ def api_request_move():
         patient_name = patient_name or (name2 or "")
         if task_type == "OR_to_WARD":
             target_ward = target_ward or (ward2 or "")
-
-    if not patient_name and hn:
-        patient_name = lookup_patient_name(hn) or ""
 
     target_ward = normalize_ward(target_ward)
     source_area = normalize_ward(source_area)

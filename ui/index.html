@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <title>P-Porter Caller Console</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      margin: 2rem;
+      background: #f8fafc;
+      color: #0f172a;
+    }
+    header {
+      margin-bottom: 1.5rem;
+    }
+    form {
+      background: white;
+      border-radius: 12px;
+      padding: 1.5rem;
+      box-shadow: 0 12px 24px rgba(15, 23, 42, 0.08);
+      max-width: 420px;
+    }
+    label {
+      display: block;
+      font-weight: 600;
+      margin-bottom: 0.35rem;
+    }
+    input, select {
+      width: 100%;
+      padding: 0.65rem 0.75rem;
+      border-radius: 8px;
+      border: 1px solid #cbd5f5;
+      margin-bottom: 1rem;
+      font-size: 1rem;
+    }
+    button {
+      background: #2563eb;
+      border: none;
+      color: white;
+      font-size: 1rem;
+      padding: 0.75rem 1.25rem;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    .hint {
+      font-size: 0.875rem;
+      color: #475569;
+      margin-top: -0.75rem;
+      margin-bottom: 0.75rem;
+      min-height: 1.2rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Caller — OR to Ward</h1>
+    <p>ระบุ HN แล้วระบบจะค้นหาชื่ออัตโนมัติจากฐาน Registry.</p>
+  </header>
+  <form id="requestForm">
+    <label for="hnInput">HN</label>
+    <input id="hnInput" name="hn" maxlength="10" autocomplete="off" required />
+    <div id="patientNameHint" class="hint"></div>
+
+    <label for="patientNameInput">ชื่อผู้ป่วย</label>
+    <input id="patientNameInput" name="patient_name" placeholder="จะเติมให้อัตโนมัติเมื่อพบ" />
+
+    <label for="targetWardInput">ปลายทาง (วอร์ด)</label>
+    <input id="targetWardInput" name="target_ward" required />
+
+    <button type="submit">สร้างงานขนย้าย</button>
+  </form>
+
+  <script>
+    const BASE = localStorage.getItem('pp_base') || '';
+
+    async function fetchNameByHN(hn) {
+      if (!hn) return '';
+      try {
+        const res = await fetch(`${BASE}/api/lookup/hn/${encodeURIComponent(hn)}`);
+        if (!res.ok) return '';
+        const data = await res.json();
+        return data.name || '';
+      } catch (err) {
+        console.warn('lookup failed', err);
+        return '';
+      }
+    }
+
+    document.querySelector('#hnInput').addEventListener('blur', async (event) => {
+      const hn = event.target.value.trim();
+      const name = await fetchNameByHN(hn);
+      const hintBox = document.querySelector('#patientNameHint');
+      if (name) {
+        hintBox.textContent = name;
+        const nameInput = document.querySelector('#patientNameInput');
+        if (!nameInput.value.trim()) {
+          nameInput.value = name;
+        }
+      } else {
+        hintBox.textContent = '';
+      }
+    });
+  </script>
+</body>
+</html>
