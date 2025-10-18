@@ -370,9 +370,16 @@ def dispatch_or_to_ward(new_task: sqlite3.Row | Dict[str, Any]) -> Dict[str, Any
 # ----------------------------------------------------------------------------
 # API Endpoints
 # ----------------------------------------------------------------------------
+def _health_payload():
+    return {"ok": True, "time": iso_now()}
+
 @app.get("/api/health")
 def api_health():
-    return jsonify({"ok": True, "time": iso_now()})
+    return jsonify(_health_payload())
+
+@app.get("/health")
+def health():
+    return jsonify(_health_payload())
 
 @app.get("/")
 def root():
@@ -381,6 +388,7 @@ def root():
         "service": "P-Porter",
         "time": iso_now(),
         "endpoints": [
+            "/health",
             "/api/health",
             "/api/porters",
             "POST /api/porters/add",
