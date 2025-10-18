@@ -433,6 +433,32 @@ WARD_LIST = [
 
 WARD_PLACEHOLDER = WARD_LIST[0]
 
+
+def _guess_building_from_ward(ward: str) -> str:
+    w = (ward or "").strip()
+    if not w:
+        return ""
+    if "ศัลยกรรม" in w and "ประสาท" not in w:
+        return "ตึกศัลยกรรม"
+    if "อายุรกรรม" in w or "ICU-MED" in w or "ICU รวม" in w:
+        return "ตึกอายุรกรรม"
+    if "กุมาร" in w or "หู ตา คอ จมูก" in w or "รวมน้ำใจ" in w:
+        return "ตึก ENT/กุมารเวช"
+    if "สูติ" in w or "นรีเวช" in w or "ห้องคลอด" in w or "ศัลยกรรมประสาทและสมอง" in w:
+        return "ตึกสูติ-นรีเวช"
+    return ""
+
+
+def _origin_from_entry(entry) -> dict:
+    ward = getattr(entry, "ward", "") or ""
+    b = _guess_building_from_ward(ward)
+    import re
+
+    m = re.search(r"ชั้น\s*(\d+)", ward)
+    floor_txt = f"ชั้น {m.group(1)}" if m else ""
+    return {"building": b, "floor": floor_txt, "ward": ward}
+
+
 SCRUB_NURSES = [
     "อรุณี", "ศิวดาติ์", "กัญญณัช", "ชัญญาภัค", "สุนทรี", "พิศมัย", "เทวัญ", "กันต์พงษ์",
     "ปนัฏฐา", "สุจิตรา", "ชัยยงค์", "สุภาวัลย์", "จันทจร", "วรรณิภา", "ณัฐพงษ์", "ตะวัน",
@@ -618,37 +644,41 @@ class SweetAlert:
 class StatusChipWidget(QtWidgets.QWidget):
     def __init__(self, text: str, color: str, pulse: bool = False, parent=None):
         super().__init__(parent)
-        self._text = text;
-        self._color = color;
+        self._text = text
+        self._color = color
         self._pulse = pulse
         if pulse:
-            self.eff = QtWidgets.QGraphicsOpacityEffect(self);
+            self.eff = QtWidgets.QGraphicsOpacityEffect(self)
             self.setGraphicsEffect(self.eff)
             self.anim = QtCore.QPropertyAnimation(self.eff, b"opacity", self)
-            self.anim.setDuration(1200);
-            self.anim.setStartValue(0.5);
+            self.anim.setDuration(1200)
+            self.anim.setStartValue(0.5)
             self.anim.setEndValue(1.0)
-            self.anim.setEasingCurve(QtCore.QEasingCurve.InOutQuad);
-            self.anim.setLoopCount(-1);
+            self.anim.setEasingCurve(QtCore.QEasingCurve.InOutQuad)
+            self.anim.setLoopCount(-1)
             self.anim.start()
 
-    def minimumSizeHint(self):
+    def minimumSizeHint(self) -> QtCore.QSize:
         fm = QtGui.QFontMetrics(self.font())
         w = fm.horizontalAdvance(self._text) + 22 + 16
         h = fm.height() + 10
         return QtCore.QSize(w, h)
 
-    def paintEvent(self, e):
-        p = QtGui.QPainter(self);
+    def paintEvent(self, e: QtGui.QPaintEvent) -> None:
+        p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
         rect = self.rect().adjusted(2, 2, -2, -2)
-        bg = QtGui.QColor(self._color);
+        bg = QtGui.QColor(self._color)
         bg.setAlpha(205)
-        p.setPen(QtCore.Qt.NoPen);
+        p.setPen(QtCore.Qt.NoPen)
         p.setBrush(bg)
         p.drawRoundedRect(rect, 10, 10)
         p.setPen(QtGui.QColor("#ffffff"))
-        p.drawText(rect.adjusted(12, 0, -8, 0), QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, self._text)
+        p.drawText(
+            rect.adjusted(12, 0, -8, 0),
+            QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft,
+            self._text,
+        )
 
 
 class PeriodBadge(QtWidgets.QWidget):
@@ -808,6 +838,13 @@ class ScheduleEntry(QtCore.QObject):
 
     def uid(self) -> str:
         return f"{self.or_room}|{self.hn}|{self.time}|{self.date}"
+
+
+def _queue_value(entry: ScheduleEntry) -> int:
+    try:
+        return int(entry.queue or 0)
+    except Exception:
+        return 0
 
 
 class SharedScheduleModel:
@@ -2735,6 +2772,21 @@ class Main(QtWidgets.QWidget):
         except requests.RequestException:
             return False
 
+    def _runner_auto_assign(self, pickup_id: str, origin: dict):
+        try:
+            resp = requests.post(
+                f"{RUNNER_BASE}{RUNNER_AUTO_ASSIGN_API}",
+                json={"pickup_id": pickup_id, "origin": origin},
+                timeout=3.0,
+                headers={"Accept": "application/json"},
+            )
+            if not resp.ok:
+                return None
+            js = resp.json()
+            return js.get("runner_id")
+        except Exception:
+            return None
+
     def _runner_arrive(self, pickup_id: str, user: str) -> bool:
         try:
             resp = requests.post(
@@ -3816,12 +3868,6 @@ class Main(QtWidgets.QWidget):
                         return (0, hh, mm)
                     except Exception:
                         return (1, 99, 99)
-
-                def _queue_value(entry: ScheduleEntry) -> int:
-                    try:
-                        return int(entry.queue or 0)
-                    except Exception:
-                        return 0
 
                 state_colors = {
                     'returning_to_ward': '#ede9fe',
