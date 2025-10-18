@@ -31,7 +31,40 @@ import os, sqlite3, json
 from datetime import datetime, date, time
 from typing import Dict, Any, Optional, Tuple, List
 
-from flask import Flask, jsonify, request, abort
+from flask import Flask, jsonify, request, abort, send_from_directory
+from functools import lru_cache
+from pathlib import Path
+
+PATIENT_DB_PATHS = os.getenv("PPORTER_PATIENT_DB", "schedule_elective.db;schedule_emergency.db")
+_PATIENT_DBS = [p.strip() for p in PATIENT_DB_PATHS.split(";") if p.strip()]
+
+
+@lru_cache(maxsize=2048)
+def lookup_patient_name(hn: str) -> str:
+    hn = (hn or "").strip()
+    if not hn:
+        return ""
+    for db in _PATIENT_DBS:
+        path = Path(db)
+        if not path.exists():
+            continue
+        conn = None
+        try:
+            conn = sqlite3.connect(str(path))
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM schedule WHERE hn=? ORDER BY id DESC LIMIT 1", (hn,))
+            row = cur.fetchone()
+        except Exception:
+            row = None
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        if row and row[0]:
+            return str(row[0])
+    return ""
 
 # ----------------------------------------------------------------------------
 # Config
@@ -443,9 +476,12 @@ def dispatch_ward_to_or(new_task: sqlite3.Row | Dict[str, Any]) -> Dict[str, Any
 # ----------------------------------------------------------------------------
 def opportunistic_assign_after_complete(porter_id: str, at_area: Optional[str]) -> Optional[Dict[str, Any]]:
     """
-    After finishing OR→WARD at 'at_area', if there exists a pending WARD→OR task from same ward,
-    assign it to this porter immediately IF fairness allows (cnt <= min_cnt + 1) and
-    shift policy allows (Afternoon: 'รอบนอก' only if both mains unavailable).
+    After finishing OR→WARD at 'at_area', opportunistically assign any WARD→OR from the same ward.
+    Preference order:
+      1. Pending NEW tasks.
+      2. Dispatched-but-unaccepted tasks (preempt to reduce travel) if fairness slack allows.
+    Slack: porter can take the job when their count <= min_count + 1 among available rostered peers.
+    Afternoon shift still prioritises main roles over รอบนอก.
     """
     if not at_area:
         return None
@@ -494,7 +530,14 @@ def opportunistic_assign_after_complete(porter_id: str, at_area: Optional[str]) 
     )
     t = cur.fetchone()
     if not t:
-        conn.close(); return None
+        cur.execute(
+            "SELECT * FROM tasks WHERE task_type='WARD_to_OR' AND status='Dispatched' AND source_area=? "
+            "ORDER BY created_at ASC LIMIT 1",
+            (at_area,)
+        )
+        t = cur.fetchone()
+        if not t:
+            conn.close(); return None
 
     cur.execute(
         "UPDATE tasks SET assigned_porter_id=?, status='Dispatched', updated_at=? WHERE task_id=?",
@@ -507,7 +550,7 @@ def opportunistic_assign_after_complete(porter_id: str, at_area: Optional[str]) 
     )
     conn.commit(); conn.close()
 
-    print(f"[Backhaul] Assigned pending WARD→OR task#{t['task_id']} at {at_area} to {porter_id}")
+    print(f"[Backhaul] Assigned/Preempted WARD→OR task#{t['task_id']} at {at_area} to {porter_id}")
     return {"task_id": t["task_id"], "assigned_porter_id": porter_id}
 
 # ----------------------------------------------------------------------------
@@ -674,6 +717,9 @@ def api_request_move():
         if task_type == "OR_to_WARD":
             target_ward = target_ward or (ward2 or "")
 
+    if not patient_name and hn:
+        patient_name = lookup_patient_name(hn) or ""
+
     target_ward = normalize_ward(target_ward)
     source_area = normalize_ward(source_area)
 
@@ -794,6 +840,16 @@ def api_tasks_list():
 @app.get("/api/config/proximity")
 def api_proximity():
     return jsonify(PROXIMITY_TO_OR)
+
+# UI static files
+@app.route("/ui")
+def ui_index():
+    return send_from_directory("ui", "index.html")
+
+
+@app.route("/ui/<path:path>")
+def ui_static(path: str):
+    return send_from_directory("ui", path)
 
 # ----------------------------------------------------------------------------
 # Main
