@@ -9,8 +9,10 @@ P-Porter: Patient-Porter Dispatch System (Flask + SQLite, LAN-only deployment)
   * Afternoon (16:30–00:30): roles = เปล 1, เปล 2, รอบนอก  (outer helps only if both mains unavailable)
   * Night     (00:30–08:30): roles = เปล 1 (one porter)
 - Fairness Dispatcher: tasks_assigned_count -> last_available_time -> proximity
+- NEW: Proximity-after-completion for WARD→OR — after a porter finishes OR→WARD and is at a ward,
+       if a WARD→OR call exists for that ward, assign to that porter immediately
+       (while keeping fairness with a small slack).
 - Optional schedule DB integration (lookup name/ward by HN) if available.
-- Designed for hospital LAN; keep behind firewall/VPN.
 
 Run server:
     python p_porter.py
@@ -42,7 +44,7 @@ SCHEDULE_DB_PATHS = [
     os.getenv("REGISTRY_SCHEDULE_EMERGENCY", "schedule_emergency.db"),
 ]
 
-# Proximity map (lower is nearer to OR Area)
+# Proximity map (lower is nearer to OR Area) — used mainly for OR<-ward proximity fallback
 PROXIMITY_TO_OR: Dict[str, int] = {
     "OR Area": 0,
     "หอผู้ป่วย ICU รวม": 1,
@@ -53,6 +55,12 @@ PROXIMITY_TO_OR: Dict[str, int] = {
     "หอผู้ป่วยพิเศษอายุรกรรม ชั้น 5": 4,
 }
 DEFAULT_PROXIMITY = 5
+
+# Proximity to source ward used for WARD->OR (simple heuristic)
+def proximity_to_source(last_area: Optional[str], source_area: Optional[str]) -> int:
+    if not last_area or not source_area:
+        return DEFAULT_PROXIMITY
+    return 0 if last_area == source_area else DEFAULT_PROXIMITY
 
 # ----------------------------------------------------------------------------
 # Shift definitions & flags
@@ -258,63 +266,60 @@ def normalize_ward(w: Optional[str]) -> Optional[str]:
     return WARD_ALIASES.get(w, w)
 
 # ----------------------------------------------------------------------------
-# Dispatcher
+# Candidate helpers
 # ----------------------------------------------------------------------------
-def dispatch_or_to_ward(new_task: sqlite3.Row | Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Smart dispatcher for OR→WARD respecting shift policies.
-    Steps:
-      - Filter: rostered & Available for current shift
-      - Weekday Morning: first job → เปล 3 (if available)
-      - Afternoon: prefer main roles (เปล 1, เปล 2); use 'รอบนอก' only if both mains unavailable
-      - Tie-breakers: tasks_assigned_count → last_available_time → proximity
-    """
-    conn = get_db()
-    cur = conn.cursor()
-    shift_name, shift_date = get_current_shift_info()
-
-    # roster of this shift
+def roster_for_shift(cur, shift_date: str, shift_name: str) -> Dict[str, str]:
     cur.execute(
         "SELECT role, porter_id FROM daily_roster WHERE date=? AND shift=?",
         (shift_date, shift_name),
     )
-    roster = {r["role"]: r["porter_id"] for r in cur.fetchall()}
+    return {r["role"]: r["porter_id"] for r in cur.fetchall()}
+
+def available_candidates(cur, ids: List[str]) -> List[Dict[str, Any]]:
+    ids = [i for i in ids if i]
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    q = f"""
+    SELECT p.porter_id, p.name, p.role, p.last_area, p.status, p.last_available_time,
+           COALESCE(s.tasks_assigned_count,0) AS cnt
+      FROM porters p
+      LEFT JOIN porter_stats s ON s.porter_id = p.porter_id
+     WHERE p.porter_id IN ({placeholders}) AND p.status='Available'
+    """
+    cur.execute(q, ids)
+    return [dict(row) for row in cur.fetchall()]
+
+# ----------------------------------------------------------------------------
+# Dispatchers
+# ----------------------------------------------------------------------------
+def dispatch_or_to_ward(new_task: sqlite3.Row | Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fairness-first dispatcher for OR→WARD.
+    Morning (weekday): first job → เปล 3
+    Afternoon: prefer เปล1/2; use รอบนอก only if both mains unavailable
+    """
+    conn = get_db(); cur = conn.cursor()
+    shift_name, shift_date = get_current_shift_info()
+    roster = roster_for_shift(cur, shift_date, shift_name)
     if not roster:
-        conn.close()
-        return {"ok": False, "reason": "Roster not set for this shift"}
+        conn.close(); return {"ok": False, "reason": "Roster not set for this shift"}
 
-    def query_available(ids: List[str]) -> List[Dict[str, Any]]:
-        ids = [i for i in ids if i]
-        if not ids:
-            return []
-        placeholders = ",".join("?" for _ in ids)
-        q = f"""
-        SELECT p.porter_id, p.name, p.role, p.last_area, p.status, p.last_available_time,
-               COALESCE(s.tasks_assigned_count,0) AS cnt
-          FROM porters p
-          LEFT JOIN porter_stats s ON s.porter_id = p.porter_id
-         WHERE p.porter_id IN ({placeholders}) AND p.status='Available'
-        """
-        cur.execute(q, ids)
-        return [dict(row) for row in cur.fetchall()]
-
-    # build candidates per shift rules
+    # candidate list per shift
     if shift_name == "Afternoon":
         main_ids = [pid for r, pid in roster.items() if r in ("เปล 1", "เปล 2")]
         outer_id = [roster.get("รอบนอก")] if roster.get("รอบนอก") else []
-        candidates = query_available(main_ids)
+        candidates = available_candidates(cur, main_ids)
         if not candidates:
-            candidates = query_available(outer_id)
+            candidates = available_candidates(cur, outer_id)
     else:
-        candidates = query_available(list(roster.values()))
-
+        candidates = available_candidates(cur, list(roster.values()))
     if not candidates:
-        conn.close()
-        return {"ok": False, "reason": "No Available porter"}
+        conn.close(); return {"ok": False, "reason": "No Available porter"}
 
     chosen: Optional[Dict[str, Any]] = None
 
-    # Weekday-Morning first job → เปล 3
+    # Weekday morning first job → เปล 3
     now = datetime.now()
     if shift_name == "Morning" and is_weekday(now.date()):
         cur.execute(
@@ -336,13 +341,12 @@ def dispatch_or_to_ward(new_task: sqlite3.Row | Dict[str, Any]) -> Dict[str, Any
                         )
                         break
 
-    # Fairness & tie-breakers
     if not chosen:
         def key_fn(c: Dict[str, Any]):
             try:
                 ts = datetime.fromisoformat(c.get("last_available_time") or "1970-01-01T00:00:00")
             except Exception:
-                ts = datetime(1970, 1, 1)
+                ts = datetime(1970,1,1)
             prox = proximity_score(c.get("last_area"))
             return (int(c.get("cnt", 0)), ts, prox, c.get("porter_id"))
         candidates.sort(key=key_fn)
@@ -358,28 +362,160 @@ def dispatch_or_to_ward(new_task: sqlite3.Row | Dict[str, Any]) -> Dict[str, Any
         "ON CONFLICT(porter_id) DO UPDATE SET tasks_assigned_count = tasks_assigned_count + 1",
         (porter_id,),
     )
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
 
-    print(f"[Dispatcher] Assign task#{new_task['task_id']} to {porter_id} ({chosen['name']})")
+    print(f"[Dispatcher] OR→WARD Assign task#{new_task['task_id']} to {porter_id} ({chosen['name']})")
     print(f"[Push→Porter] 📲 {chosen['name']} รับเคสใหม่: HN {new_task['hn']} → {new_task['target_ward']}")
     print(f"[Notify→Ward] 🏥 แจ้งวอร์ด {new_task['target_ward']} ว่ามีเปล {chosen['name']} ไปรับผู้ป่วยจาก OR")
-
     return {"ok": True, "assigned_porter_id": porter_id, "porter_name": chosen["name"]}
+
+def dispatch_ward_to_or(new_task: sqlite3.Row | Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fairness-first dispatcher for WARD→OR.
+    - Prefer porters already at the source ward (last_area == source_area) if within fairness slack.
+    - Afternoon: รอบนอกช่วยได้เฉพาะเมื่อเปลหลักทั้ง 2 ไม่ว่าง
+    """
+    conn = get_db(); cur = conn.cursor()
+    shift_name, shift_date = get_current_shift_info()
+    roster = roster_for_shift(cur, shift_date, shift_name)
+    if not roster:
+        conn.close(); return {"ok": False, "reason": "Roster not set for this shift"}
+
+    if shift_name == "Afternoon":
+        main_ids = [pid for r, pid in roster.items() if r in ("เปล 1", "เปล 2")]
+        outer_id = [roster.get("รอบนอก")] if roster.get("รอบนอก") else []
+        candidates = available_candidates(cur, main_ids)
+        if not candidates:
+            candidates = available_candidates(cur, outer_id)
+    else:
+        candidates = available_candidates(cur, list(roster.values()))
+    if not candidates:
+        conn.close(); return {"ok": False, "reason": "No Available porter"}
+
+    source = new_task["source_area"]
+    min_cnt = min(int(c.get("cnt", 0)) for c in candidates)
+    slack = 1
+
+    near = [c for c in candidates if proximity_to_source(c.get("last_area"), source) == 0]
+    if near:
+        near.sort(key=lambda c: (
+            int(c.get("cnt", 0)),
+            datetime.fromisoformat(c.get("last_available_time") or "1970-01-01T00:00:00")
+        ))
+        top = near[0]
+        if int(top.get("cnt", 0)) <= min_cnt + slack:
+            chosen = top
+        else:
+            chosen = None
+    else:
+        chosen = None
+
+    if not chosen:
+        def key_fn(c: Dict[str, Any]):
+            try:
+                ts = datetime.fromisoformat(c.get("last_available_time") or "1970-01-01T00:00:00")
+            except Exception:
+                ts = datetime(1970,1,1)
+            prox = proximity_to_source(c.get("last_area"), source)
+            return (int(c.get("cnt", 0)), ts, prox, c.get("porter_id"))
+        candidates.sort(key=key_fn)
+        chosen = candidates[0]
+
+    porter_id = chosen["porter_id"]
+    cur.execute(
+        "UPDATE tasks SET assigned_porter_id=?, status='Dispatched', updated_at=? WHERE task_id=?",
+        (porter_id, iso_now(), new_task["task_id"]),
+    )
+    cur.execute(
+        "INSERT INTO porter_stats(porter_id, tasks_assigned_count) VALUES(?, 1) "
+        "ON CONFLICT(porter_id) DO UPDATE SET tasks_assigned_count = tasks_assigned_count + 1",
+        (porter_id,),
+    )
+    conn.commit(); conn.close()
+
+    print(f"[Dispatcher] WARD→OR Assign task#{new_task['task_id']} to {porter_id} ({chosen['name']}) from {source}")
+    print(f"[Push→Porter] 📲 {chosen['name']} รับเคส WARD→OR: รับจาก {source} ส่ง OR")
+    print(f"[Notify→OR] 🏥 แจ้งห้องผ่าตัดว่า {chosen['name']} ไปรับผู้ป่วยจาก {source}")
+    return {"ok": True, "assigned_porter_id": porter_id, "porter_name": chosen["name"]}
+
+# ----------------------------------------------------------------------------
+# Opportunistic assignment after completion (backhaul)
+# ----------------------------------------------------------------------------
+def opportunistic_assign_after_complete(porter_id: str, at_area: Optional[str]) -> Optional[Dict[str, Any]]:
+    """
+    After finishing OR→WARD at 'at_area', if there exists a pending WARD→OR task from same ward,
+    assign it to this porter immediately IF fairness allows (cnt <= min_cnt + 1) and
+    shift policy allows (Afternoon: 'รอบนอก' only if both mains unavailable).
+    """
+    if not at_area:
+        return None
+
+    conn = get_db(); cur = conn.cursor()
+    shift_name, shift_date = get_current_shift_info()
+
+    roster = roster_for_shift(cur, shift_date, shift_name)
+    if not roster:
+        conn.close(); return None
+
+    cur.execute(
+        "SELECT p.role, p.status, COALESCE(s.tasks_assigned_count,0) AS cnt "
+        "FROM porters p LEFT JOIN porter_stats s ON s.porter_id=p.porter_id WHERE p.porter_id=?",
+        (porter_id,)
+    )
+    me = cur.fetchone()
+    if not me or me["status"] != "Available":
+        conn.close(); return None
+
+    if shift_name == "Afternoon" and (me["role"] == "รอบนอก"):
+        main_ids = [roster.get("เปล 1"), roster.get("เปล 2")]
+        placeholders = ",".join("?" for _ in main_ids if _)
+        if placeholders:
+            cur.execute(
+                f"SELECT status FROM porters WHERE porter_id IN ({placeholders})",
+                [pid for pid in main_ids if pid]
+            )
+            main_statuses = [r["status"] for r in cur.fetchall()]
+            if any(s == "Available" for s in main_statuses):
+                conn.close(); return None
+
+    roster_ids = list(roster.values())
+    candidates = available_candidates(cur, roster_ids)
+    if not candidates:
+        conn.close(); return None
+    min_cnt = min(int(c.get("cnt", 0)) for c in candidates)
+    my_cnt = int(me["cnt"] or 0)
+    if my_cnt > min_cnt + 1:
+        conn.close(); return None
+
+    cur.execute(
+        "SELECT * FROM tasks WHERE task_type='WARD_to_OR' AND status='New' AND source_area=? "
+        "ORDER BY created_at ASC LIMIT 1",
+        (at_area,)
+    )
+    t = cur.fetchone()
+    if not t:
+        conn.close(); return None
+
+    cur.execute(
+        "UPDATE tasks SET assigned_porter_id=?, status='Dispatched', updated_at=? WHERE task_id=?",
+        (porter_id, iso_now(), t["task_id"]),
+    )
+    cur.execute(
+        "INSERT INTO porter_stats(porter_id, tasks_assigned_count) VALUES(?, 1) "
+        "ON CONFLICT(porter_id) DO UPDATE SET tasks_assigned_count = tasks_assigned_count + 1",
+        (porter_id,),
+    )
+    conn.commit(); conn.close()
+
+    print(f"[Backhaul] Assigned pending WARD→OR task#{t['task_id']} at {at_area} to {porter_id}")
+    return {"task_id": t["task_id"], "assigned_porter_id": porter_id}
 
 # ----------------------------------------------------------------------------
 # API Endpoints
 # ----------------------------------------------------------------------------
-def _health_payload():
-    return {"ok": True, "time": iso_now()}
-
 @app.get("/api/health")
 def api_health():
-    return jsonify(_health_payload())
-
-@app.get("/health")
-def health():
-    return jsonify(_health_payload())
+    return jsonify({"ok": True, "time": iso_now()})
 
 @app.get("/")
 def root():
@@ -388,7 +524,6 @@ def root():
         "service": "P-Porter",
         "time": iso_now(),
         "endpoints": [
-            "/health",
             "/api/health",
             "/api/porters",
             "POST /api/porters/add",
@@ -476,10 +611,8 @@ def api_roster_set():
         abort(400, f"missing role(s): {', '.join(missing)}")
 
     shift_name, shift_date = get_current_shift_info()
-    conn = get_db()
-    cur = conn.cursor()
+    conn = get_db(); cur = conn.cursor()
 
-    # Clear all role labels (simple approach)
     cur.execute("UPDATE porters SET role=NULL")
 
     for role, pid in mapping.items():
@@ -500,15 +633,13 @@ def api_roster_set():
         "ON CONFLICT(date,shift) DO UPDATE SET first_job_assigned=0",
         (shift_date, shift_name),
     )
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
 
     print(f"[Roster] {shift_date} {shift_name} → {json.dumps(mapping, ensure_ascii=False)}")
     return jsonify({"ok": True, "date": shift_date, "shift": shift_name, "roster": mapping})
 
 @app.get("/api/roster/today")
 def api_roster_today():
-    # Optional: ?shift=Morning|Afternoon|Night ; default = current shift
     arg_shift = (request.args.get("shift") or "").strip()
     if arg_shift:
         shift_name = arg_shift
@@ -516,8 +647,7 @@ def api_roster_today():
     else:
         shift_name, shift_date = get_current_shift_info()
 
-    conn = get_db()
-    cur = conn.cursor()
+    conn = get_db(); cur = conn.cursor()
     cur.execute(
         "SELECT role, porter_id FROM daily_roster WHERE date=? AND shift=? ORDER BY role",
         (shift_date, shift_name),
@@ -536,33 +666,49 @@ def api_request_move():
     target_ward = str(payload.get("target_ward") or "").strip()
     patient_name = str(payload.get("patient_name") or "").strip()
 
-    # Autofill from schedule DBs when possible
-    if (not patient_name or not target_ward) and hn:
+    source_area = str(payload.get("source_area") or payload.get("source_ward") or "").strip()
+
+    if (not patient_name or (task_type == "OR_to_WARD" and not target_ward)) and hn:
         name2, ward2 = lookup_patient_from_schedule(hn)
         patient_name = patient_name or (name2 or "")
-        target_ward = target_ward or (ward2 or "")
+        if task_type == "OR_to_WARD":
+            target_ward = target_ward or (ward2 or "")
 
     target_ward = normalize_ward(target_ward)
+    source_area = normalize_ward(source_area)
 
     if not hn:
         abort(400, "hn required")
-    if task_type == "OR_to_WARD" and not target_ward:
-        abort(400, "target_ward required for OR_to_WARD")
 
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO tasks(hn,patient_name,target_ward,source_area,task_type,status,assigned_porter_id,created_at,updated_at) "
-        "VALUES(?,?,?,?, ?, 'New', NULL, ?, ?)",
-        (hn, patient_name, target_ward or None, 'OR Area', task_type, iso_now(), iso_now()),
-    )
+    conn = get_db(); cur = conn.cursor()
+
+    if task_type == "OR_to_WARD":
+        if not target_ward:
+            abort(400, "target_ward required for OR_to_WARD")
+        cur.execute(
+            "INSERT INTO tasks(hn,patient_name,target_ward,source_area,task_type,status,assigned_porter_id,created_at,updated_at) "
+            "VALUES(?,?,?,?, 'OR_to_WARD', 'New', NULL, ?, ?)",
+            (hn, patient_name, target_ward or None, 'OR Area', iso_now(), iso_now()),
+        )
+    else:
+        if not source_area:
+            abort(400, "source_area (ward) required for WARD_to_OR")
+        cur.execute(
+            "INSERT INTO tasks(hn,patient_name,target_ward,source_area,task_type,status,assigned_porter_id,created_at,updated_at) "
+            "VALUES(?,?,NULL,?, 'WARD_to_OR', 'New', NULL, ?, ?)",
+            (hn, patient_name, source_area, iso_now(), iso_now()),
+        )
+
     task_id = cur.lastrowid
     cur.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,))
     new_task = cur.fetchone()
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
 
-    result = dispatch_or_to_ward(new_task)
+    if task_type == "OR_to_WARD":
+        result = dispatch_or_to_ward(new_task)
+    else:
+        result = dispatch_ward_to_or(new_task)
+
     return jsonify({"task_id": task_id, **result})
 
 @app.post("/api/task/<int:task_id>/accept")
@@ -591,26 +737,28 @@ def api_task_accept(task_id: int):
     print(f"[Porter Action] {porter_id} accepted task#{task_id}")
     return jsonify({"ok": True})
 
+
 @app.post("/api/task/<int:task_id>/complete")
 def api_task_complete(task_id: int):
     payload = request.get_json(force=True) or {}
     porter_id = str(payload.get("porter_id") or "").strip()
 
-    conn = get_db()
-    cur = conn.cursor()
+    conn = get_db(); cur = conn.cursor()
     cur.execute("SELECT assigned_porter_id, target_ward, task_type FROM tasks WHERE task_id=?", (task_id,))
     row = cur.fetchone()
     if not row:
-        conn.close()
-        abort(404, "task not found")
+        conn.close(); abort(404, "task not found")
     assigned = row["assigned_porter_id"]
     target_ward = row["target_ward"]
     task_type = row["task_type"]
-    if porter_id and assigned and porter_id != assigned:
-        conn.close()
-        abort(403, "not assignee")
 
-    # Complete task, free porter, update last_area + last_available_time
+    if not assigned and porter_id:
+        assigned = porter_id
+        cur.execute("UPDATE tasks SET assigned_porter_id=? WHERE task_id=?", (assigned, task_id))
+
+    if porter_id and assigned and porter_id != assigned:
+        conn.close(); abort(403, "not assignee")
+
     cur.execute("UPDATE tasks SET status='Completed', updated_at=? WHERE task_id=?", (iso_now(), task_id))
     if assigned:
         last_area = "OR Area" if task_type == "WARD_to_OR" else (target_ward or "OR Area")
@@ -618,11 +766,17 @@ def api_task_complete(task_id: int):
             "UPDATE porters SET status='Available', last_area=?, last_available_time=? WHERE porter_id=?",
             (last_area, iso_now(), assigned),
         )
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
 
     print(f"[Porter Action] {assigned or porter_id or '-'} completed task#{task_id} at {target_ward}")
+
+    if task_type == "OR_to_WARD" and assigned and target_ward:
+        backhaul = opportunistic_assign_after_complete(assigned, target_ward)
+        if backhaul:
+            return jsonify({"ok": True, "last_area": target_ward, "backhaul_assigned": backhaul})
+
     return jsonify({"ok": True, "last_area": target_ward})
+
 
 @app.get("/api/tasks")
 def api_tasks_list():
@@ -649,8 +803,7 @@ if __name__ == "__main__":
     seed_porters_if_empty()
     print("P-Porter — Flask started (LAN mode).")
     print("Porters seeded:")
-    conn = get_db()
-    cur = conn.cursor()
+    conn = get_db(); cur = conn.cursor()
     cur.execute("SELECT porter_id, name FROM porters ORDER BY porter_id")
     for row in cur.fetchall():
         print("  ", row["porter_id"], row["name"])
