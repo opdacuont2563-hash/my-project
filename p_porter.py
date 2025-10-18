@@ -32,40 +32,8 @@ from datetime import datetime, date, time
 from typing import Dict, Any, Optional, Tuple, List
 
 from flask import Flask, jsonify, request, abort, send_from_directory
-from flask_cors import CORS
 from functools import lru_cache
 from pathlib import Path
-
-PATIENT_DB_PATHS = os.getenv("PPORTER_PATIENT_DB", "schedule_elective.db;schedule_emergency.db")
-_PATIENT_DBS = [p.strip() for p in PATIENT_DB_PATHS.split(";") if p.strip()]
-
-
-@lru_cache(maxsize=2048)
-def lookup_patient_name(hn: str) -> str:
-    hn = (hn or "").strip()
-    if not hn:
-        return ""
-    for db in _PATIENT_DBS:
-        path = Path(db)
-        if not path.exists():
-            continue
-        conn = None
-        try:
-            conn = sqlite3.connect(str(path))
-            cur = conn.cursor()
-            cur.execute("SELECT name FROM schedule WHERE hn=? ORDER BY id DESC LIMIT 1", (hn,))
-            row = cur.fetchone()
-        except Exception:
-            row = None
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-        if row and row[0]:
-            return str(row[0])
-    return ""
 
 # ----------------------------------------------------------------------------
 # Config
@@ -125,7 +93,51 @@ ROLES_WEEKEND = {
 # App / DB helpers
 # ----------------------------------------------------------------------------
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# --- CORS (ถ้าเปิดหน้าเว็บแบบ file://) -------------------------------------
+try:
+    from flask_cors import CORS  # type: ignore
+    CORS(app, resources={r"/api/*": {"origins": "*"}})
+except Exception:
+    pass
+
+# --- Patient Registry lookup -----------------------------------------------
+PATIENT_DB_PATHS = os.getenv("PPORTER_PATIENT_DB", "")
+_PATIENT_DBS = [p.strip() for p in PATIENT_DB_PATHS.split(";") if p.strip()]
+
+
+@lru_cache(maxsize=2048)
+def lookup_patient_name(hn: str) -> str:
+    hn = (hn or "").strip()
+    if not hn:
+        return ""
+    for db in _PATIENT_DBS:
+        path = Path(db)
+        if not path.exists():
+            continue
+        conn = None
+        try:
+            conn = sqlite3.connect(str(path))
+            cur = conn.cursor()
+            for sql in (
+                "SELECT name FROM schedule WHERE hn=? ORDER BY id DESC LIMIT 1",
+                "SELECT patient_name FROM schedule WHERE hn=? ORDER BY id DESC LIMIT 1",
+                "SELECT name FROM patients WHERE hn=? ORDER BY rowid DESC LIMIT 1",
+            ):
+                try:
+                    cur.execute(sql, (hn,))
+                    row = cur.fetchone()
+                except sqlite3.Error:
+                    continue
+                if row and row[0]:
+                    return str(row[0])
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    return ""
 
 def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
