@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """
 P-Porter — Patient-Porter Dispatch System (LAN-only mock)
@@ -48,10 +47,21 @@ ROLE_PRIORITY = {"เปล 3": 0, "เปล 1": 1, "เปล 2": 2}  # เป
 # --------------------------- DB helpers ---------------------------
 
 def conn() -> sqlite3.Connection:
-    if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
-        g.db.row_factory = sqlite3.Row
-    return g.db
+    # Use Flask 'g' if in app context; otherwise keep a module-level fallback connection.
+    from flask import has_app_context
+    if has_app_context():
+        if "db" not in g:
+            g.db = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+            g.db.row_factory = sqlite3.Row
+        return g.db
+    # Fallback for CLI/demo segments executed outside requests
+    global _global_db_conn
+    try:
+        _global_db_conn
+    except NameError:
+        _global_db_conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
+        _global_db_conn.row_factory = sqlite3.Row
+    return _global_db_conn
 
 @APP.teardown_appcontext
 def teardown(_exc):
@@ -435,8 +445,10 @@ def demo_flow():
     - Seed -> Set roster -> Request 3 moves -> Accept/Complete first -> Request another -> Show fairness rotation
     """
     print("\n===== P-Porter DEMO START =====\n")
-    init_db(reset=True)
-    seed_porters()
+    # Ensure app context for DB setup in CLI demo
+    with APP.app_context():
+        init_db(reset=True)
+        seed_porters()
 
     with APP.test_client() as cli:
         # Set weekday-morning roster: pick any 3 porters from our list.
@@ -486,8 +498,10 @@ def demo_flow():
 # --------------------------- Entrypoint ---------------------------
 
 def run_server():
-    init_db()
-    seed_porters()  # safe if already inserted
+    # Push app context before DB set-up when running as a server script
+    with APP.app_context():
+        init_db()
+        seed_porters()  # safe if already inserted
     print("P-Porter is running at http://127.0.0.1:5007")
     APP.run(host="127.0.0.1", port=5007, debug=False)
 
