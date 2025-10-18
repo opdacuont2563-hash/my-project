@@ -398,6 +398,35 @@ def roster_today():
     """,(today,)).fetchall()
     return jsonify([dict(r) for r in rows])
 
+# --------------------------- Health & Root ---------------------------
+@APP.route("/", methods=["GET"])
+def root():
+    return (
+        "<h1>P-Porter API</h1>"
+        "<ul>"
+        "<li>GET /health</li>"
+        "<li>GET /api/porters</li>"
+        "<li>POST /api/porters/add</li>"
+        "<li>POST /api/roster/set</li>"
+        "<li>GET /api/roster/today</li>"
+        "<li>POST /api/request_move</li>"
+        "<li>POST /api/task/&lt;id&gt;/accept</li>"
+        "<li>POST /api/task/&lt;id&gt;/complete</li>"
+        "<li>GET /api/tasks</li>"
+        "</ul>",
+        200,
+        {"Content-Type": "text/html; charset=utf-8"},
+    )
+
+
+@APP.route("/health", methods=["GET"])
+def health():
+    return {
+        "status": "ok",
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
 # --------------------------- Console Mockups / Demo ---------------------------
 
 TODAY_OPERATIONS = [
@@ -426,7 +455,16 @@ def caller_app_mock():
         FROM patient_move_task ORDER BY task_id
     """).fetchall()
     for r in rows:
-        p = conn().execute("SELECT name, last_area FROM porter_profile WHERE porter_id=?",(r["assigned_porter_id"],)).fetchone() if r["assigned_porter_id"] else None
+        p = (
+            conn()
+            .execute(
+                "SELECT name, last_area FROM porter_profile WHERE porter_id=?",
+                (r["assigned_porter_id"],),
+            )
+            .fetchone()
+            if r["assigned_porter_id"]
+            else None
+        )
         porter_info = f"{p['name']} (last_area: {p['last_area']})" if p else "-"
         print(f"   • task#{r['task_id']} HN {r['hn']} → {r['target_ward']} | status={r['status']} | assigned={porter_info}")
 
