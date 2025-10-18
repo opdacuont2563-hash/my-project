@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """
 P-Porter — Patient-Porter Dispatch System (LAN-only mock)
@@ -18,9 +17,9 @@ Author: NBHPY
 """
 
 from __future__ import annotations
-import os, sqlite3, json, argparse, threading, time
-from datetime import datetime, date, timedelta
-from typing import Dict, List, Optional, Tuple
+import os, sqlite3, argparse
+from datetime import datetime, date, time as dt_time
+from typing import Any, Dict, List, Optional, Tuple
 from flask import Flask, request, jsonify, g
 
 # --------------------------- Config ---------------------------
@@ -45,13 +44,49 @@ PROXIMITY_TO_OR: Dict[str, int] = {
 ROLE_PRIORITY = {"เปล 3": 0, "เปล 1": 1, "เปล 2": 2}  # เปล 3 เป็นคิว 1 (tie-breaker)
 
 
+# ---- Shift definitions & flags ----
+FORCE_WEEKDAY = os.getenv("PPORTER_FORCE_WEEKDAY", "0") == "1"
+FORCE_MORNING = os.getenv("PPORTER_FORCE_MORNING", "0") == "1"
+FORCE_SHIFT = os.getenv("PPORTER_FORCE_SHIFT")
+
+SHIFT_DEFS = [
+    {"name": "Morning", "start": dt_time(8, 30), "end": dt_time(16, 30)},
+    {"name": "Afternoon", "start": dt_time(16, 30), "end": dt_time(0, 30)},
+    {"name": "Night", "start": dt_time(0, 30), "end": dt_time(8, 30)},
+]
+
+ROLES_WEEKDAY: Dict[str, List[str]] = {
+    "Morning": ["เปล 1", "เปล 2", "เปล 3"],
+    "Afternoon": ["เปล 1", "เปล 2", "รอบนอก"],
+    "Night": ["เปล 1"],
+}
+
+ROLES_WEEKEND: Dict[str, List[str]] = {
+    "Morning": ["เปล 1"],
+    "Afternoon": ["เปล 1", "เปล 2", "รอบนอก"],
+    "Night": ["เปล 1"],
+}
+
+
+
 # --------------------------- DB helpers ---------------------------
 
 def conn() -> sqlite3.Connection:
-    if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
-        g.db.row_factory = sqlite3.Row
-    return g.db
+    # Use Flask 'g' if in app context; otherwise keep a module-level fallback connection.
+    from flask import has_app_context
+    if has_app_context():
+        if "db" not in g:
+            g.db = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+            g.db.row_factory = sqlite3.Row
+        return g.db
+    # Fallback for CLI/demo segments executed outside requests
+    global _global_db_conn
+    try:
+        _global_db_conn
+    except NameError:
+        _global_db_conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
+        _global_db_conn.row_factory = sqlite3.Row
+    return _global_db_conn
 
 @APP.teardown_appcontext
 def teardown(_exc):
@@ -62,7 +97,7 @@ def teardown(_exc):
 def init_db(reset: bool = False):
     c = conn()
     if reset:
-        for t in ("porter_profile","patient_move_task","daily_roster","porter_stats"):
+        for t in ("porter_profile","patient_move_task","daily_roster","porter_stats","shift_state"):
             c.execute(f"DROP TABLE IF EXISTS {t}")
         c.commit()
 
@@ -106,19 +141,61 @@ def init_db(reset: bool = False):
         tasks_assigned_count INTEGER DEFAULT 0
     )
     """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS shift_state(
+        date TEXT NOT NULL,
+        shift TEXT NOT NULL,
+        first_job_assigned INTEGER DEFAULT 0,
+        PRIMARY KEY(date, shift)
+    )
+    """)
     c.commit()
 
 def _fmt_now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def _iso_date_today() -> str:
-    return date.today().strftime("%Y-%m-%d")
+def today_str(now: Optional[datetime] = None) -> str:
+    now = now or datetime.now()
+    return now.strftime("%Y-%m-%d")
 
-def _weekday_morning(dt: Optional[datetime]=None) -> bool:
-    dt = dt or datetime.now()
-    is_weekday = dt.weekday() < 5  # Mon-Fri
-    is_morning = 6 <= dt.hour < 14  # tweakable
-    return is_weekday and is_morning
+def _iso_date_today() -> str:
+    return today_str()
+
+
+def is_weekday(d: Optional[date] = None) -> bool:
+    if FORCE_WEEKDAY:
+        return True
+    d = d or date.today()
+    return d.weekday() < 5
+
+
+def _time_in_range(point: dt_time, start: dt_time, end: dt_time) -> bool:
+    if end > start:
+        return start <= point < end
+    return point >= start or point < end
+
+
+def get_current_shift_info(now: Optional[datetime] = None) -> Tuple[str, str]:
+    now = now or datetime.now()
+    if FORCE_SHIFT in {"Morning", "Afternoon", "Night"}:
+        return FORCE_SHIFT, today_str(now)
+    point = now.time()
+    for info in SHIFT_DEFS:
+        if _time_in_range(point, info["start"], info["end"]):
+            return info["name"], today_str(now)
+    return "Morning", today_str(now)
+
+
+def expected_roles(is_weekday_flag: bool, shift_name: str) -> List[str]:
+    policy = ROLES_WEEKDAY if is_weekday_flag else ROLES_WEEKEND
+    return policy.get(shift_name, ["เปล 1"])
+
+
+def in_morning_shift(now: Optional[datetime] = None) -> bool:
+    if FORCE_MORNING:
+        return True
+    shift_name, _ = get_current_shift_info(now)
+    return shift_name == "Morning"
 
 def _ensure_porter_stats(pid: str):
     c = conn()
@@ -163,63 +240,135 @@ def seed_porters(names: List[str] = DEFAULT_PORTER_NAMES):
 
 # --------------------------- Dispatcher ---------------------------
 
+# ---- Ward aliases / normalization ----
+WARD_ALIASES = {
+    "หอผ้ป่วย ICU รวม": "หอผู้ป่วย ICU รวม",
+    "ICU รวม": "หอผู้ป่วย ICU รวม",
+}
+
+
+def normalize_ward(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return name
+    return WARD_ALIASES.get(name, name)
+
+
+
 def _proximity_score(area: Optional[str]) -> int:
     if not area:
         return PROXIMITY_TO_OR["Default"]
     return PROXIMITY_TO_OR.get(area, PROXIMITY_TO_OR["Default"])
 
 def dispatch_or_to_ward(task_row: sqlite3.Row) -> Optional[str]:
-    """
-    Smart dispatcher for OR -> WARD tasks.
-    Returns assigned porter_id or None.
-    """
-    c = conn()
-    today = _iso_date_today()
-    # 1) Filter — Available and rostered today (Morning)
-    rows = c.execute("""
-        SELECT p.porter_id, p.name, p.role, p.last_area, p.status, p.last_available_time,
-               COALESCE(s.tasks_assigned_count,0) AS cnt
-        FROM porter_profile p
-        JOIN daily_roster r ON r.porter_id = p.porter_id
-        LEFT JOIN porter_stats s ON s.porter_id = p.porter_id
-        WHERE p.status='Available' AND r.date=? AND r.shift='Morning'
-    """,(today,)).fetchall()
+    """Dispatcher for OR→WARD moves with shift-aware policies."""
 
-    if not rows:
-        print("🚫 Dispatcher: ไม่มีเปลว่างในกะนี้ (หรือยังไม่ได้ตั้งเวร)")
+    c = conn()
+    shift_name, shift_date = get_current_shift_info()
+    roster_rows = c.execute(
+        "SELECT role, porter_id FROM daily_roster WHERE date=? AND shift=?",
+        (shift_date, shift_name),
+    ).fetchall()
+    if not roster_rows:
+        print("🚫 Dispatcher: ยังไม่ตั้งเวรสำหรับกะนี้")
         return None
 
-    # 2) Sort — fairness (cnt), time (older first), proximity (lower), role priority (เปล3 first)
-    def parse_time(t: Optional[str]) -> float:
-        if not t: 
+    roster = {row["role"]: row["porter_id"] for row in roster_rows}
+
+    def fetch_available(porter_ids: List[Optional[str]]) -> List[Dict[str, Any]]:
+        valid_ids = [pid for pid in porter_ids if pid]
+        if not valid_ids:
+            return []
+        placeholders = ",".join("?" for _ in valid_ids)
+        query = f"""
+            SELECT p.porter_id, p.name, p.role, p.last_area, p.status, p.last_available_time,
+                   COALESCE(s.tasks_assigned_count,0) AS cnt
+              FROM porter_profile p
+              LEFT JOIN porter_stats s ON s.porter_id = p.porter_id
+             WHERE p.porter_id IN ({placeholders}) AND p.status='Available'
+        """
+        return [dict(row) for row in c.execute(query, valid_ids).fetchall()]
+
+    if shift_name == "Afternoon":
+        primary_ids = [roster.get("เปล 1"), roster.get("เปล 2")]
+        candidates = fetch_available(primary_ids)
+        if not candidates:
+            candidates = fetch_available([roster.get("รอบนอก")])
+    else:
+        candidates = fetch_available(list(roster.values()))
+
+    if not candidates:
+        print("🚫 Dispatcher: ไม่มีเปลว่างในกะนี้")
+        return None
+
+    chosen: Optional[Dict[str, Any]] = None
+    try:
+        weekday_flag = is_weekday(date.fromisoformat(shift_date))
+    except ValueError:
+        weekday_flag = is_weekday()
+    if shift_name == "Morning" and weekday_flag:
+        row = c.execute(
+            "SELECT first_job_assigned FROM shift_state WHERE date=? AND shift=?",
+            (shift_date, shift_name),
+        ).fetchone()
+        first_done = bool(row["first_job_assigned"]) if row else False
+        if not first_done:
+            preferred_pid = roster.get("เปล 3")
+            if preferred_pid:
+                for candidate in candidates:
+                    if candidate["porter_id"] == preferred_pid:
+                        chosen = candidate
+                        break
+
+    def parse_time(value: Optional[str]) -> float:
+        if not value:
             return 0.0
-        try:
-            return datetime.fromisoformat(t).timestamp()
-        except Exception:
+        for fmt in ("%Y-%m-%d %H:%M:%S", None):
             try:
-                return datetime.strptime(t, "%Y-%m-%d %H:%M:%S").timestamp()
+                if fmt:
+                    return datetime.strptime(value, fmt).timestamp()
+                return datetime.fromisoformat(value).timestamp()
             except Exception:
-                return 0.0
+                continue
+        return 0.0
 
-    def sort_key(r: sqlite3.Row) -> Tuple[int,float,int,int]:
-        cnt = int(r["cnt"] or 0)
-        last_avail_ts = parse_time(r["last_available_time"])
-        prox = _proximity_score(r["last_area"])
-        role_bias = ROLE_PRIORITY.get(r["role"] or "", 9)
-        return (cnt, last_avail_ts, prox, role_bias)
+    if not chosen:
+        def sort_key(item: Dict[str, Any]) -> Tuple[int, float, int, int, str]:
+            cnt = int(item.get("cnt", 0) or 0)
+            last_available = parse_time(item.get("last_available_time"))
+            proximity = _proximity_score(item.get("last_area"))
+            role_bias = ROLE_PRIORITY.get(item.get("role") or "", 9)
+            return (cnt, last_available, proximity, role_bias, item.get("porter_id", ""))
 
-    ranked = sorted(rows, key=sort_key)
-    chosen = ranked[0]
+        candidates.sort(key=sort_key)
+        chosen = candidates[0]
+
     pid = chosen["porter_id"]
-
-    # 3) Assign & Update
-    c.execute("UPDATE patient_move_task SET status='Assigned', assigned_porter_id=? WHERE task_id=?", (pid, task_row["task_id"]))
-    c.execute("UPDATE porter_stats SET tasks_assigned_count=COALESCE(tasks_assigned_count,0)+1 WHERE porter_id=?", (pid,))
+    c.execute(
+        "UPDATE patient_move_task SET status='Assigned', assigned_porter_id=? WHERE task_id=?",
+        (pid, task_row["task_id"]),
+    )
+    _ensure_porter_stats(pid)
+    c.execute(
+        "UPDATE porter_stats SET tasks_assigned_count=COALESCE(tasks_assigned_count,0)+1 WHERE porter_id=?",
+        (pid,),
+    )
+    if shift_name == "Morning" and weekday_flag:
+        c.execute(
+            """
+            INSERT INTO shift_state(date,shift,first_job_assigned)
+            VALUES(?,?,1)
+            ON CONFLICT(date,shift) DO UPDATE SET first_job_assigned=1
+            """,
+            (shift_date, shift_name),
+        )
     c.commit()
 
-    # 4) Notifications (mock)
-    print(f"🔔 [WARD Notification] มอบหมายให้ '{chosen['name']}' ({chosen['role']}) ไปรับผู้ป่วย HN {task_row['hn']} ที่ OR -> {task_row['target_ward']}")
-    print(f"📣 [Porter App] งานใหม่สำหรับ {chosen['name']} ({pid}) — ไปรับ HN {task_row['hn']} ส่งไป {task_row['target_ward']} (tap เพื่อ Accept)")
+    print(
+        f"🔔 [WARD Notification] มอบหมายให้ '{chosen['name']}' ({chosen['role']}) ไปรับผู้ป่วย HN {task_row['hn']} ที่ OR -> {task_row['target_ward']}"
+    )
+    print(
+        f"📣 [Porter App] งานใหม่สำหรับ {chosen['name']} ({pid}) — ไปรับ HN {task_row['hn']} ส่งไป {task_row['target_ward']} (tap เพื่อ Accept)"
+    )
     return pid
 
 # --------------------------- API ---------------------------
@@ -250,57 +399,92 @@ def add_porter():
 
 @APP.route("/api/roster/set", methods=["POST"])
 def set_roster():
-    """
-    Payload examples:
-    {
-      "shift": "Morning",
-      "roles": {"เปล 1":"P01","เปล 2":"P02","เปล 3":"P03"}   # you can also send porter names instead of ids
-    }
-    Weekday-Morning rule: must have 3 roles; เปล 3 gets first pick on ties (role_bias).
-    """
-    data = request.get_json(force=True, silent=True) or {}
-    shift = (data.get("shift") or "Morning").strip()
-    roles: Dict[str,str] = data.get("roles") or {}
-    today = _iso_date_today()
-    if shift != "Morning":
-        return jsonify({"error":"Only Morning shift is supported in this mock"}), 400
-    if _weekday_morning():
-        # enforce 3 porters
-        for key in ("เปล 1","เปล 2","เปล 3"):
-            if key not in roles:
-                return jsonify({"error":f"Weekday Morning ต้องระบุ {key}"}), 400
+    """Set roster assignments for the active shift.
 
-    # Normalize: map names -> porter_ids if needed
+    Accepted payloads:
+      • Legacy: {"เปล 1":"P01","เปล 2":"P02","เปล 3":"P03"}
+      • Explicit: {"shift":"Afternoon","roles":{"เปล 1":"P01","รอบนอก":"P08"}}
+    Porter values may be IDs (Pxx) or names.
+    """
+
+    payload = request.get_json(force=True, silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "payload must be an object"}), 400
+
+    if "roles" in payload or "shift" in payload:
+        shift_name = (payload.get("shift") or "").strip()
+        mapping_input = payload.get("roles") or {}
+    else:
+        shift_name = ""
+        mapping_input = payload
+
+    if not isinstance(mapping_input, dict):
+        return jsonify({"error": "roles must be a mapping"}), 400
+
+    current_shift, current_date = get_current_shift_info()
+    shift_name = shift_name or current_shift
+    shift_date = current_date
+
+    try:
+        shift_date_obj = date.fromisoformat(shift_date)
+    except ValueError:
+        shift_date_obj = date.today()
+
+    required = expected_roles(is_weekday(shift_date_obj), shift_name)
+    missing = [role for role in required if role not in mapping_input]
+    if missing:
+        return jsonify({"error": f"missing role(s): {', '.join(missing)}"}), 400
+
     c = conn()
-    normalized: Dict[str,str] = {}
-    for role, val in roles.items():
-        val = (val or "").strip()
+    normalized: Dict[str, str] = {}
+    for role, raw_val in mapping_input.items():
+        raw_val = (raw_val or "").strip()
+        if not raw_val:
+            return jsonify({"error": f"missing porter for role '{role}'"}), 400
         pid = None
-        if val.upper().startswith("P") and val[1:].isdigit():
-            pid = val.upper()
+        if raw_val.upper().startswith("P") and raw_val[1:].isdigit():
+            pid = raw_val.upper()
         else:
-            row = c.execute("SELECT porter_id FROM porter_profile WHERE name=?", (val,)).fetchone()
-            if row: pid = row["porter_id"]
+            row = c.execute("SELECT porter_id FROM porter_profile WHERE name=?", (raw_val,)).fetchone()
+            if row:
+                pid = row["porter_id"]
         if not pid:
-            return jsonify({"error":f"ไม่พบพนักงานสำหรับ '{val}'"}), 400
+            return jsonify({"error": f"ไม่พบพนักงานสำหรับ '{raw_val}'"}), 400
         normalized[role] = pid
 
-    # Upsert roster and update porter_profile.role
-    for role, pid in normalized.items():
-        c.execute("""
-            INSERT INTO daily_roster(date,shift,role,porter_id)
-            VALUES(?,?,?,?)
-            ON CONFLICT(date,shift,role) DO UPDATE SET porter_id=excluded.porter_id
-        """,(today, shift, role, pid))
-    # clear roles first
+    c.execute("DELETE FROM daily_roster WHERE date=? AND shift=?", (shift_date, shift_name))
     c.execute("UPDATE porter_profile SET role=NULL")
+
     for role, pid in normalized.items():
-        c.execute("UPDATE porter_profile SET role=? WHERE porter_id=?", (role, pid))
+        c.execute(
+            "INSERT INTO daily_roster(date,shift,role,porter_id) VALUES(?,?,?,?)",
+            (shift_date, shift_name, role, pid),
+        )
+        _ensure_porter_stats(pid)
+        c.execute(
+            "UPDATE porter_stats SET tasks_assigned_count=0 WHERE porter_id=?",
+            (pid,),
+        )
+        c.execute(
+            "UPDATE porter_profile SET role=?, status='Available', last_available_time=? WHERE porter_id=?",
+            (role, _fmt_now(), pid),
+        )
+
+    c.execute(
+        """
+        INSERT INTO shift_state(date,shift,first_job_assigned)
+        VALUES(?,?,0)
+        ON CONFLICT(date,shift) DO UPDATE SET first_job_assigned=0
+        """,
+        (shift_date, shift_name),
+    )
     c.commit()
 
-    # Console mockup
-    print("🗂️ [Roster App] ตั้งเวรเช้า: ", ", ".join([f"{r}→{normalized[r]}" for r in ("เปล 1","เปล 2","เปล 3") if r in normalized]))
-    return jsonify({"message":"ok","date":today,"shift":shift,"roles":normalized})
+    pretty_roles = ", ".join(
+        f"{role}→{normalized[role]}" for role in required if role in normalized
+    ) or ", ".join(f"{r}→{p}" for r, p in normalized.items())
+    print(f"🗂️ [Roster App] {shift_date} {shift_name}: {pretty_roles}")
+    return jsonify({"ok": True, "date": shift_date, "shift": shift_name, "roles": normalized})
 
 @APP.route("/api/request_move", methods=["POST"])
 def request_move():
@@ -312,7 +496,7 @@ def request_move():
     task_type = (data.get("task_type") or "OR_to_WARD").strip()
     hn = (data.get("hn") or "").strip()
     name = (data.get("patient_name") or "").strip()
-    target = (data.get("target_ward") or "").strip()
+    target = normalize_ward((data.get("target_ward") or "").strip())
     if not (hn and target):
         return jsonify({"error":"hn and target_ward are required"}), 400
 
@@ -379,14 +563,48 @@ def list_tasks():
 
 @APP.route("/api/roster/today", methods=["GET"])
 def roster_today():
-    today = _iso_date_today()
-    rows = conn().execute("""
-        SELECT r.*, p.name FROM daily_roster r
-        LEFT JOIN porter_profile p ON p.porter_id=r.porter_id
-        WHERE r.date=? AND r.shift='Morning'
-        ORDER BY CASE role WHEN 'เปล 1' THEN 1 WHEN 'เปล 2' THEN 2 WHEN 'เปล 3' THEN 3 ELSE 9 END
-    """,(today,)).fetchall()
-    return jsonify([dict(r) for r in rows])
+    arg_shift = (request.args.get("shift") or "").strip()
+    if arg_shift:
+        shift_name = arg_shift
+        shift_date = today_str()
+    else:
+        shift_name, shift_date = get_current_shift_info()
+
+    rows = conn().execute(
+        "SELECT role, porter_id FROM daily_roster WHERE date=? AND shift=? ORDER BY role",
+        (shift_date, shift_name),
+    ).fetchall()
+    roster_map = {row["role"]: row["porter_id"] for row in rows}
+    return jsonify({"date": shift_date, "shift": shift_name, "roster": roster_map})
+
+# --------------------------- Health & Root ---------------------------
+@APP.route("/", methods=["GET"])
+def root():
+    return (
+        "<h1>P-Porter API</h1>"
+        "<ul>"
+        "<li>GET /health</li>"
+        "<li>GET /api/porters</li>"
+        "<li>POST /api/porters/add</li>"
+        "<li>POST /api/roster/set</li>"
+        "<li>GET /api/roster/today</li>"
+        "<li>POST /api/request_move</li>"
+        "<li>POST /api/task/&lt;id&gt;/accept</li>"
+        "<li>POST /api/task/&lt;id&gt;/complete</li>"
+        "<li>GET /api/tasks</li>"
+        "</ul>",
+        200,
+        {"Content-Type": "text/html; charset=utf-8"},
+    )
+
+
+@APP.route("/health", methods=["GET"])
+def health():
+    return {
+        "status": "ok",
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
 
 # --------------------------- Console Mockups / Demo ---------------------------
 
@@ -416,7 +634,16 @@ def caller_app_mock():
         FROM patient_move_task ORDER BY task_id
     """).fetchall()
     for r in rows:
-        p = conn().execute("SELECT name, last_area FROM porter_profile WHERE porter_id=?",(r["assigned_porter_id"],)).fetchone() if r["assigned_porter_id"] else None
+        p = (
+            conn()
+            .execute(
+                "SELECT name, last_area FROM porter_profile WHERE porter_id=?",
+                (r["assigned_porter_id"],),
+            )
+            .fetchone()
+            if r["assigned_porter_id"]
+            else None
+        )
         porter_info = f"{p['name']} (last_area: {p['last_area']})" if p else "-"
         print(f"   • task#{r['task_id']} HN {r['hn']} → {r['target_ward']} | status={r['status']} | assigned={porter_info}")
 
@@ -435,8 +662,10 @@ def demo_flow():
     - Seed -> Set roster -> Request 3 moves -> Accept/Complete first -> Request another -> Show fairness rotation
     """
     print("\n===== P-Porter DEMO START =====\n")
-    init_db(reset=True)
-    seed_porters()
+    # Ensure app context for DB setup in CLI demo
+    with APP.app_context():
+        init_db(reset=True)
+        seed_porters()
 
     with APP.test_client() as cli:
         # Set weekday-morning roster: pick any 3 porters from our list.
@@ -486,8 +715,10 @@ def demo_flow():
 # --------------------------- Entrypoint ---------------------------
 
 def run_server():
-    init_db()
-    seed_porters()  # safe if already inserted
+    # Push app context before DB set-up when running as a server script
+    with APP.app_context():
+        init_db()
+        seed_porters()  # safe if already inserted
     print("P-Porter is running at http://127.0.0.1:5007")
     APP.run(host="127.0.0.1", port=5007, debug=False)
 
