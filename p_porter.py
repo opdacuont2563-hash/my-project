@@ -28,6 +28,7 @@ Environment vars (optional, for testing/demo):
 
 from __future__ import annotations
 import os, sqlite3, json
+import requests
 from datetime import datetime, date, time
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -101,21 +102,30 @@ try:
 except Exception:
     pass
 
-# --- Patient Registry lookup -----------------------------------------------
+# --- Patient name resolver ---------------------------------------------------
 PATIENT_DB_PATHS = os.getenv("PPORTER_PATIENT_DB", "")
 _PATIENT_DBS = [p.strip() for p in PATIENT_DB_PATHS.split(";") if p.strip()]
+SUGI_BASE = os.getenv("SUGIBOT_BASE", "").rstrip("/")
 
 
-@lru_cache(maxsize=2048)
+def _norm_name(raw: Optional[str]) -> str:
+    if not raw:
+        return ""
+    cleaned = (raw.replace("\u200b", "") if isinstance(raw, str) else str(raw))
+    return " ".join(cleaned.split())
+
+
+@lru_cache(maxsize=4096)
 def lookup_patient_name(hn: str) -> str:
     hn = (hn or "").strip()
     if not hn:
         return ""
+
     for db in _PATIENT_DBS:
         path = Path(db)
         if not path.exists():
             continue
-        conn = None
+        conn: Optional[sqlite3.Connection] = None
         try:
             conn = sqlite3.connect(str(path))
             cur = conn.cursor()
@@ -130,13 +140,29 @@ def lookup_patient_name(hn: str) -> str:
                 except sqlite3.Error:
                     continue
                 if row and row[0]:
-                    return str(row[0])
+                    return _norm_name(row[0])
+        except Exception:
+            pass
         finally:
             if conn is not None:
                 try:
                     conn.close()
                 except Exception:
                     pass
+
+    if SUGI_BASE:
+        for path in (f"/api/lookup/hn/{hn}", f"/api/patient/{hn}"):
+            try:
+                resp = requests.get(f"{SUGI_BASE}{path}", timeout=2)
+                if not resp.ok:
+                    continue
+                payload = resp.json()
+                candidate = payload.get("name") or payload.get("patient_name") or ""
+                if candidate:
+                    return _norm_name(candidate)
+            except Exception:
+                continue
+
     return ""
 
 def get_db() -> sqlite3.Connection:
@@ -295,7 +321,7 @@ def lookup_patient_from_schedule(hn: str) -> Tuple[Optional[str], Optional[str]]
                 row = cur.fetchone()
             c.close()
             if row:
-                return (row["name"], row["ward"])
+                return (_norm_name(row["name"]), normalize_ward(row["ward"]))
         except Exception:
             pass
     return (None, None)
@@ -725,20 +751,23 @@ def api_request_move():
     task_type = str(payload.get("task_type") or "").strip() or "OR_to_WARD"
     if task_type not in ("OR_to_WARD", "WARD_to_OR"):
         abort(400, "invalid task_type")
-    hn = str(payload.get("hn") or "").strip()
-    target_ward = str(payload.get("target_ward") or "").strip()
-    patient_name = str(payload.get("patient_name") or "").strip()
+    hn = (payload.get("hn") or "").strip()
+    target_ward = (payload.get("target_ward") or "").strip()
+    patient_name = _norm_name(payload.get("patient_name"))
 
     if not patient_name and hn:
-        patient_name = lookup_patient_name(hn) or ""
+        patient_name = lookup_patient_name(hn)
 
     source_area = str(payload.get("source_area") or payload.get("source_ward") or "").strip()
 
     if (not patient_name or (task_type == "OR_to_WARD" and not target_ward)) and hn:
         name2, ward2 = lookup_patient_from_schedule(hn)
-        patient_name = patient_name or (name2 or "")
+        if not patient_name and name2:
+            patient_name = name2
         if task_type == "OR_to_WARD":
             target_ward = target_ward or (ward2 or "")
+
+    patient_name = _norm_name(patient_name)
 
     target_ward = normalize_ward(target_ward)
     source_area = normalize_ward(source_area)
@@ -854,8 +883,38 @@ def api_tasks_list():
         "ORDER BY t.task_id DESC"
     )
     rows = [dict(r) for r in cur.fetchall()]
+
+    updated = False
+    for task in rows:
+        if not task.get("patient_name") and task.get("hn"):
+            name = lookup_patient_name(task["hn"])
+            if name:
+                task["patient_name"] = name
+                cur.execute("UPDATE tasks SET patient_name=? WHERE task_id=?", (name, task["task_id"]))
+                updated = True
+
+    if updated:
+        conn.commit()
+
     conn.close()
     return jsonify(rows)
+
+
+@app.post("/api/tasks/sync_names")
+def api_tasks_sync_names():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT task_id, hn, patient_name FROM tasks")
+    updated = 0
+    for task_id, hn, name in cur.fetchall():
+        if hn and not name:
+            resolved = lookup_patient_name(hn)
+            if resolved:
+                cur.execute("UPDATE tasks SET patient_name=? WHERE task_id=?", (resolved, task_id))
+                updated += 1
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "updated": updated})
 
 @app.get("/api/config/proximity")
 def api_proximity():
