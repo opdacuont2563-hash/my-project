@@ -2994,16 +2994,58 @@ class Main(QtWidgets.QWidget):
         return shift_key_now()
 
     def _load_roster_for_now(self) -> list[str]:
-        self.dispatch_engine.update_status(self._runner_status_cache)
-        return self.dispatch_engine.roster_for_now()
+        """อ่านรายชื่อเวรเปลจาก QSettings ของกะปัจจุบัน หากไม่มีให้ใช้ DEFAULT_RUNNERS"""
+        settings = self.sched.s
+        key = f"runner/roster/{self._shift_key_now()}"
+        raw = settings.value(key)
+
+        if isinstance(raw, (list, tuple)):
+            source = list(raw)
+        elif isinstance(raw, str):
+            # รองรับการเก็บเป็น string คั่นด้วยเครื่องหมายจุลภาค
+            source = raw.split(",")
+        else:
+            source = []
+
+        names = [str(item).strip() for item in source if str(item).strip()]
+        if not names:
+            names = DEFAULT_RUNNERS[:]
+        return names
 
     def _busy_names_from_runner_board(self) -> set[str]:
-        self.dispatch_engine.update_status(self._runner_status_cache)
-        return self.dispatch_engine.busy_names()
+        busy: set[str] = set()
+        cache = getattr(self, "_runner_status_cache", {}) or {}
+        for row in cache.values():
+            name = str(row.get("assignee") or "").strip()
+            status = str(row.get("status") or "").strip().lower()
+            if name and status in RUNNER_BOARD_BUSY_STATES:
+                busy.add(name)
+        return busy
 
     def _next_by_round_robin(self, roster: list[str]) -> Optional[str]:
-        self.dispatch_engine.update_status(self._runner_status_cache)
-        return self.dispatch_engine.next_runner()
+        roster = [r for r in roster if r]
+        if not roster:
+            return None
+
+        settings = self.sched.s
+        key = f"runner/rr_pointer/{self._shift_key_now()}"
+        try:
+            ptr = int(settings.value(key, 0))
+        except Exception:
+            ptr = 0
+
+        busy = self._busy_names_from_runner_board()
+        n = len(roster)
+        for i in range(n):
+            idx = (ptr + i) % n
+            cand = roster[idx]
+            if cand not in busy:
+                settings.setValue(key, idx + 1)
+                return cand
+
+        # ทุกคนกำลังยุ่งอยู่ → เลื่อนไปตัวถัดไป แต่ไม่เลือกใคร
+        settings.setValue(key, (ptr + 1) % n)
+        return None
 
     def _pick_next_waiting_case(self) -> Optional["ScheduleEntry"]:
         """เลือกเคสที่ยังไม่ถูกส่งขึ้น Runner board โดยเรียงตามเวลา OR"""
@@ -3045,7 +3087,7 @@ class Main(QtWidgets.QWidget):
 
         roster = self._load_roster_for_now()
         runner_name = self._next_by_round_robin(roster)
-        if not runner_name:
+        if runner_name is None:
             return
 
         ok, _ = self._push_rows_to_runner([next_case], runner_ready=True)
