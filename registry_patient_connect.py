@@ -2759,8 +2759,9 @@ class Main(QtWidgets.QWidget):
             if cand not in busy:
                 s.setValue(key, idx + 1)
                 return cand
-        s.setValue(key, (ptr + 1) % n)
-        return roster[ptr % n]
+
+        # ถ้าไม่มีใครว่างเลย → ข้าม auto-dispatch
+        return None
 
     def _pick_next_waiting_case(self) -> Optional["ScheduleEntry"]:
         """เลือกเคสที่ยังไม่ถูกส่งขึ้น Runner board โดยเรียงตามเวลา OR"""
@@ -2802,14 +2803,16 @@ class Main(QtWidgets.QWidget):
 
         roster = self._load_roster_for_now()
         runner_name = self._next_by_round_robin(roster)
+        if not runner_name:
+            return
+
         ok, _ = self._push_rows_to_runner([next_case], runner_ready=True)
         if not ok:
             return
 
         try:
             pid = self._pickup_id_for_entry(next_case)
-            if runner_name:
-                self._runner_ack(pid, runner_name)
+            self._runner_ack(pid, runner_name)
         except Exception:
             pass
 
