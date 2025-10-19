@@ -408,6 +408,290 @@ DEFAULT_RUNNERS = [
     "อนุพงษ์",
 ]
 
+# เก็บข้อมูล roster ลงไฟล์ JSON (แก้ path ผ่าน env ได้)
+RUNNER_ROSTER_FILE = Path(os.getenv("RUNNER_ROSTER_FILE", "runner_roster.json")).expanduser()
+
+RUNNER_BOARD_BUSY_STATES = {"waiting", "picking"}
+RUNNER_BOARD_PUSHED_STATES = {"waiting", "picking", "arrived"}
+
+SHIFT_ROLE_ORDERS = {
+    "morning": ["P3", "P1", "P2", "OUTER"],
+    "evening": ["P1", "P2", "OUTER"],
+    "night": ["P1", "OUTER"],
+    "holiday_morning": ["P1", "OUTER"],
+    "holiday_evening": ["P1", "P2", "OUTER"],
+    "holiday_night": ["P1", "OUTER"],
+}
+
+
+def shift_key_now(dt: Optional[datetime] = None) -> str:
+    """คืนค่า shift key ตามวัน/เวลา (holiday_* สำหรับเสาร์-อาทิตย์)."""
+    dt = dt or datetime.now()
+    wd = dt.weekday()
+    is_holiday = wd >= 5
+    hhmm = int(dt.strftime("%H%M"))
+    if 830 <= hhmm < 1630:
+        base = "morning"
+    elif 1630 <= hhmm < 2400:
+        base = "evening"
+    else:
+        base = "night"
+    return f"holiday_{base}" if is_holiday else base
+
+
+def base_role_order(shift_key: Optional[str] = None) -> List[str]:
+    key = shift_key or shift_key_now()
+    if key in SHIFT_ROLE_ORDERS:
+        return SHIFT_ROLE_ORDERS[key][:]
+    if key.startswith("holiday_"):
+        fall_back = key.replace("holiday_", "", 1)
+        if fall_back in SHIFT_ROLE_ORDERS:
+            return SHIFT_ROLE_ORDERS[fall_back][:]
+    return ["P1", "P2", "P3", "OUTER"]
+
+
+class RosterStore:
+    """จัดการทะเบียนเวรเปล (master + roster รายกะ) บนไฟล์ JSON."""
+
+    def __init__(self, path: Optional[Path] = None):
+        self.path = Path(path or RUNNER_ROSTER_FILE)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        self._data: Dict[str, object] = {"master": DEFAULT_RUNNERS[:], "shifts": {}}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            with self.path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception:
+            return
+        if isinstance(payload, dict):
+            master = payload.get("master")
+            if isinstance(master, list):
+                self._data["master"] = self._normalize_names(master)
+            shifts = payload.get("shifts")
+            if isinstance(shifts, dict):
+                cleaned: Dict[str, Dict[str, str]] = {}
+                for key, value in shifts.items():
+                    if not isinstance(value, dict):
+                        continue
+                    roster: Dict[str, str] = {}
+                    for role, name in value.items():
+                        role_key = str(role).strip().upper()
+                        if role_key:
+                            roster[role_key] = str(name or "").strip()
+                    cleaned[str(key)] = roster
+                self._data["shifts"] = cleaned
+
+    def _save(self) -> None:
+        try:
+            with self.path.open("w", encoding="utf-8") as fh:
+                json.dump(self._data, fh, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _normalize_names(items: List[object]) -> List[str]:
+        seen: Set[str] = set()
+        result: List[str] = []
+        for raw in items or []:
+            name = str(raw or "").strip()
+            if name and name not in seen:
+                seen.add(name)
+                result.append(name)
+        if not result:
+            result = DEFAULT_RUNNERS[:]
+        return result
+
+    def master(self) -> List[str]:
+        return list(self._data.get("master", DEFAULT_RUNNERS[:]))
+
+    def set_master(self, names: List[object]) -> None:
+        self._data["master"] = self._normalize_names(names)
+        self._save()
+
+    def roles_for_shift(self, shift_key: Optional[str] = None) -> Dict[str, str]:
+        key = shift_key or shift_key_now()
+        shifts = self._data.get("shifts") or {}
+        if not isinstance(shifts, dict):
+            shifts = {}
+        raw = shifts.get(key) or {}
+        roles: Dict[str, str] = {}
+        for role in ("P1", "P2", "P3", "OUTER"):
+            name = str(raw.get(role, "")).strip()
+            roles[role] = name
+        return roles
+
+    def set_shift(self, shift_key: str, **roles: object) -> None:
+        key = str(shift_key)
+        clean: Dict[str, str] = {}
+        for role, name in roles.items():
+            role_key = str(role or "").strip().upper()
+            if not role_key:
+                continue
+            value = str(name or "").strip()
+            if value:
+                clean[role_key] = value
+        shifts = self._data.setdefault("shifts", {})
+        if not isinstance(shifts, dict):
+            shifts = {}
+            self._data["shifts"] = shifts
+        shifts[key] = clean
+        self._save()
+
+    def roster_for_shift(self, shift_key: Optional[str] = None) -> List[str]:
+        key = shift_key or shift_key_now()
+        order = base_role_order(key)
+        roles = self.roles_for_shift(key)
+        names: List[str] = []
+        for role in order:
+            name = roles.get(role, "").strip()
+            if name:
+                names.append(name)
+        master = self.master()
+        for name in master:
+            if name not in names:
+                names.append(name)
+        return names
+
+
+class DispatchEngine:
+    """กลไกเลือกเวรเปลตาม roster + ความแฟร์ (Round-Robin)."""
+
+    def __init__(self, roster: Optional[RosterStore] = None, settings: Optional[QSettings] = None):
+        self.roster = roster or RosterStore()
+        self.settings = settings or QSettings(ORG_NAME, APP_SHARED)
+        self._status_map: Dict[str, dict] = {}
+
+    # ----- status cache -----
+    def update_status(self, status_map: Optional[Dict[str, dict]]) -> None:
+        self._status_map = dict(status_map or {})
+
+    def status_map(self) -> Dict[str, dict]:
+        return dict(self._status_map)
+
+    # ----- shift helpers -----
+    def shift_key_now(self) -> str:
+        return shift_key_now()
+
+    def roster_for_now(self) -> List[str]:
+        return self.roster.roster_for_shift(self.shift_key_now())
+
+    def roles_for_now(self) -> Dict[str, str]:
+        return self.roster.roles_for_shift(self.shift_key_now())
+
+    # ----- fairness helpers -----
+    def _pointer_key(self, shift_key: str) -> str:
+        return f"runner/rr_pointer/{shift_key}"
+
+    def _get_pointer(self, shift_key: str) -> int:
+        try:
+            raw = self.settings.value(self._pointer_key(shift_key), 0)
+            if isinstance(raw, int):
+                return raw
+            return int(raw or 0)
+        except Exception:
+            return 0
+
+    def _set_pointer(self, shift_key: str, value: int) -> None:
+        try:
+            self.settings.setValue(self._pointer_key(shift_key), int(value))
+        except Exception:
+            pass
+
+    def busy_names(self) -> Set[str]:
+        busy: Set[str] = set()
+        for row in self._status_map.values():
+            name = str(row.get("assignee") or "").strip()
+            status = str(row.get("status") or "").strip().lower()
+            if name and status in RUNNER_BOARD_BUSY_STATES:
+                busy.add(name)
+        return busy
+
+    def next_runner(self) -> Optional[str]:
+        shift = self.shift_key_now()
+        roster = [name for name in self.roster_for_now() if name]
+        if not roster:
+            return None
+        busy = self.busy_names()
+        ptr = self._get_pointer(shift)
+        n = len(roster)
+        for i in range(n):
+            idx = (ptr + i) % n
+            cand = roster[idx]
+            if cand not in busy:
+                self._set_pointer(shift, (idx + 1) % n)
+                return cand
+        # ทุกคนยุ่งอยู่ → ขยับ pointer หนึ่งสเต็ปแต่ไม่เลือกใคร
+        self._set_pointer(shift, (ptr + 1) % n)
+        return None
+
+    def preview_queue(self, limit: int = 3) -> List[str]:
+        roster = [name for name in self.roster_for_now() if name]
+        if not roster:
+            return []
+        n = len(roster)
+        ptr = self._get_pointer(self.shift_key_now()) % n
+        busy = self.busy_names()
+        result: List[str] = []
+        idx = ptr
+        checked = 0
+        while checked < n and len(result) < limit:
+            cand = roster[idx]
+            if cand not in busy and cand not in result:
+                result.append(cand)
+            idx = (idx + 1) % n
+            checked += 1
+        idx = ptr
+        checked = 0
+        while checked < n and len(result) < limit:
+            cand = roster[idx]
+            if cand not in result:
+                result.append(cand)
+            idx = (idx + 1) % n
+            checked += 1
+        return result
+
+
+def nurse_roster_banner(engine: DispatchEngine) -> Dict[str, object]:
+    shift = engine.shift_key_now()
+    meta = {
+        "shift_key": shift,
+        "roles": engine.roles_for_now(),
+        "base_order": base_role_order(shift),
+        "next3": engine.preview_queue(limit=3),
+        "busy": sorted(engine.busy_names()),
+    }
+    return meta
+
+
+def runner_inboxes(engine: DispatchEngine) -> Dict[str, List[Dict[str, str]]]:
+    boxes: Dict[str, List[Dict[str, str]]] = {}
+    status_map = engine.status_map()
+    for pickup_id, row in status_map.items():
+        status = str(row.get("status") or "").strip().lower()
+        if status not in RUNNER_BOARD_PUSHED_STATES:
+            continue
+        assignee = str(row.get("assignee") or "").strip() or "(Unassigned)"
+        payload = row.get("payload") or {}
+        record = {
+            "pickup_id": pickup_id,
+            "status": status,
+            "hn": str(payload.get("hn") or payload.get("HN") or ""),
+            "name": str(payload.get("name") or payload.get("patient_name") or ""),
+            "ward": str(payload.get("ward") or ""),
+            "or": str(payload.get("or") or payload.get("or_room") or payload.get("OR") or ""),
+        }
+        boxes.setdefault(assignee, []).append(record)
+    for items in boxes.values():
+        items.sort(key=lambda item: item.get("pickup_id", ""))
+    return boxes
+
 STATUS_COLORS = {
     "รอผ่าตัด": "#fde047", "กำลังผ่าตัด": "#ef4444", "กำลังพักฟื้น": "#22c55e",
     "กำลังส่งกลับตึก": "#a855f7", "เลื่อนการผ่าตัด": "#64748b",
@@ -1877,6 +2161,8 @@ class Main(QtWidgets.QWidget):
         super().__init__()
         self.cli = ClientHTTP(host, port, token)
         self.sched = SharedScheduleModel()
+        self.runner_roster = RosterStore()
+        self.dispatch_engine = DispatchEngine(self.runner_roster, self.sched.s)
         self.db_logger = LocalDBLogger()
         self.ws = None;
         self.rows_cache = []
@@ -2705,69 +2991,25 @@ class Main(QtWidgets.QWidget):
         return ok, failed
 
     def _shift_key_now(self) -> str:
-        """คืนค่า shift key: morning|evening|night|holiday_morning|holiday_evening|holiday_night"""
-        now = datetime.now()
-        wd = now.weekday()  # 0=Mon,6=Sun
-        is_holiday = wd >= 5  # เสาร์/อาทิตย์ถือเป็นวันหยุด (ปรับได้ถ้ามีปฏิทินจริง)
-        hhmm = int(now.strftime("%H%M"))
-        if 830 <= hhmm < 1630:
-            base = "morning"
-        elif 1630 <= hhmm < 2400:
-            base = "evening"
-        else:
-            base = "night"
-        return f"holiday_{base}" if is_holiday else base
+        return shift_key_now()
 
     def _load_roster_for_now(self) -> list[str]:
-        """อ่านรายชื่อเวรเปลตามกะจาก QSettings; ถ้าไม่มีให้ใช้ DEFAULT_RUNNERS"""
-        s = self.sched.s  # QSettings shared
-        key = f"runner/roster/{self._shift_key_now()}"
-        lst = s.value(key)
-        names = [str(x).strip() for x in (lst or []) if str(x).strip()]
-        if not names:
-            names = DEFAULT_RUNNERS[:]
-        return names
+        self.dispatch_engine.update_status(self._runner_status_cache)
+        return self.dispatch_engine.roster_for_now()
 
     def _busy_names_from_runner_board(self) -> set[str]:
-        """ชื่อที่กำลังมีงาน waiting/picking อยู่บนกระดาน Runner ตอนนี้"""
-        busy: Set[str] = set()
-        cache = getattr(self, "_runner_status_cache", {}) or {}
-        for row in cache.values():
-            name = str(row.get("assignee") or "").strip()
-            status = str(row.get("status") or "").strip().lower()
-            if name and status in {"waiting", "picking"}:
-                busy.add(name)
-        return busy
+        self.dispatch_engine.update_status(self._runner_status_cache)
+        return self.dispatch_engine.busy_names()
 
     def _next_by_round_robin(self, roster: list[str]) -> Optional[str]:
-        """เลือกชื่อรอบคิว RR ข้ามคนที่ busy; pointer เก็บใน QSettings ตาม shift key"""
-        roster = [r for r in roster if r]
-        if not roster:
-            return None
-        s = self.sched.s
-        key = f"runner/rr_pointer/{self._shift_key_now()}"
-        try:
-            ptr = int(s.value(key, 0))
-        except Exception:
-            ptr = 0
-
-        busy = self._busy_names_from_runner_board()
-        n = len(roster)
-        for i in range(n):
-            idx = (ptr + i) % n
-            cand = roster[idx]
-            if cand not in busy:
-                s.setValue(key, idx + 1)
-                return cand
-
-        # ถ้าไม่มีใครว่างเลย → ข้าม auto-dispatch
-        return None
+        self.dispatch_engine.update_status(self._runner_status_cache)
+        return self.dispatch_engine.next_runner()
 
     def _pick_next_waiting_case(self) -> Optional["ScheduleEntry"]:
         """เลือกเคสที่ยังไม่ถูกส่งขึ้น Runner board โดยเรียงตามเวลา OR"""
         today = datetime.now().date()
         candidate_states = {"scheduled", "in_or", "operation_started", "operation_ended"}
-        pushed_states = {"waiting", "picking", "arrived"}
+        pushed_states = RUNNER_BOARD_PUSHED_STATES
 
         cache = getattr(self, "_runner_status_cache", {}) or {}
         lst: List["ScheduleEntry"] = []
@@ -3888,6 +4130,7 @@ class Main(QtWidgets.QWidget):
                     runner_status_map = _fetch_runner_status_map(str(base_date))
                     self._auto_finish_runner_cases(entries_for_day, runner_status_map)
             self._runner_status_cache = runner_status_map
+            self.dispatch_engine.update_status(self._runner_status_cache)
 
             indexed_entries: List[Tuple[int, ScheduleEntry]] = list(enumerate(entries_snapshot))
             if not indexed_entries:
@@ -4589,17 +4832,44 @@ class SearchSelectAdder(QtWidgets.QWidget):
 
 
 def main():
+    ap = argparse.ArgumentParser();
+    ap.add_argument("--host", default="127.0.0.1");
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT);
+    ap.add_argument("--token", default=DEFAULT_TOKEN);
+    ap.add_argument("--set-master", nargs="+", help="ตั้งทะเบียนเวรเปล (master list) แล้วออกจากโปรแกรม");
+    ap.add_argument(
+        "--set-shift",
+        nargs="+",
+        help="ตั้ง roster ของกะปัจจุบัน (รูปแบบ ROLE=NAME เช่น P1=นาที)",
+    )
+    args = ap.parse_args()
+
+    if args.set_master or args.set_shift:
+        store = RosterStore()
+        if args.set_master:
+            store.set_master(list(args.set_master))
+            print("✅ อัปเดตทะเบียนเวรเปล (master) เรียบร้อย", flush=True)
+        if args.set_shift:
+            role_map: Dict[str, str] = {}
+            for token in args.set_shift:
+                if "=" not in token:
+                    continue
+                role, name = token.split("=", 1)
+                role_map[role.strip()] = name.strip()
+            if not role_map:
+                print("⚠️ ไม่พบรูปแบบ ROLE=NAME สำหรับ --set-shift", file=sys.stderr)
+                sys.exit(1)
+            key = shift_key_now()
+            store.set_shift(key, **role_map)
+            print(f"✅ อัปเดต roster ของ {key} เรียบร้อย", flush=True)
+        return
+
     QLocale.setDefault(QLocale("en_US"))
     app = QtWidgets.QApplication(sys.argv);
     app.setApplicationName("RegistryPatientConnect");
     app.setOrganizationName(ORG_NAME);
     app.setWindowIcon(_load_app_icon())
-    ap = argparse.ArgumentParser();
-    ap.add_argument("--host", default="127.0.0.1");
-    ap.add_argument("--port", type=int, default=DEFAULT_PORT);
-    ap.add_argument("--token", default=DEFAULT_TOKEN)
-    a = ap.parse_args()
-    w = Main(a.host, a.port, a.token);
+    w = Main(args.host, args.port, args.token);
     w.show();
     sys.exit(app.exec())
 
