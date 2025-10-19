@@ -393,6 +393,21 @@ API_LIST = "/api/list";
 API_LIST_FULL = "/api/list_full";
 API_WS = "/api/ws"
 
+# ใหม่: ตั้งค่าเวลา Grace ตอน RETURNING
+RETURNING_GRACE_SEC = int(os.getenv("RETURNING_GRACE_SEC", "180"))
+
+# รายชื่อเริ่มต้น (แก้ได้ภายหลัง)
+DEFAULT_RUNNERS = [
+    "นาที",
+    "อนุพันธ์",
+    "กฤษณพงษ์",
+    "จีระวัฒน์",
+    "นัฐพงษ์",
+    "ศราวุธ",
+    "รัตนพล",
+    "อนุพงษ์",
+]
+
 STATUS_COLORS = {
     "รอผ่าตัด": "#fde047", "กำลังผ่าตัด": "#ef4444", "กำลังพักฟื้น": "#22c55e",
     "กำลังส่งกลับตึก": "#a855f7", "เลื่อนการผ่าตัด": "#64748b",
@@ -2371,12 +2386,13 @@ class Main(QtWidgets.QWidget):
                 t0 = _parse_iso(entry.returning_started_at)
                 if not t0 or not entry.time_end:
                     continue
-                if (now - t0) >= timedelta(minutes=3):
+                if (now - t0) >= timedelta(seconds=RETURNING_GRACE_SEC):
                     if self._is_entry_completed(entry):
                         entry.postop_completed = True
                         entry.state = "returned_to_ward"
                         entry.returned_to_ward_at = now.strftime("%Y-%m-%dT%H:%M:%S")
                         self._db_insert_case(entry)
+                        QtCore.QTimer.singleShot(10, lambda e=entry: self._auto_dispatch_after_return(e))
                         alerts.append(("ok", entry))
                     else:
                         entry.postop_completed = False
@@ -2687,6 +2703,115 @@ class Main(QtWidgets.QWidget):
                 if collect_failures:
                     failed.append(payload.get("hn") or payload.get("pickup_id") or "-")
         return ok, failed
+
+    def _shift_key_now(self) -> str:
+        """คืนค่า shift key: morning|evening|night|holiday_morning|holiday_evening|holiday_night"""
+        now = datetime.now()
+        wd = now.weekday()  # 0=Mon,6=Sun
+        is_holiday = wd >= 5  # เสาร์/อาทิตย์ถือเป็นวันหยุด (ปรับได้ถ้ามีปฏิทินจริง)
+        hhmm = int(now.strftime("%H%M"))
+        if 830 <= hhmm < 1630:
+            base = "morning"
+        elif 1630 <= hhmm < 2400:
+            base = "evening"
+        else:
+            base = "night"
+        return f"holiday_{base}" if is_holiday else base
+
+    def _load_roster_for_now(self) -> list[str]:
+        """อ่านรายชื่อเวรเปลตามกะจาก QSettings; ถ้าไม่มีให้ใช้ DEFAULT_RUNNERS"""
+        s = self.sched.s  # QSettings shared
+        key = f"runner/roster/{self._shift_key_now()}"
+        lst = s.value(key)
+        names = [str(x).strip() for x in (lst or []) if str(x).strip()]
+        if not names:
+            names = DEFAULT_RUNNERS[:]
+        return names
+
+    def _busy_names_from_runner_board(self) -> set[str]:
+        """ชื่อที่กำลังมีงาน waiting/picking อยู่บนกระดาน Runner ตอนนี้"""
+        busy: Set[str] = set()
+        cache = getattr(self, "_runner_status_cache", {}) or {}
+        for row in cache.values():
+            name = str(row.get("assignee") or "").strip()
+            status = str(row.get("status") or "").strip().lower()
+            if name and status in {"waiting", "picking"}:
+                busy.add(name)
+        return busy
+
+    def _next_by_round_robin(self, roster: list[str]) -> Optional[str]:
+        """เลือกชื่อรอบคิว RR ข้ามคนที่ busy; pointer เก็บใน QSettings ตาม shift key"""
+        roster = [r for r in roster if r]
+        if not roster:
+            return None
+        s = self.sched.s
+        key = f"runner/rr_pointer/{self._shift_key_now()}"
+        try:
+            ptr = int(s.value(key, 0))
+        except Exception:
+            ptr = 0
+
+        busy = self._busy_names_from_runner_board()
+        n = len(roster)
+        for i in range(n):
+            idx = (ptr + i) % n
+            cand = roster[idx]
+            if cand not in busy:
+                s.setValue(key, idx + 1)
+                return cand
+        s.setValue(key, (ptr + 1) % n)
+        return roster[ptr % n]
+
+    def _pick_next_waiting_case(self) -> Optional["ScheduleEntry"]:
+        """เลือกเคสที่ยังไม่ถูกส่งขึ้น Runner board โดยเรียงตามเวลา OR"""
+        today = datetime.now().date()
+        candidate_states = {"scheduled", "in_or", "operation_started", "operation_ended"}
+        pushed_states = {"waiting", "picking", "arrived"}
+
+        cache = getattr(self, "_runner_status_cache", {}) or {}
+        lst: List["ScheduleEntry"] = []
+        for e in self.sched.entries:
+            if not isinstance(e, ScheduleEntry):
+                continue
+            if getattr(e, "date", today) != today:
+                continue
+            if e.state not in candidate_states:
+                continue
+            pid = self._pickup_id_for_entry(e)
+            r = cache.get(pid)
+            if r and str(r.get("status") or "").strip().lower() in pushed_states:
+                continue
+            lst.append(e)
+
+        if not lst:
+            return None
+
+        def _key(e: "ScheduleEntry"):
+            return self._coerce_time_value(getattr(e, "time", "")) or "99:99"
+
+        lst.sort(key=_key)
+        return lst[0]
+
+    def _auto_dispatch_after_return(self, just_returned: "ScheduleEntry"):
+        """ปิดเคสแล้ว → ส่งงานรับผู้ป่วยเคสถัดไปตามกะ/ความแฟร์อัตโนมัติ"""
+        if not runner_health_ok():
+            return
+        next_case = self._pick_next_waiting_case()
+        if not next_case:
+            return
+
+        roster = self._load_roster_for_now()
+        runner_name = self._next_by_round_robin(roster)
+        ok, _ = self._push_rows_to_runner([next_case], runner_ready=True)
+        if not ok:
+            return
+
+        try:
+            pid = self._pickup_id_for_entry(next_case)
+            if runner_name:
+                self._runner_ack(pid, runner_name)
+        except Exception:
+            pass
 
     def _runner_status_label(self, status: str) -> str:
         status = (status or "").strip()
