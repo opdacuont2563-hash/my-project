@@ -112,7 +112,7 @@ except Exception:  # pragma: no cover - keep UI responsive without catalog
 
 # ใช้กติกา/ตัวช่วยห้อง OR เดียวกับฝั่ง patient (fallback เมื่อไฟล์ไม่พร้อมใช้)
 try:
-    from surgibot_patient_connect import (
+    from registry_patient_connect import (
         describe_or_plan_label,
         normalize_owner_for_wednesday,
     )

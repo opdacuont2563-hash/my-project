@@ -313,7 +313,7 @@ class FastSearchIndex:
 # ---------------------- Config ----------------------
 DEFAULT_HOST = os.getenv("SURGIBOT_CLIENT_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.getenv("SURGIBOT_CLIENT_PORT", "8088"))
-DEFAULT_TOKEN = os.getenv("SURGIBOT_SECRET", "8HDYAANLgTyjbBK4JPGx1ooZbVC86_OMJ9uEXBm3EZTidUVyzhGiReaksGA0ites")
+DEFAULT_TOKEN = os.getenv("SURGIBOT_SECRET", "uTCoBelMyNfSSNmUulT_Kz6zrrCVkvD578MxEuLKZoaaXX0pVlpAD8toYHBxsFxI")
 
 # === Runner pickup service (FastAPI) ===
 RUNNER_BASE = os.getenv("SURGIBOT_RUNNER_BASE_URL", "http://127.0.0.1:8777").rstrip("/")
@@ -322,6 +322,7 @@ RUNNER_HEALTH_API = "/health"
 RUNNER_LIST_API = "/runner/list"
 RUNNER_ACK_API = "/runner/ack"
 RUNNER_ARRIVE_API = "/runner/arrive"
+RUNNER_FINISH_API = "/runner/finish"
 
 
 def runner_health_ok(timeout: float = 0.8) -> bool:
@@ -343,12 +344,14 @@ RUNNER_STATUS_LABELS = {
     "waiting": "รอรับ",
     "picking": "กำลังไปรับ",
     "arrived": "ถึง OR",
+    "finished": "ผ่าตัดเสร็จแล้ว",
 }
 
 RUNNER_STATUS_COLORS = {
     "waiting": "#64748b",
     "picking": "#f59e0b",
     "arrived": "#16a34a",
+    "finished": "#0f172a",
 }
 
 
@@ -1432,99 +1435,46 @@ def map_to_known_ward(src: str, known_wards: List[str]) -> str:
 # ]
 # หมายเหตุ: Monday=0 ... Sunday=6
 WEEKLY_DOCTOR_OR_PLAN: Dict[int, Dict[str, List[Dict[str, object]]]] = {
-    0: {
-        "OR1": [
-            {"doctor": "นพ.สุริยา คุณาชน", "when": "ALLDAY", "weeks": [1]},
-            {"doctor": "พญ.รัฐพร ตั้งเพียร", "when": "ALLDAY", "weeks": [2]},
-            {"doctor": "พญ.พิชัย สุวัฒนพูนลาภ", "when": "ALLDAY", "weeks": [3]},
-            {"doctor": "นพ.ธนวัฒน์ พันธุ์พรหม", "when": "ALLDAY", "weeks": [4]},
-        ],
-        "OR2": [],
-        "OR3": [{"doctor": "พญ.พิรุณยา แสนวันดี", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR5": [{"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR6": [{"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-        "OR8": [{"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]}],
-    },
-    1: {
-        "OR1": [
-            {"doctor": "พญ.สายฝน บรรณจิตร์", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR2": [
-            {"doctor": "นพ.ชัชพล องค์โฆษิต", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR3": [
-            {"doctor": "พญ.สุภาภรณ์ พิณพาทย์", "when": "AM", "weeks": [1, 2, 3, 4]},
-            {"doctor": "ทพญ.อรุณนภา คิสารัง", "when": "PM", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR5": [
-            {"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR6": [
-            {"doctor": "นพ.พิชัย สุวัฒนพูนลาภ", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR8": [
-            {"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-    },
-    2: {
-        "OR1": [
-            {"doctor": "นพ.สุริยา คุณาชน", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR2": [
-            {"doctor": "นพ.วิษณุ ผูกพันธ์", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR3": [
-            {"doctor": "CLOSED", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR5": [
-            {"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR6": [
-            {"doctor": "พญ.รัฐพร ตั้งเพียร", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR8": [
-            {"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-    },
-    3: {
-        "OR1": [],
-        "OR2": [
-            {"doctor": "นพ.อำนาจ อนันต์วัฒนกุล", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR3": [
-            {"doctor": "นพ.วรวิช พลเวียงธรรม", "when": "AM", "weeks": [1, 2, 3, 4]},
-            {"doctor": "ทพ.ฉลองรัฐ เดชา", "when": "PM", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR5": [
-            {"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR6": [
-            {"doctor": "นพ.ธนวัฒน์ พันธุ์พรหม", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR8": [
-            {"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-    },
-    4: {
-        "OR1": [
-            {"doctor": "พญ.สุภาภรณ์ พิณพาทย์", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR2": [
-            {"doctor": "นพ.กฤษฎา อิ้งอำพร", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR3": [
-            {"doctor": "พญ.สุทธิพร หมวดไธสง", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR5": [
-            {"doctor": "OBGYN_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR6": [
-            {"doctor": "CLOSED", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-        "OR8": [
-            {"doctor": "EYE_ANY", "when": "ALLDAY", "weeks": [1, 2, 3, 4]},
-        ],
-    },
+  0: {
+    'OR1': [{'doctor': 'นพ.สุริยา คุณาชน', 'when': 'ALLDAY', 'weeks': [1]}, {'doctor': 'พญ.รัฐพร ตั้งเพียร', 'when': 'ALLDAY', 'weeks': [2]}, {'doctor': 'พญ.พิชัย สุวัฒนพูนลาภ', 'when': 'ALLDAY', 'weeks': [3]}, {'doctor': 'นพ.ธนวัฒน์ พันธุ์พรหม', 'when': 'ALLDAY', 'weeks': [4]}],
+    'OR2': [{'doctor': 'นพ.ณัฐพงศ์ ศรีโพนทอง', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR3': [{'doctor': 'พญ.พิรุณยา แสนวันดี', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR5': [{'doctor': 'OBGYN_ANY', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR6': [{'doctor': 'OBGYN_ANY', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR8': [{'doctor': 'พญ.สีชมพู ตั้งสัตยาธิษฐาน', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+  },
+  1: {
+    'OR1': [{'doctor': 'พญ.สายฝน บรรณจิตร์', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR2': [{'doctor': 'นพ.ชัชพล องค์โฆษิต', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR3': [{'doctor': 'พญ.สุภาภรณ์ พิณพาทย์', 'when': 'AM', 'weeks': [1, 2, 3, 4]}, {'doctor': 'ทพญ.อรุณนภา คิสารัง', 'when': 'PM', 'weeks': [1, 2, 3, 4]}],
+    'OR5': [{'doctor': 'OBGYN_ANY', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR6': [{'doctor': 'นพ.พิชัย สุวัฒนพูนลาภ', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR8': [{'doctor': 'พญ.สาวิตรี ถนอมวงศ์ไทย', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+  },
+  2: {
+    'OR1': [{'doctor': 'นพ.สุริยา คุณาชน', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR2': [{'doctor': 'นพ.วิษณุ ผูกพันธ์', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR3': [{'doctor': 'CLOSED', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR5': [{'doctor': 'OBGYN_ANY', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR6': [{'doctor': 'พญ.รัฐพร ตั้งเพียร', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR8': [{'doctor': 'พญ.นันท์นภัส ชีวะเกรียงไกร', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+  },
+  3: {
+    'OR1': [{'doctor': 'พญ.สายฝน บรรณจิตร์', 'when': 'AM', 'weeks': [1, 2, 3, 4]}, {'doctor': 'นพ.ชัชพล องค์โฆษิต', 'when': 'PM', 'weeks': [1, 3]}, {'doctor': ['นพ.ณัฐพงศ์ ศรีโพนทอง', 'นพ.วิษณุ ผูกพันธ์'], 'when': 'PM', 'weeks': [2, 4]}],
+    'OR2': [{'doctor': 'นพ.อำนาจ อนันต์วัฒนกุล', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR3': [{'doctor': 'นพ.วรวิช พลเวียงธรรม', 'when': 'AM', 'weeks': [1, 2, 3, 4]}, {'doctor': 'ทพ.ฉลองรัฐ เดชา', 'when': 'PM', 'weeks': [1, 2, 3, 4]}],
+    'OR5': [{'doctor': 'OBGYN_ANY', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR6': [{'doctor': 'นพ.ธนวัฒน์ พันธุ์พรหม', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR8': [{'doctor': 'พญ.ดวิษา อังศรีประเสริฐ', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+  },
+  4: {
+    'OR1': [{'doctor': 'พญ.สุภาภรณ์ พิณพาทย์', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR2': [{'doctor': 'นพ.กฤษฎา อิ้งอำพร', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR3': [{'doctor': 'พญ.สุทธิพร หมวดไธสง', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR5': [{'doctor': 'OBGYN_ANY', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR6': [{'doctor': 'CLOSED', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+    'OR8': [{'doctor': 'นพ.สราวุธ สารีย์', 'when': 'ALLDAY', 'weeks': [1, 2, 3, 4]}],
+  },
 }
 
 GROUPS: Dict[str, List[str]] = {
@@ -1871,6 +1821,7 @@ class Main(QtWidgets.QWidget):
         self._last_status_by_hn: dict[str, str] = {}
         self._runner_status_cache: Dict[str, dict] = {}
         self._last_runner_user: str = ""
+        self._runner_finished_sent: Set[str] = set()
 
         # form edit mode
         self._edit_idx: Optional[int] = None
@@ -2742,6 +2693,36 @@ class Main(QtWidgets.QWidget):
             return bool(resp.ok)
         except requests.RequestException:
             return False
+
+    def _runner_finish(self, pickup_id: str, user: str = "ระบบ") -> bool:
+        try:
+            resp = requests.post(
+                f"{RUNNER_BASE}{RUNNER_FINISH_API}",
+                json={"pickup_id": pickup_id, "user": user},
+                timeout=2.0,
+                headers={"Accept": "application/json"},
+            )
+            return bool(resp.ok)
+        except requests.RequestException:
+            return False
+
+    def _auto_finish_runner_cases(self, entries: List["ScheduleEntry"], status_map: Dict[str, dict]) -> None:
+        if not entries or not status_map:
+            return
+        for entry in entries:
+            if not self._is_entry_completed(entry):
+                continue
+            pickup_id = self._pickup_id_for_entry(entry)
+            if not pickup_id:
+                continue
+            row = status_map.get(pickup_id) or {}
+            if str(row.get("status") or "").strip() == "finished":
+                self._runner_finished_sent.discard(pickup_id)
+                continue
+            if pickup_id in self._runner_finished_sent:
+                continue
+            if self._runner_finish(pickup_id, user="ระบบ"):
+                self._runner_finished_sent.add(pickup_id)
 
     def _handle_runner_action(self, entry: "ScheduleEntry", action: str) -> None:
         pid = self._pickup_id_for_entry(entry)
@@ -3707,6 +3688,16 @@ class Main(QtWidgets.QWidget):
 
             entries_for_day = [entry for entry in entries_snapshot if _resolved_date(entry) == base_date]
 
+            valid_pickups: Set[str] = set()
+            for entry in entries_for_day:
+                pid = self._pickup_id_for_entry(entry)
+                if pid:
+                    valid_pickups.add(pid)
+            if valid_pickups:
+                self._runner_finished_sent.intersection_update(valid_pickups)
+            else:
+                self._runner_finished_sent.clear()
+
             runner_status_map: Dict[str, dict] = {}
             runner_ready = False
             if entries_for_day:
@@ -3714,6 +3705,7 @@ class Main(QtWidgets.QWidget):
                 if runner_ready:
                     self._push_rows_to_runner(entries_for_day, runner_ready=True)
                     runner_status_map = _fetch_runner_status_map(str(base_date))
+                    self._auto_finish_runner_cases(entries_for_day, runner_status_map)
             self._runner_status_cache = runner_status_map
 
             indexed_entries: List[Tuple[int, ScheduleEntry]] = list(enumerate(entries_snapshot))
