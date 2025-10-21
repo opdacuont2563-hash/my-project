@@ -1589,6 +1589,150 @@ def normalize_doctor_name(name: str) -> str:
     return DOCTOR_ALIASES.get(s, s)
 
 
+OR_AFTER_HOURS = "OR_AFTER_HOURS"
+OR_AFTER_HOURS_LABEL_TH = "OR นอกเวลา"
+
+_DOCTOR_DEPT_RAW: Dict[str, str] = {
+    "นพ.สุริยา คุณาชน": "ศัลยกรรมทั่วไป",
+    "นพ.พิชัย สุวัฒนพูนลาภ": "ศัลยกรรมทั่วไป",
+    "พญ.พิชัย สุวัฒนพูนลาภ": "ศัลยกรรมทั่วไป",
+    "นพ.ธนวัฒน์ พันธุ์พรหม": "ศัลยกรรมทั่วไป",
+    "นพ.ชัชพล องค์โฆษิต": "ศัลยกรรมทั่วไป",
+    "นพ.ณัฐพงศ์ ศรีโพนทอง": "ศัลยกรรมทั่วไป",
+    "นพ.วิษณุ ผูกพันธ์": "ศัลยกรรมทั่วไป",
+    "พญ.สายฝน บรรณจิตร์": "ศัลยกรรมทั่วไป",
+    "พญ.รัฐพร ตั้งเพียร": "ศัลยกรรมทั่วไป",
+    "พญ.สุภาภรณ์ พิณพาทย์": "ศัลยกรรมทั่วไป",
+    "พญ.วิรัชกรกศณท์ ณัชชาวัชฌะคุปต์": "OBGYN",
+}
+
+DOCTOR_DEPT: Dict[str, str] = {
+    normalize_doctor_name(name): dept for name, dept in _DOCTOR_DEPT_RAW.items()
+}
+
+OBGYN_DEPTS = {"OBGYN", "สูติ-นรีเวช", "สูติ-นรีเวชกรรม"}
+
+
+def get_doctor_dept(name: str) -> str:
+    normalized = normalize_doctor_name(name)
+    return DOCTOR_DEPT.get(normalized, "UNKNOWN")
+
+
+def parse_hhmm_or_tf(s: str | None) -> tuple[bool, int | None]:
+    """Return (is_tf, minutes_since_midnight)."""
+
+    if s is None:
+        return True, None
+    text = str(s).strip()
+    if not text or text.upper() == "TF":
+        return True, None
+    try:
+        hh, mm = text.split(":")
+        return False, int(hh) * 60 + int(mm)
+    except Exception:
+        return False, None
+
+
+def timeband_from_minutes(m: int | None) -> str:
+    if m is None:
+        return "AFTER_HOURS"
+    if m >= 16 * 60 + 30:
+        return "AFTER_HOURS"
+    if m < 12 * 60:
+        return "AM"
+    return "PM"
+
+
+def doctor_home_or(day_idx: int, band: str, doctor_name: str) -> str | None:
+    doctor_normalized = normalize_doctor_name(doctor_name)
+    day_plan = WEEKLY_DOCTOR_OR_PLAN.get(day_idx, {})
+    for or_key, rules in day_plan.items():
+        for rule in rules or []:
+            when = (rule.get("when") or "ALLDAY").upper()
+            if when not in ("ALLDAY", band):
+                continue
+            who = rule.get("doctor")
+            owners = who if isinstance(who, list) else [who]
+            owners_normalized = [normalize_doctor_name(item) for item in owners]
+            if doctor_normalized in owners_normalized:
+                return or_key
+    return None
+
+
+def borrow_or_same_department(day_idx: int, band: str, doctor_name: str) -> str | None:
+    dept = get_doctor_dept(doctor_name)
+    if dept in OBGYN_DEPTS or dept == "UNKNOWN":
+        return None
+
+    candidates: list[str] = []
+    day_plan = WEEKLY_DOCTOR_OR_PLAN.get(day_idx, {})
+    for or_key, rules in day_plan.items():
+        for rule in rules or []:
+            when = (rule.get("when") or "ALLDAY").upper()
+            if when not in ("ALLDAY", band):
+                continue
+            who = rule.get("doctor")
+            owners = who if isinstance(who, list) else [who]
+            normalized_candidates = [normalize_doctor_name(item) for item in owners]
+            filtered = [
+                cand
+                for cand in normalized_candidates
+                if cand and cand not in GROUPS and cand not in CLOSED_TOKENS
+            ]
+            if not filtered:
+                continue
+            owner_name = filtered[0]
+            if get_doctor_dept(owner_name) == dept:
+                candidates.append(or_key)
+                break
+
+    def _or_sort_key(value: str) -> int:
+        match = re.search(r"\d+", value or "")
+        return int(match.group()) if match else 9999
+
+    return sorted(set(candidates), key=_or_sort_key)[0] if candidates else None
+
+
+def route_case_to_or(*, day_idx: int, time_str: str | None, doctor_name: str) -> tuple[str | None, dict]:
+    normalized_doctor = normalize_doctor_name(doctor_name)
+    is_tf, minutes = parse_hhmm_or_tf(time_str)
+    band = timeband_from_minutes(minutes)
+
+    if band == "AFTER_HOURS":
+        return OR_AFTER_HOURS, {"borrowed": False, "owner": None, "is_tf": is_tf}
+
+    if not normalized_doctor:
+        return None, {"borrowed": False, "owner": None, "is_tf": is_tf}
+
+    home = doctor_home_or(day_idx, band, normalized_doctor)
+    if home:
+        return home, {"borrowed": False, "owner": normalized_doctor, "is_tf": is_tf}
+
+    borrowed = borrow_or_same_department(day_idx, band, normalized_doctor)
+    if borrowed:
+        return borrowed, {"borrowed": True, "owner": normalized_doctor, "is_tf": is_tf}
+
+    return None, {"borrowed": False, "owner": None, "is_tf": is_tf}
+
+
+def show_doctor_with_dept(name: str) -> str:
+    normalized = normalize_doctor_name(name)
+    if not normalized:
+        return ""
+    dept = get_doctor_dept(normalized)
+    if dept == "UNKNOWN":
+        return normalized
+    return f"{normalized} — {dept}"
+
+
+def format_or_display(or_key: str | None) -> str:
+    if not or_key or or_key == "-":
+        return "-"
+    if or_key == OR_AFTER_HOURS:
+        return OR_AFTER_HOURS_LABEL_TH
+    return or_key
+
+
 GROUP_MEMBER_LOOKUP: Dict[str, Set[str]] = {
     token: {normalize_doctor_name(member) for member in members}
     for token, members in GROUPS.items()
@@ -1671,12 +1815,14 @@ def _describe_doctor_token(token: str) -> str:
         members = GROUPS.get(token, [])
         if members:
             return f"{TOKEN_DISPLAY_NAMES.get(token, '') or members[0]}"
-    return normalize_doctor_name(token)
+    return show_doctor_with_dept(token)
 
 
 def describe_or_plan_label(case_date: date, or_room: str) -> str:
     if not or_room or or_room == "-":
         return ""
+    if or_room == OR_AFTER_HOURS:
+        return OR_AFTER_HOURS_LABEL_TH
 
     weekday = case_date.weekday()
     plan = WEEKLY_DOCTOR_OR_PLAN.get(weekday, {})
@@ -1732,7 +1878,7 @@ def resolve_or_owner(or_room: str, dt: date, fallback: str | None = None) -> str
     return fallback_name or "-"
 
 
-def pick_or_by_doctor(case_date: date, time_str: str, doctor_name: str) -> str:
+def _legacy_pick_or_by_doctor(case_date: date, time_str: str, doctor_name: str) -> str:
     if not doctor_name:
         return ""
 
@@ -1802,6 +1948,23 @@ def pick_or_by_doctor(case_date: date, time_str: str, doctor_name: str) -> str:
                 return or_room
 
     return ""
+
+
+def pick_or_by_doctor(case_date: date, time_str: str, doctor_name: str) -> str:
+    if not doctor_name:
+        return ""
+
+    weekday = case_date.weekday()
+    normalized = normalize_doctor_name(doctor_name)
+    routed_or, _meta = route_case_to_or(
+        day_idx=weekday,
+        time_str=time_str,
+        doctor_name=normalized,
+    )
+    if routed_or:
+        return routed_or
+
+    return _legacy_pick_or_by_doctor(case_date, time_str, normalized)
 
 
 class Main(QtWidgets.QWidget):
@@ -3751,6 +3914,8 @@ class Main(QtWidgets.QWidget):
                         return (0, order.index(or_name))
                     if str(or_name).strip() == '-':
                         return (2, 999)
+                    if or_name == OR_AFTER_HOURS:
+                        return (1, 9999)
                     digits = ''.join(ch for ch in str(or_name) if ch.isdigit())
                     num = int(digits) if digits else 999
                     return (1, num)
@@ -3803,24 +3968,31 @@ class Main(QtWidgets.QWidget):
                     entries_only = [entry for _, entry in bucket_sorted]
 
                     header_item = QtWidgets.QTreeWidgetItem(['' for _ in range(self.tree2.columnCount())])
-                    or_label = or_room or '-'
+                    actual_or = or_room or '-'
+                    display_or = format_or_display(or_room)
                     first_entry = entries_only[0] if entries_only else None
                     the_date = getattr(first_entry, 'date', base_date)
-                    owner = resolve_or_owner(or_label, the_date, getattr(first_entry, 'doctor', None)) or '-'
-                    header_item.setText(0, f"{or_label} • {owner}")
+                    owner = resolve_or_owner(actual_or, the_date, getattr(first_entry, 'doctor', None)) or '-'
+                    owner_display = show_doctor_with_dept(owner) if owner and owner not in {'-', ''} else owner
+                    if owner_display and owner_display not in {'-', ''}:
+                        header_text = f"{display_or} • {owner_display}"
+                    else:
+                        header_text = display_or
+                    header_item.setText(0, header_text)
                     font = header_item.font(0)
                     font.setBold(True)
                     header_item.setFont(0, font)
                     _span_first_column(header_item)
                     header_item.setChildIndicatorPolicy(QtWidgets.QTreeWidgetItem.ShowIndicator)
-                    header_item.setData(0, QtCore.Qt.UserRole, or_label)
+                    header_item.setData(0, QtCore.Qt.UserRole, actual_or)
                     self.tree2.addTopLevelItem(header_item)
-                    headers.append((or_label, header_item))
+                    headers.append((actual_or, header_item))
 
                     for idx, entry in bucket_sorted:
                         diag_txt = ' ; '.join(entry.diags) if entry.diags else '-'
                         op_txt = ' ; '.join(entry.ops) if entry.ops else '-'
-                        or_time = f"{or_label} • {entry.time or 'TF'}"
+                        or_time = f"{display_or} • {entry.time or 'TF'}"
+                        doctor_display = show_doctor_with_dept(entry.doctor) if entry.doctor else ''
                         status_text = getattr(entry, 'status', '') or (entry.state or '') or '-'
                         case_size_txt = getattr(entry, 'case_size', '') or '-'
                         dept_txt = getattr(entry, 'dept', '') or '-'
@@ -3831,7 +4003,7 @@ class Main(QtWidgets.QWidget):
                             str(entry.age or 0),
                             diag_txt,
                             op_txt,
-                            entry.doctor or '-',
+                            doctor_display or '-',
                             entry.ward or '-',
                             case_size_txt,
                             dept_txt,
@@ -3846,7 +4018,7 @@ class Main(QtWidgets.QWidget):
                         ])
                         row.setData(0, QtCore.Qt.UserRole, entry.uid())
                         row.setData(0, QtCore.Qt.UserRole + 1, idx)
-                        pickup_id = self._pickup_id_for_entry(entry, or_label)
+                        pickup_id = self._pickup_id_for_entry(entry, actual_or)
                         row.setData(0, QtCore.Qt.UserRole + 2, pickup_id)
                         header_item.addChild(row)
 
