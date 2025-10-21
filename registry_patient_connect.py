@@ -4,7 +4,7 @@
 """
 import os, sys, json, argparse, csv, base64, secrets, hashlib, unicodedata, re
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Set
+from typing import List, Optional, Tuple, Dict, Set, Union
 from datetime import datetime, timedelta, time as dtime, date
 from concurrent.futures import ThreadPoolExecutor
 
@@ -1174,7 +1174,10 @@ def _infer_doctor_from_entry(entry: "ScheduleEntry") -> str:
 
 def normalize_owner_for_wednesday(entries: List["ScheduleEntry"], dt: date) -> List["ScheduleEntry"]:
     """Ensure Wednesday cases stay with their designated room owners."""
-    if not dt or dt.weekday() != 2:
+    if not dt:
+        return entries
+
+    if plan_day_index(dt) != _WED:
         return entries
 
     for entry in entries:
@@ -1592,6 +1595,64 @@ def normalize_doctor_name(name: str) -> str:
 OR_AFTER_HOURS = "OR_AFTER_HOURS"
 OR_AFTER_HOURS_LABEL_TH = "OR นอกเวลา"
 
+WeekdayLike = Union[int, date, datetime, QtCore.QDate]
+
+
+def plan_day_index(day_value: WeekdayLike) -> int:
+    """Normalize any weekday-like input to Monday=0..Sunday=6."""
+
+    raw: Optional[int] = None
+    from_weekday_method = False
+
+    if isinstance(day_value, int):
+        raw = day_value
+    else:
+        to_python = getattr(day_value, "toPython", None)
+        if callable(to_python):
+            try:
+                py_date = to_python()
+            except Exception:  # pragma: no cover - defensive for older Qt
+                py_date = None
+            if py_date is not None and hasattr(py_date, "weekday"):
+                try:
+                    raw = int(py_date.weekday())
+                    from_weekday_method = True
+                except Exception:  # pragma: no cover - fallback when weekday fails
+                    raw = None
+
+        if raw is None and hasattr(day_value, "weekday"):
+            try:
+                raw = int(day_value.weekday())
+                from_weekday_method = True
+            except Exception:  # pragma: no cover - fallback for unexpected objects
+                raw = None
+
+        if raw is None and hasattr(day_value, "dayOfWeek"):
+            try:
+                raw = int(day_value.dayOfWeek())
+            except Exception:  # pragma: no cover - fallback when Qt API unavailable
+                raw = None
+
+        if raw is None:
+            try:
+                raw = int(day_value)
+            except Exception:
+                raw = None
+
+    if raw is None:
+        return 0
+
+    if not from_weekday_method and 1 <= raw <= 7:
+        return (raw - 1) % 7
+
+    if raw < 0:
+        return raw % 7
+
+    if raw > 6:
+        return raw % 7
+
+    return raw
+
 _DOCTOR_DEPT_RAW: Dict[str, str] = {
     "นพ.สุริยา คุณาชน": "ศัลยกรรมทั่วไป",
     "นพ.พิชัย สุวัฒนพูนลาภ": "ศัลยกรรมทั่วไป",
@@ -1643,9 +1704,10 @@ def timeband_from_minutes(m: int | None) -> str:
     return "PM"
 
 
-def doctor_home_or(day_idx: int, band: str, doctor_name: str) -> str | None:
+def doctor_home_or(day_idx: WeekdayLike, band: str, doctor_name: str) -> str | None:
     doctor_normalized = normalize_doctor_name(doctor_name)
-    day_plan = WEEKLY_DOCTOR_OR_PLAN.get(day_idx, {})
+    normalized_idx = plan_day_index(day_idx)
+    day_plan = WEEKLY_DOCTOR_OR_PLAN.get(normalized_idx, {})
     for or_key, rules in day_plan.items():
         for rule in rules or []:
             when = (rule.get("when") or "ALLDAY").upper()
@@ -1659,13 +1721,14 @@ def doctor_home_or(day_idx: int, band: str, doctor_name: str) -> str | None:
     return None
 
 
-def borrow_or_same_department(day_idx: int, band: str, doctor_name: str) -> str | None:
+def borrow_or_same_department(day_idx: WeekdayLike, band: str, doctor_name: str) -> str | None:
     dept = get_doctor_dept(doctor_name)
     if dept in OBGYN_DEPTS or dept == "UNKNOWN":
         return None
 
     candidates: list[str] = []
-    day_plan = WEEKLY_DOCTOR_OR_PLAN.get(day_idx, {})
+    normalized_idx = plan_day_index(day_idx)
+    day_plan = WEEKLY_DOCTOR_OR_PLAN.get(normalized_idx, {})
     for or_key, rules in day_plan.items():
         for rule in rules or []:
             when = (rule.get("when") or "ALLDAY").upper()
@@ -1693,7 +1756,7 @@ def borrow_or_same_department(day_idx: int, band: str, doctor_name: str) -> str 
     return sorted(set(candidates), key=_or_sort_key)[0] if candidates else None
 
 
-def route_case_to_or(*, day_idx: int, time_str: str | None, doctor_name: str) -> tuple[str | None, dict]:
+def route_case_to_or(*, day_idx: WeekdayLike, time_str: str | None, doctor_name: str) -> tuple[str | None, dict]:
     normalized_doctor = normalize_doctor_name(doctor_name)
     is_tf, minutes = parse_hhmm_or_tf(time_str)
     band = timeband_from_minutes(minutes)
@@ -1824,7 +1887,7 @@ def describe_or_plan_label(case_date: date, or_room: str) -> str:
     if or_room == OR_AFTER_HOURS:
         return OR_AFTER_HOURS_LABEL_TH
 
-    weekday = case_date.weekday()
+    weekday = plan_day_index(case_date)
     plan = WEEKLY_DOCTOR_OR_PLAN.get(weekday, {})
     rules = plan.get(or_room, []) or []
     if not rules:
@@ -1872,7 +1935,7 @@ _OWNER_WED: Dict[str, str] = {
 def resolve_or_owner(or_room: str, dt: date, fallback: str | None = None) -> str:
     """Return the resolved owner for an OR room, overriding Wednesday defaults."""
     room_key = (or_room or "").strip()
-    if dt and room_key and dt.weekday() == _WED and room_key in _OWNER_WED:
+    if dt and room_key and plan_day_index(dt) == _WED and room_key in _OWNER_WED:
         return _OWNER_WED[room_key]
     fallback_name = normalize_doctor_name(fallback) if fallback else ""
     return fallback_name or "-"
@@ -1954,10 +2017,9 @@ def pick_or_by_doctor(case_date: date, time_str: str, doctor_name: str) -> str:
     if not doctor_name:
         return ""
 
-    weekday = case_date.weekday()
     normalized = normalize_doctor_name(doctor_name)
     routed_or, _meta = route_case_to_or(
-        day_idx=weekday,
+        day_idx=case_date,
         time_str=time_str,
         doctor_name=normalized,
     )
@@ -3972,12 +4034,19 @@ class Main(QtWidgets.QWidget):
                     display_or = format_or_display(or_room)
                     first_entry = entries_only[0] if entries_only else None
                     the_date = getattr(first_entry, 'date', base_date)
-                    owner = resolve_or_owner(actual_or, the_date, getattr(first_entry, 'doctor', None)) or '-'
-                    owner_display = show_doctor_with_dept(owner) if owner and owner not in {'-', ''} else owner
-                    if owner_display and owner_display not in {'-', ''}:
-                        header_text = f"{display_or} • {owner_display}"
+                    plan_label = ""
+                    if actual_or not in {'', '-', OR_AFTER_HOURS}:
+                        plan_label = describe_or_plan_label(the_date, actual_or)
+
+                    if plan_label:
+                        header_text = f"{display_or} • {plan_label}"
                     else:
-                        header_text = display_or
+                        owner = resolve_or_owner(actual_or, the_date, getattr(first_entry, 'doctor', None)) or '-'
+                        owner_display = show_doctor_with_dept(owner) if owner and owner not in {'-', ''} else owner
+                        if owner_display and owner_display not in {'-', ''}:
+                            header_text = f"{display_or} • {owner_display}"
+                        else:
+                            header_text = display_or
                     header_item.setText(0, header_text)
                     font = header_item.font(0)
                     font.setBold(True)

@@ -1,3 +1,5 @@
+from datetime import date
+
 import pytest
 
 try:
@@ -8,7 +10,7 @@ except ImportError as exc:  # pragma: no cover - environment dependency
 
 def test_borrow_same_department_daytime():
     or_key, meta = route_case_to_or(
-        day_idx=1,  # Tuesday
+        day_idx=date(2024, 7, 16),  # Tuesday
         time_str="10:00",
         doctor_name="นพ.สุริยา คุณาชน",
     )
@@ -18,7 +20,7 @@ def test_borrow_same_department_daytime():
 
 def test_after_hours_tf_bucket():
     or_key, meta = route_case_to_or(
-        day_idx=2,  # Wednesday
+        day_idx=date(2024, 7, 17),  # Wednesday
         time_str="TF",
         doctor_name="นพ.สุริยา คุณาชน",
     )
@@ -28,7 +30,7 @@ def test_after_hours_tf_bucket():
 
 def test_after_hours_time_bucket():
     or_key, meta = route_case_to_or(
-        day_idx=1,  # Tuesday
+        day_idx=date(2024, 7, 16),  # Tuesday
         time_str="17:00",
         doctor_name="นพ.ธนวัฒน์ พันธุ์พรหม",
     )
@@ -38,7 +40,7 @@ def test_after_hours_time_bucket():
 
 def test_obgyn_does_not_borrow_daytime():
     or_key, meta = route_case_to_or(
-        day_idx=3,  # Thursday
+        day_idx=date(2024, 7, 18),  # Thursday
         time_str="13:30",
         doctor_name="พญ.วิรัชกรกศณท์ ณัชชาวัชฌะคุปต์",
     )
