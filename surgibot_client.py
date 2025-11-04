@@ -156,6 +156,18 @@ STATUS_FLOW = [STATUS_READY, STATUS_OPERATING, STATUS_RECOVERY, STATUS_RETURNING
 FLOW_INDEX = {s: i for i, s in enumerate(STATUS_FLOW)}
 POSTPONE_ALLOWED_FROM = {STATUS_READY}
 
+# ----- Post-op choices -----
+CASE_SIZES = ["Major", "Minor"]
+DEPARTMENTS_THAI = [
+    "ศัลยกรรมทั่วไป",
+    "ศัลยกรรมกระดูกและข้อ",
+    "ศัลยกรรมระบบทางเดินปัสสาวะ",
+    "ศัลยกรรม โสต ศอ นาสิก",
+    "สูติ-นรีเวช",
+    "จักษุ",
+    "ศัลยกรรมขากรรไกร",
+]
+
 STATUS_CHOICES = [
     STATUS_READY,
     STATUS_OPERATING,
@@ -223,7 +235,7 @@ class _SchedEntry:
             "or", "date", "time", "hn", "name", "age", "dept", "doctor", "diags", "ops",
             "ward", "queue", "period", "case_size", "urgency", "assist1", "assist2",
             "scrub", "circulate", "time_start", "time_end", "status", "state",
-            "returning_started_at", "version", "updated_at"
+            "returning_started_at", "version", "updated_at", "post_case_size", "post_department"
         }
         self.or_room = str(d.get("or","") or "")
         self.date = str(d.get("date","") or "")
@@ -256,7 +268,13 @@ class _SchedEntry:
         except Exception:
             self.version = 0
         self.updated_at = str(d.get("updated_at", "") or "")
+        self.post_case_size = str(d.get("post_case_size", "") or "")
+        self.post_department = str(d.get("post_department", "") or "")
         self._extra = {k: v for k, v in d.items() if k not in known_keys}
+        if not self.post_case_size and isinstance(self._extra, dict):
+            self.post_case_size = str(self._extra.get("post_case_size", "") or "")
+        if not self.post_department and isinstance(self._extra, dict):
+            self.post_department = str(self._extra.get("post_department", "") or "")
 
     def uid(self) -> str:
         return f"{self.or_room}|{self.hn}|{self.time}|{self.date}"
@@ -289,6 +307,8 @@ class _SchedEntry:
             "returning_started_at": self.returning_started_at,
             "version": int(self.version or 0),
             "updated_at": self.updated_at,
+            "post_case_size": self.post_case_size,
+            "post_department": self.post_department,
         }
         payload.update(self._extra)
         return payload
@@ -691,7 +711,39 @@ class PostOpDialog(QtWidgets.QDialog):
         self.circulate.setEditText(entry.circulate)
         grid.addWidget(self.circulate, 1, 3)
 
+        # --- New: Case Size & Department ---
+        self.cb_case_size = QtWidgets.QComboBox(self)
+        self.cb_case_size.addItems(["— เลือก —"] + CASE_SIZES)
+
+        self.cb_department = QtWidgets.QComboBox(self)
+        self.cb_department.addItems(["— เลือก —"] + DEPARTMENTS_THAI)
+
         row = 2
+        grid.addWidget(QtWidgets.QLabel("ขนาดเคส", self), row, 0)
+        grid.addWidget(self.cb_case_size, row, 1)
+        grid.addWidget(QtWidgets.QLabel("แผนก", self), row, 2)
+        grid.addWidget(self.cb_department, row, 3)
+        row += 1
+
+        def _select_if_found(combo: QtWidgets.QComboBox, text: str):
+            if not text:
+                return
+            idx = combo.findText(text, QtCore.Qt.MatchFixedString)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+
+        old_case_size = None
+        old_department = None
+        if hasattr(self.entry, "_extra") and isinstance(self.entry._extra, dict):
+            old_case_size = self.entry._extra.get("post_case_size") or getattr(self.entry, "post_case_size", None)
+            old_department = self.entry._extra.get("post_department") or getattr(self.entry, "post_department", None)
+        else:
+            old_case_size = getattr(self.entry, "post_case_size", None)
+            old_department = getattr(self.entry, "post_department", None)
+
+        _select_if_found(self.cb_case_size, (old_case_size or "").strip())
+        _select_if_found(self.cb_department, (old_department or "").strip())
+
         op_label = QtWidgets.QLabel("Operation (หลังผ่าตัด)")
         grid.addWidget(op_label, row, 0, 1, 4)
         row += 1
@@ -724,6 +776,14 @@ class PostOpDialog(QtWidgets.QDialog):
         btn.clicked.connect(self.accept)
         layout.addWidget(btn, 0, QtCore.Qt.AlignRight)
 
+    def accept(self) -> None:
+        case_size = self.cb_case_size.currentText().strip()
+        dept = self.cb_department.currentText().strip()
+        if case_size in ("", "— เลือก —") or dept in ("", "— เลือก —"):
+            QtWidgets.QMessageBox.warning(self, "กรอกไม่ครบ", "กรุณาเลือก 'ขนาดเคส' และ 'แผนก'")
+            return
+        super().accept()
+
     def _refresh_dx_suggest(self, _items: list[str]):
         suggestions = diagnosis_suggestions(self.specialty_key, self.op_adder.items())
         self.dx_adder.set_suggestions(suggestions)
@@ -736,6 +796,8 @@ class PostOpDialog(QtWidgets.QDialog):
             "circulate": self.circulate.currentText().strip(),
             "ops": self.op_adder.items(),
             "diags": self.dx_adder.items(),
+            "post_case_size": self.cb_case_size.currentText().strip(),
+            "post_department": self.cb_department.currentText().strip(),
         }
 
 class Card(QtWidgets.QFrame):
@@ -1955,6 +2017,23 @@ QCheckBox { color:#0f172a; }
         ops = values.get("ops") or []
         if ops and list(entry.ops or []) != ops:
             entry.ops = ops
+            changed = True
+
+        case_size = values.get("post_case_size", "")
+        department = values.get("post_department", "")
+        if getattr(entry, "post_case_size", "") != case_size:
+            entry.post_case_size = case_size
+            changed = True
+        if getattr(entry, "post_department", "") != department:
+            entry.post_department = department
+            changed = True
+        if not isinstance(entry._extra, dict):
+            entry._extra = {}
+        if entry._extra.get("post_case_size") != case_size:
+            entry._extra["post_case_size"] = case_size
+            changed = True
+        if entry._extra.get("post_department") != department:
+            entry._extra["post_department"] = department
             changed = True
 
         if not changed:
