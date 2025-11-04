@@ -150,13 +150,19 @@ OR_CHOICES     = ["OR1", "OR2", "OR3", "OR4", "OR5", "OR6", "OR8"]
 QUEUE_CHOICES  = ["0-1", "0-2", "0-3", "0-4", "0-5", "0-6", "0-7"]
 
 STATUS_OP_START = "กำลังผ่าตัด"
-STATUS_OP_END = "กำลังพักฟื้น"
+STATUS_RECOVERY = "กำลังพักฟื้น"
+STATUS_OP_END = STATUS_RECOVERY
 STATUS_RETURNING = "กำลังส่งกลับตึก"
 
+PULSE_STATUS: set[str] = {STATUS_OP_START, STATUS_RECOVERY}
+
+RECOVERY_DURATION_MIN = 60
+
 STATUS_COLORS = {
-    "รอผ่าตัด": "#fde047",
-    "กำลังผ่าตัด": "#ef4444",
-    "กำลังพักฟื้น": "#22c55e",
+    STATUS_OP_START: "#f97316",
+    STATUS_RECOVERY: "#38bdf8",
+    "รอผ่าตัด": "#facc15",
+    "ส่งกลับตึก": "#22c55e",
     "กำลังส่งกลับตึก": "#a855f7",
     "เลื่อนการผ่าตัด": "#64748b",
 }
@@ -1051,6 +1057,11 @@ class Main(QtWidgets.QWidget):
         self._tick = QtCore.QTimer(self); self._tick.timeout.connect(self._update_monitor_elapsed); self._tick.start(1000)
         self._pull = QtCore.QTimer(self); self._pull.timeout.connect(lambda: self._refresh(True)); self._pull.start(2000)
         self._sched_timer = QtCore.QTimer(self); self._sched_timer.timeout.connect(self._check_schedule_seq); self._sched_timer.start(1000)
+        # ตัวสลับข้อความสถานะทุก 5 วินาที
+        self._flip5s = False
+        self._statusTicker = QtCore.QTimer(self)
+        self._statusTicker.timeout.connect(self._tick_status_col)
+        self._statusTicker.start(5000)
         self._start_websocket()
 
     # ---------- Settings dialog ----------
@@ -1518,9 +1529,9 @@ QCheckBox { color:#0f172a; }
         )
         gs = self.card_sched.grid(); gs.setContentsMargins(0,0,0,0)
         self.tree_sched = QtWidgets.QTreeWidget()
-        self.tree_sched.setColumnCount(20)
+        self.tree_sched.setColumnCount(21)
         self.tree_sched.setHeaderLabels([
-            "บันทึก",
+            "สถานะ",
             "ช่วงเวลา",
             "OR/เวลา",
             "HN",
@@ -1540,13 +1551,14 @@ QCheckBox { color:#0f172a; }
             "จบ",
             "คิว",
             "ประเภทเคส",
+            "บันทึกหลังผ่าตัด",
         ])
         self.tree_sched.setUniformRowHeights(False)
         hdr = self.tree_sched.header()
         hdr.setStretchLastSection(False)
         hdr.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         hdr.setFixedHeight(42)
-        for i in range(20):
+        for i in range(21):
             hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
         self.tree_sched.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.tree_sched.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
@@ -1898,6 +1910,81 @@ QCheckBox { color:#0f172a; }
         if not (entry.ops or entry.diags):
             return True
         return False
+
+    def _dt_from_date_and_hm(self, date_str: str, hm: str):
+        try:
+            hm = (hm or "").strip()
+            if not hm or ":" not in hm:
+                return None
+            base = _parse_date(date_str) if date_str else None
+            if base is None:
+                base = datetime.now().date()
+            h, m = hm.split(":", 1)
+            return datetime(base.year, base.month, base.day, int(h), int(m), 0)
+        except Exception:
+            return None
+
+    def _status_countdown_text(self, entry: _SchedEntry) -> tuple[bool, str]:
+        now = datetime.now()
+        status = (entry.status or "").strip()
+        rec_start_extra = ""
+        try:
+            extra = getattr(entry, "_extra", {})
+            if isinstance(extra, dict):
+                rec_start_extra = str(extra.get("time_recovery_start") or "").strip()
+        except Exception:
+            rec_start_extra = ""
+
+        if status == STATUS_OP_START:
+            end_dt = self._dt_from_date_and_hm(entry.date, entry.time_end)
+            if end_dt:
+                remain = end_dt - now
+                flag = "เหลือ" if remain.total_seconds() >= 0 else "เกินเวลา"
+                return True, f"({flag} {_fmt_td(remain)} นาที)"
+            return False, ""
+
+        if status == STATUS_RECOVERY:
+            start_dt = None
+            if rec_start_extra:
+                start_dt = _parse_iso(rec_start_extra)
+            if start_dt is None and entry.time_end:
+                start_dt = self._dt_from_date_and_hm(entry.date, entry.time_end)
+            if start_dt:
+                end_recovery = start_dt + timedelta(minutes=RECOVERY_DURATION_MIN)
+                remain = end_recovery - now
+                flag = "เหลือ" if remain.total_seconds() >= 0 else "เกินเวลา"
+                return True, f"({flag} {_fmt_td(remain)} นาที)"
+            return False, ""
+
+        return False, ""
+
+    def _status_label_for_entry(self, entry: _SchedEntry, flip: bool) -> str:
+        has_countdown, time_txt = self._status_countdown_text(entry)
+        base = (entry.status or "รอผ่าตัด").strip() or "รอผ่าตัด"
+        if has_countdown and flip:
+            return time_txt or base
+        return base
+
+    def _tick_status_col(self):
+        self._flip5s = not getattr(self, "_flip5s", False)
+        tree = getattr(self, "tree_sched", None)
+        if tree is None:
+            return
+        tree.setUpdatesEnabled(False)
+        try:
+            for i in range(tree.topLevelItemCount()):
+                parent = tree.topLevelItem(i)
+                if parent is None:
+                    continue
+                for j in range(parent.childCount()):
+                    child = parent.child(j)
+                    entry = child.data(0, QtCore.Qt.UserRole)
+                    if isinstance(entry, _SchedEntry):
+                        text = self._status_label_for_entry(entry, self._flip5s)
+                        if child.text(0) != text:
+                            child.setText(0, text)
+        finally:
+            tree.setUpdatesEnabled(True)
 
     def _first_visible_item(self) -> QtWidgets.QTreeWidgetItem | None:
         return None
@@ -2490,7 +2577,7 @@ QCheckBox { color:#0f172a; }
 
                 for e in sorted(groups[orr], key=row_sort_key):
                     row = QtWidgets.QTreeWidgetItem([
-                        "",
+                        self._status_label_for_entry(e, False),
                         _period_label(e.period),
                         (e.time or "-"),
                         e.hn,
@@ -2508,14 +2595,20 @@ QCheckBox { color:#0f172a; }
                         (e.circulate or "-"),
                         (e.time_start or "-"),
                         (e.time_end or "-"),
-                        (str(e.queue) if str(getattr(e, "queue", "0")).isdigit() and int(getattr(e, "queue", "0")) > 0 else "ตามเวลา"),
+                        (
+                            str(e.queue)
+                            if str(getattr(e, "queue", "0")).isdigit()
+                            and int(getattr(e, "queue", "0")) > 0
+                            else "ตามเวลา"
+                        ),
                         (e.urgency or "Elective"),
+                        "",
                     ])
                     row.setData(0, QtCore.Qt.UserRole, e)
                     parent.addChild(row)
 
                     if self._incomplete(e):
-                        tree.setItemWidget(row, 0, self._make_postop_button(e.uid()))
+                        tree.setItemWidget(row, 20, self._make_postop_button(e.uid()))
         finally:
             tree.setUpdatesEnabled(True)
 
