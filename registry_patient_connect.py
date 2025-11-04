@@ -4467,8 +4467,21 @@ class Main(QtWidgets.QWidget):
                         or_time = f"{display_or} • {entry.time or 'TF'}"
                         doctor_display = show_doctor_with_dept(entry.doctor) if entry.doctor else ''
                         status_text = getattr(entry, 'status', '') or (entry.state or '') or '-'
-                        case_size_txt = getattr(entry, 'case_size', '') or '-'
-                        dept_txt = getattr(entry, 'dept', '') or '-'
+                        extra = entry._extra if isinstance(getattr(entry, '_extra', None), dict) else {}
+                        case_size_txt = (
+                            getattr(entry, 'case_size', '')
+                            or getattr(entry, 'post_case_size', '')
+                            or extra.get('post_case_size')
+                            or extra.get('case_size')
+                            or ''
+                        ) or '-'
+                        dept_txt = (
+                            getattr(entry, 'dept', '')
+                            or getattr(entry, 'post_department', '')
+                            or extra.get('post_department')
+                            or extra.get('dept')
+                            or ''
+                        ) or '-'
                         row = QtWidgets.QTreeWidgetItem([
                             or_time,
                             entry.hn or '-',

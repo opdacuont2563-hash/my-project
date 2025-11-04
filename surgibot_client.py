@@ -773,22 +773,16 @@ class PostOpDialog(QtWidgets.QDialog):
 
         btn = QtWidgets.QPushButton("💾 บันทึกหลังผ่าตัด")
         btn.setProperty("variant", "primary")
-        btn.clicked.connect(self.accept)
+        btn.clicked.connect(self._on_save_clicked)
         layout.addWidget(btn, 0, QtCore.Qt.AlignRight)
 
-    def accept(self) -> None:
+    def _collect_values(self) -> Dict:
         case_size = self.cb_case_size.currentText().strip()
         dept = self.cb_department.currentText().strip()
-        if case_size in ("", "— เลือก —") or dept in ("", "— เลือก —"):
-            QtWidgets.QMessageBox.warning(self, "กรอกไม่ครบ", "กรุณาเลือก 'ขนาดเคส' และ 'แผนก'")
-            return
-        super().accept()
-
-    def _refresh_dx_suggest(self, _items: list[str]):
-        suggestions = diagnosis_suggestions(self.specialty_key, self.op_adder.items())
-        self.dx_adder.set_suggestions(suggestions)
-
-    def values(self) -> Dict:
+        if case_size in ("", "— เลือก —"):
+            case_size = ""
+        if dept in ("", "— เลือก —"):
+            dept = ""
         return {
             "assist1": self.assist1.currentText().strip(),
             "assist2": self.assist2.currentText().strip(),
@@ -796,9 +790,57 @@ class PostOpDialog(QtWidgets.QDialog):
             "circulate": self.circulate.currentText().strip(),
             "ops": self.op_adder.items(),
             "diags": self.dx_adder.items(),
-            "post_case_size": self.cb_case_size.currentText().strip(),
-            "post_department": self.cb_department.currentText().strip(),
+            "post_case_size": case_size,
+            "post_department": dept,
         }
+
+    def _on_save_clicked(self) -> None:
+        values = self._collect_values()
+        case_size = values.get("post_case_size", "")
+        dept = values.get("post_department", "")
+        if not case_size or not dept:
+            QtWidgets.QMessageBox.warning(self, "กรอกไม่ครบ", "กรุณาเลือก 'ขนาดเคส' และ 'แผนก'")
+            return
+
+        setattr(self.entry, "case_size", case_size)
+        setattr(self.entry, "dept", dept)
+        setattr(self.entry, "post_case_size", case_size)
+        setattr(self.entry, "post_department", dept)
+
+        if not hasattr(self.entry, "_extra") or not isinstance(self.entry._extra, dict):
+            self.entry._extra = {}
+        self.entry._extra["case_size"] = case_size
+        self.entry._extra["dept"] = dept
+        self.entry._extra["post_case_size"] = case_size
+        self.entry._extra["post_department"] = dept
+
+        parent = self.parent()
+        if parent is not None:
+            try:
+                sched = getattr(parent, "sched", None)
+                if sched is not None:
+                    sched.touch_entry(self.entry)
+            except Exception:
+                pass
+            try:
+                if hasattr(parent, "_render_schedule_tree"):
+                    parent._render_schedule_tree()
+                elif hasattr(parent, "_render_tree2"):
+                    parent._render_tree2()
+            except Exception:
+                pass
+
+        self._cached_values = values
+        super().accept()
+
+    def _refresh_dx_suggest(self, _items: list[str]):
+        suggestions = diagnosis_suggestions(self.specialty_key, self.op_adder.items())
+        self.dx_adder.set_suggestions(suggestions)
+
+    def values(self) -> Dict:
+        if hasattr(self, "_cached_values"):
+            return dict(self._cached_values)
+        return self._collect_values()
 
 class Card(QtWidgets.QFrame):
     def __init__(self, title="", parent=None):
@@ -2021,6 +2063,12 @@ QCheckBox { color:#0f172a; }
 
         case_size = values.get("post_case_size", "")
         department = values.get("post_department", "")
+        if getattr(entry, "case_size", "") != case_size:
+            entry.case_size = case_size
+            changed = True
+        if getattr(entry, "dept", "") != department:
+            entry.dept = department
+            changed = True
         if getattr(entry, "post_case_size", "") != case_size:
             entry.post_case_size = case_size
             changed = True
@@ -2035,6 +2083,12 @@ QCheckBox { color:#0f172a; }
         if entry._extra.get("post_department") != department:
             entry._extra["post_department"] = department
             changed = True
+        if entry._extra.get("case_size") != case_size:
+            entry._extra["case_size"] = case_size
+            changed = True
+        if entry._extra.get("dept") != department:
+            entry._extra["dept"] = department
+            changed = True
 
         if not changed:
             return
@@ -2042,6 +2096,10 @@ QCheckBox { color:#0f172a; }
         entry.version = int(entry.version or 0) + 1
         entry.updated_at = datetime.now().isoformat()
         self.sched.touch_entry(entry)
+        try:
+            self.sched._save()
+        except Exception:
+            pass
         self._render_schedule_tree()
         self._flash_row_by_uid(entry.uid())
         self.toast.show_toast("บันทึกหลังผ่าตัดเรียบร้อย")
@@ -2885,6 +2943,22 @@ QCheckBox { color:#0f172a; }
                 self._apply_or_expand_state(parent)
 
                 for e in sorted(groups[orr], key=row_sort_key):
+                    extra = e._extra if isinstance(getattr(e, "_extra", None), dict) else {}
+                    case_size_txt = (
+                        e.case_size
+                        or getattr(e, "post_case_size", "")
+                        or extra.get("post_case_size")
+                        or extra.get("case_size")
+                        or ""
+                    )
+                    dept_txt = (
+                        e.dept
+                        or getattr(e, "post_department", "")
+                        or extra.get("post_department")
+                        or extra.get("dept")
+                        or ""
+                    )
+
                     row = QtWidgets.QTreeWidgetItem([
                         self._status_label_for_entry(e, False),
                         _period_label(e.period),
@@ -2896,8 +2970,8 @@ QCheckBox { color:#0f172a; }
                         (", ".join(e.ops) if getattr(e, "ops", None) else "-"),
                         (e.doctor or "-"),
                         (e.ward or "-"),
-                        (e.case_size or "-"),
-                        (e.dept or "-"),
+                        (case_size_txt or "-"),
+                        (dept_txt or "-"),
                         (e.assist1 or "-"),
                         (e.assist2 or "-"),
                         (e.scrub or "-"),
