@@ -1057,11 +1057,11 @@ class Main(QtWidgets.QWidget):
         self._tick = QtCore.QTimer(self); self._tick.timeout.connect(self._update_monitor_elapsed); self._tick.start(1000)
         self._pull = QtCore.QTimer(self); self._pull.timeout.connect(lambda: self._refresh(True)); self._pull.start(2000)
         self._sched_timer = QtCore.QTimer(self); self._sched_timer.timeout.connect(self._check_schedule_seq); self._sched_timer.start(1000)
-        # ตัวสลับข้อความสถานะทุก 5 วินาที
+        # ตัวสลับข้อความสถานะทุก 3 วินาที
         self._flip5s = False
         self._statusTicker = QtCore.QTimer(self)
         self._statusTicker.timeout.connect(self._tick_status_col)
-        self._statusTicker.start(5000)
+        self._statusTicker.start(3000)
         self._start_websocket()
 
     # ---------- Settings dialog ----------
@@ -1924,6 +1924,27 @@ QCheckBox { color:#0f172a; }
         except Exception:
             return None
 
+    def _monitor_row_for_hn(self, hn: str) -> dict | None:
+        key = str(hn or "").strip()
+        if not key:
+            return None
+        best_row: dict | None = None
+        best_ts: datetime | None = None
+        for row in self.rows_cache:
+            row_hn = str(row.get("hn_full") or row.get("id") or "").strip()
+            if row_hn != key:
+                continue
+            ts = row.get("_ts")
+            if ts is None:
+                ts = _parse_iso(row.get("timestamp"))
+            if isinstance(ts, datetime):
+                if best_ts is None or ts >= best_ts:
+                    best_ts = ts
+                    best_row = row
+            elif best_row is None:
+                best_row = row
+        return best_row
+
     def _status_countdown_text(self, entry: _SchedEntry) -> tuple[bool, str]:
         now = datetime.now()
         status = (entry.status or "").strip()
@@ -1936,7 +1957,17 @@ QCheckBox { color:#0f172a; }
             rec_start_extra = ""
 
         if status == STATUS_OP_START:
-            end_dt = self._dt_from_date_and_hm(entry.date, entry.time_end)
+            end_dt = None
+            monitor_row = self._monitor_row_for_hn(entry.hn)
+            if monitor_row:
+                ts_val = monitor_row.get("_ts")
+                if not isinstance(ts_val, datetime):
+                    ts_val = _parse_iso(monitor_row.get("timestamp"))
+                eta_val = monitor_row.get("eta_minutes")
+                if isinstance(ts_val, datetime) and isinstance(eta_val, int):
+                    end_dt = ts_val + timedelta(minutes=int(eta_val))
+            if end_dt is None:
+                end_dt = self._dt_from_date_and_hm(entry.date, entry.time_end)
             if end_dt:
                 remain = end_dt - now
                 flag = "เหลือ" if remain.total_seconds() >= 0 else "เกินเวลา"

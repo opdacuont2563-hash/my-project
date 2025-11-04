@@ -2123,6 +2123,7 @@ class Main(QtWidgets.QWidget):
         self.tray.show()
 
         self._last_status_by_hn: dict[str, str] = {}
+        self._monitor_meta_by_hn: dict[str, tuple[Optional[datetime], Optional[int]]] = {}
         self._runner_status_cache: Dict[str, dict] = {}
         self._last_runner_user: str = ""
         self._runner_finished_sent: Set[str] = set()
@@ -2736,6 +2737,7 @@ class Main(QtWidgets.QWidget):
 
     def _rebuild_table(self, rows):
         self.rows_cache = rows;
+        self._monitor_meta_by_hn = {}
         self.table.setRowCount(0)
         if not rows:
             self.table.setRowCount(1);
@@ -2759,6 +2761,16 @@ class Main(QtWidgets.QWidget):
             ts = _parse_iso(r.get("timestamp"));
             txt = ""
             if ts: txt = _fmt_td(datetime.now() - ts)
+
+            hn_key = str(r.get("hn_full") or r.get("id") or "").strip()
+            eta_val = r.get("eta_minutes")
+            eta_int: Optional[int]
+            try:
+                eta_int = int(eta_val) if eta_val not in (None, "") else None
+            except Exception:
+                eta_int = None
+            if hn_key:
+                self._monitor_meta_by_hn[hn_key] = (ts, eta_int)
             self.table.setItem(i, 3, QtWidgets.QTableWidgetItem(txt))
         # ให้ Result tree รีเฟรชเงื่อนไขแสดงผลด้วย เมื่อ monitor เปลี่ยน
         self._render_tree2()
@@ -3933,6 +3945,38 @@ class Main(QtWidgets.QWidget):
             if changed:
                 self.sched._save()
 
+    def _monitor_info_for_hn(self, hn: str) -> tuple[Optional[datetime], Optional[int]]:
+        key = str(hn or "").strip()
+        if not key:
+            return (None, None)
+        info = self._monitor_meta_by_hn.get(key)
+        if info is not None:
+            return info
+
+        best_ts: Optional[datetime] = None
+        eta_val: Optional[int] = None
+        for row in self.rows_cache:
+            row_hn = str(row.get("hn_full") or row.get("id") or "").strip()
+            if row_hn != key:
+                continue
+            ts = _parse_iso(row.get("timestamp"))
+            if ts is not None and (best_ts is None or ts >= best_ts):
+                best_ts = ts
+                eta_candidate = row.get("eta_minutes")
+                try:
+                    eta_val = int(eta_candidate) if eta_candidate not in (None, "") else None
+                except Exception:
+                    eta_val = None
+            elif best_ts is None:
+                eta_candidate = row.get("eta_minutes")
+                try:
+                    eta_val = int(eta_candidate) if eta_candidate not in (None, "") else eta_val
+                except Exception:
+                    pass
+        if key and (best_ts is not None or eta_val is not None):
+            self._monitor_meta_by_hn[key] = (best_ts, eta_val)
+        return self._monitor_meta_by_hn.get(key, (None, None))
+
     def _is_entry_completed(self, e: ScheduleEntry) -> bool:
         """ตรวจว่ารายการถูกเติมข้อมูลหลังผ่าตัดครบถ้วนพอสำหรับการปิดเคส"""
         return _is_postop_complete_entry(e)
@@ -4199,10 +4243,18 @@ class Main(QtWidgets.QWidget):
                             alt_fn = None
 
                             if monitor_status == STATUS_OP_START:
-                                end_txt = parse_time_hhmm_or_tf(getattr(entry, 'time_end', '') or '')
-                                end_dt = _hhmm_on_base_date(end_txt, base_date)
+                                mon_ts, mon_eta = self._monitor_info_for_hn(entry.hn)
+                                end_dt: Optional[datetime] = None
+                                if mon_ts is not None and mon_eta is not None:
+                                    try:
+                                        end_dt = mon_ts + timedelta(minutes=int(mon_eta))
+                                    except Exception:
+                                        end_dt = None
+                                if end_dt is None:
+                                    end_txt = parse_time_hhmm_or_tf(getattr(entry, 'time_end', '') or '')
+                                    end_dt = _hhmm_on_base_date(end_txt, base_date)
 
-                                if end_dt:
+                                if end_dt is not None:
 
                                     def _alt_op():
                                         now = datetime.now()
@@ -4239,7 +4291,7 @@ class Main(QtWidgets.QWidget):
                                 color,
                                 pulse=(monitor_status in PULSE_STATUS),
                                 alt_fn=alt_fn,
-                                alt_interval_ms=2000,
+                                alt_interval_ms=3000,
                             )
 
                             cell = QtWidgets.QWidget()
