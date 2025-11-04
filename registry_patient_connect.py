@@ -4,7 +4,7 @@
 """
 import os, sys, json, argparse, csv, base64, secrets, hashlib, unicodedata, re
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Set, Union
+from typing import List, Optional, Tuple, Dict, Set, Union, Callable
 from datetime import datetime, timedelta, time as dtime, date
 from concurrent.futures import ThreadPoolExecutor
 
@@ -628,7 +628,7 @@ class StatusChipWidget(QtWidgets.QWidget):
         text: str,
         color: str,
         pulse: bool = False,
-        alt_fn: callable | None = None,
+        alt_fn: Optional[Callable[..., str]] = None,
         alt_interval_ms: int = 2000,
         parent=None,
     ):
