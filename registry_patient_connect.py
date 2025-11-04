@@ -393,17 +393,24 @@ API_LIST = "/api/list";
 API_LIST_FULL = "/api/list_full";
 API_WS = "/api/ws"
 
+STATUS_OP_START = "กำลังผ่าตัด"
+STATUS_RECOVERY = "กำลังพักฟื้น"
+STATUS_RETURNING = "กำลังส่งกลับตึก"
+
 STATUS_COLORS = {
-    "รอผ่าตัด": "#fde047", "กำลังผ่าตัด": "#ef4444", "กำลังพักฟื้น": "#22c55e",
-    "กำลังส่งกลับตึก": "#a855f7", "เลื่อนการผ่าตัด": "#64748b",
+    STATUS_OP_START: "#f97316",
+    STATUS_RECOVERY: "#38bdf8",
+    "รอผ่าตัด": "#facc15",
+    "ส่งกลับตึก": "#22c55e",
+    STATUS_RETURNING: "#22c55e",
+    "เลื่อนการผ่าตัด": "#64748b",
 }
-PULSE_STATUS = {"กำลังผ่าตัด", "กำลังพักฟื้น", "กำลังส่งกลับตึก"}
+PULSE_STATUS = {STATUS_OP_START, STATUS_RECOVERY}
+RECOVERY_DURATION_MIN = 60
 DEFAULT_OR_ROOMS = ["OR1", "OR2", "OR3", "OR4", "OR5", "OR6", "OR8"]
 
 # --- สถานะจาก monitor ที่ใช้จับเวลา / auto-complete ---
-STATUS_OP_START = "กำลังผ่าตัด"
-STATUS_OP_END = "กำลังพักฟื้น"
-STATUS_RETURNING = "กำลังส่งกลับตึก"
+# NOTE: STATUS_OP_START / STATUS_RECOVERY / STATUS_RETURNING ประกาศด้านบน
 
 WARD_LIST = [
     "— กรุณาเลือก —",
@@ -616,39 +623,101 @@ class SweetAlert:
 
 
 class StatusChipWidget(QtWidgets.QWidget):
-    def __init__(self, text: str, color: str, pulse: bool = False, parent=None):
+    def __init__(
+        self,
+        text: str,
+        color: str,
+        pulse: bool = False,
+        alt_fn: callable | None = None,
+        alt_interval_ms: int = 2000,
+        parent=None,
+    ):
         super().__init__(parent)
-        self._text = text;
-        self._color = color;
+        self._text_primary = text
+        self._text_display = text
+        self._color = color
         self._pulse = pulse
+        self._alt_fn = alt_fn
+        self._show_primary = True
+        self._alt_interval_ms = max(800, int(alt_interval_ms or 2000))
+
         if pulse:
-            self.eff = QtWidgets.QGraphicsOpacityEffect(self);
+            self.eff = QtWidgets.QGraphicsOpacityEffect(self)
             self.setGraphicsEffect(self.eff)
             self.anim = QtCore.QPropertyAnimation(self.eff, b"opacity", self)
-            self.anim.setDuration(1200);
-            self.anim.setStartValue(0.5);
+            self.anim.setDuration(1200)
+            self.anim.setStartValue(0.5)
             self.anim.setEndValue(1.0)
-            self.anim.setEasingCurve(QtCore.QEasingCurve.InOutQuad);
-            self.anim.setLoopCount(-1);
+            self.anim.setEasingCurve(QtCore.QEasingCurve.InOutQuad)
+            self.anim.setLoopCount(-1)
             self.anim.start()
 
-    def minimumSizeHint(self):
+        self._tick = QtCore.QTimer(self)
+        self._tick.setInterval(1000)
+        self._tick.timeout.connect(self._on_tick)
+
+        self._swap = QtCore.QTimer(self)
+        self._swap.setInterval(self._alt_interval_ms)
+        self._swap.timeout.connect(self._on_swap)
+
+        if self._alt_fn:
+            self._tick.start()
+            self._swap.start()
+
+        self.setMinimumHeight(28)
+
+    def _on_tick(self):
+        if not self._alt_fn or self._show_primary:
+            return
+        try:
+            self._text_display = str(self._alt_fn()) or "-"
+        except Exception:
+            self._text_display = "-"
+        self.update()
+
+    def _on_swap(self):
+        if not self._alt_fn:
+            return
+        self._show_primary = not self._show_primary
+        if self._show_primary:
+            self._text_display = self._text_primary
+        else:
+            try:
+                self._text_display = str(self._alt_fn()) or "-"
+            except Exception:
+                self._text_display = "-"
+        self.update()
+
+    def sizeHint(self):
         fm = QtGui.QFontMetrics(self.font())
-        w = fm.horizontalAdvance(self._text) + 22 + 16
+        alt_sample = ""
+        if self._alt_fn:
+            try:
+                alt_sample = str(self._alt_fn()) or ""
+            except Exception:
+                pass
+        w = max(
+            fm.horizontalAdvance(self._text_primary),
+            fm.horizontalAdvance(alt_sample),
+        ) + 22 + 16
         h = fm.height() + 10
         return QtCore.QSize(w, h)
 
     def paintEvent(self, e):
-        p = QtGui.QPainter(self);
+        p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
         rect = self.rect().adjusted(2, 2, -2, -2)
-        bg = QtGui.QColor(self._color);
+        bg = QtGui.QColor(self._color)
         bg.setAlpha(205)
-        p.setPen(QtCore.Qt.NoPen);
+        p.setPen(QtCore.Qt.NoPen)
         p.setBrush(bg)
         p.drawRoundedRect(rect, 10, 10)
         p.setPen(QtGui.QColor("#ffffff"))
-        p.drawText(rect.adjusted(12, 0, -8, 0), QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, self._text)
+        p.drawText(
+            rect.adjusted(12, 0, -8, 0),
+            QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft,
+            self._text_display,
+        )
 
 
 class PeriodBadge(QtWidgets.QWidget):
@@ -1051,6 +1120,16 @@ def _fmt_td(td: timedelta) -> str:
     m = (total % 3600) // 60;
     s = total % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _hhmm_on_base_date(hhmm: str, base_date: date) -> datetime | None:
+    if not hhmm or hhmm == "TF" or not isinstance(base_date, date):
+        return None
+    try:
+        hh, mm = map(int, hhmm.split(":", 1))
+        return datetime.combine(base_date, dtime(hour=hh, minute=mm))
+    except Exception:
+        return None
 
 
 def _parse_iso(ts: str):
@@ -3837,7 +3916,7 @@ class Main(QtWidgets.QWidget):
                 if entry.state in {"scheduled", "in_or", "operation_ended", "postop_pending", ""}:
                     entry.state = "operation_started"
                     changed = True
-            elif status == STATUS_OP_END:
+            elif status == STATUS_RECOVERY:
                 self._set_time_end_if_empty(entry)
                 if entry.state in {"operation_started", "in_or", "scheduled", ""}:
                     entry.state = "operation_ended"
@@ -4114,9 +4193,55 @@ class Main(QtWidgets.QWidget):
                             row.setText(2, entry.name or '-')
 
                         monitor_status = self._last_status_by_hn.get(str(entry.hn).strip(), '')
+
                         if monitor_status:
                             color = STATUS_COLORS.get(monitor_status, '#64748b')
-                            chip = StatusChipWidget(monitor_status, color, pulse=(monitor_status in PULSE_STATUS))
+                            alt_fn = None
+
+                            if monitor_status == STATUS_OP_START:
+                                end_txt = parse_time_hhmm_or_tf(getattr(entry, 'time_end', '') or '')
+                                end_dt = _hhmm_on_base_date(end_txt, base_date)
+
+                                if end_dt:
+
+                                    def _alt_op():
+                                        now = datetime.now()
+                                        td = end_dt - now
+                                        if td.total_seconds() >= 0:
+                                            return f"(เหลือ {_fmt_td(td)} นาที)"
+                                        else:
+                                            return f"(เกินเวลา {_fmt_td(td)} นาที)"
+
+                                    alt_fn = _alt_op
+
+                            elif monitor_status == STATUS_RECOVERY:
+                                start_txt = parse_time_hhmm_or_tf(
+                                    getattr(entry, 'time_recovery_start', '')
+                                    or getattr(entry, 'time_end', '')
+                                    or ''
+                                )
+                                start_dt = _hhmm_on_base_date(start_txt, base_date)
+                                if start_dt:
+                                    end_dt = start_dt + timedelta(minutes=RECOVERY_DURATION_MIN)
+
+                                    def _alt_rec():
+                                        now = datetime.now()
+                                        td = end_dt - now
+                                        if td.total_seconds() >= 0:
+                                            return f"(เหลือ {_fmt_td(td)} นาที)"
+                                        else:
+                                            return f"(เกินเวลา {_fmt_td(td)} นาที)"
+
+                                    alt_fn = _alt_rec
+
+                            chip = StatusChipWidget(
+                                monitor_status,
+                                color,
+                                pulse=(monitor_status in PULSE_STATUS),
+                                alt_fn=alt_fn,
+                                alt_interval_ms=2000,
+                            )
+
                             cell = QtWidgets.QWidget()
                             lay = QtWidgets.QHBoxLayout(cell)
                             lay.setContentsMargins(0, 0, 0, 0)
