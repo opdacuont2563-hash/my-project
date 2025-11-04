@@ -628,7 +628,7 @@ class StatusChipWidget(QtWidgets.QWidget):
         text: str,
         color: str,
         pulse: bool = False,
-        alt_fn: Optional[Callable[..., str]] = None,
+        alt_fn: Optional[Callable[[], str]] = None,
         alt_interval_ms: int = 2000,
         parent=None,
     ):
@@ -652,10 +652,12 @@ class StatusChipWidget(QtWidgets.QWidget):
             self.anim.setLoopCount(-1)
             self.anim.start()
 
+        # อัปเดตตัวเลขทุก 1 วินาที
         self._tick = QtCore.QTimer(self)
         self._tick.setInterval(1000)
         self._tick.timeout.connect(self._on_tick)
 
+        # สลับข้อความ primary <-> alt
         self._swap = QtCore.QTimer(self)
         self._swap.setInterval(self._alt_interval_ms)
         self._swap.timeout.connect(self._on_swap)
@@ -690,15 +692,15 @@ class StatusChipWidget(QtWidgets.QWidget):
 
     def sizeHint(self):
         fm = QtGui.QFontMetrics(self.font())
-        alt_sample = ""
+        sample = ""
         if self._alt_fn:
             try:
-                alt_sample = str(self._alt_fn()) or ""
+                sample = str(self._alt_fn()) or ""
             except Exception:
                 pass
         w = max(
             fm.horizontalAdvance(self._text_primary),
-            fm.horizontalAdvance(alt_sample),
+            fm.horizontalAdvance(sample),
         ) + 22 + 16
         h = fm.height() + 10
         return QtCore.QSize(w, h)
@@ -2123,7 +2125,8 @@ class Main(QtWidgets.QWidget):
         self.tray.show()
 
         self._last_status_by_hn: dict[str, str] = {}
-        self._monitor_meta_by_hn: dict[str, tuple[Optional[datetime], Optional[int]]] = {}
+        self._status_ts_by_hn: Dict[str, datetime] = {}
+        self._eta_by_hn: Dict[str, Optional[int]] = {}
         self._runner_status_cache: Dict[str, dict] = {}
         self._last_runner_user: str = ""
         self._runner_finished_sent: Set[str] = set()
@@ -2737,7 +2740,8 @@ class Main(QtWidgets.QWidget):
 
     def _rebuild_table(self, rows):
         self.rows_cache = rows;
-        self._monitor_meta_by_hn = {}
+        self._status_ts_by_hn.clear()
+        self._eta_by_hn.clear()
         self.table.setRowCount(0)
         if not rows:
             self.table.setRowCount(1);
@@ -2770,7 +2774,9 @@ class Main(QtWidgets.QWidget):
             except Exception:
                 eta_int = None
             if hn_key:
-                self._monitor_meta_by_hn[hn_key] = (ts, eta_int)
+                if ts is not None:
+                    self._status_ts_by_hn[hn_key] = ts
+                self._eta_by_hn[hn_key] = eta_int
             self.table.setItem(i, 3, QtWidgets.QTableWidgetItem(txt))
         # ให้ Result tree รีเฟรชเงื่อนไขแสดงผลด้วย เมื่อ monitor เปลี่ยน
         self._render_tree2()
@@ -3913,6 +3919,25 @@ class Main(QtWidgets.QWidget):
             if not status:
                 continue
 
+            eta = row.get("eta_minutes")
+            if isinstance(eta, str) and eta.isdigit():
+                eta_val: Optional[int] = int(eta)
+            elif isinstance(eta, int):
+                eta_val = eta
+            else:
+                eta_val = None
+            self._eta_by_hn[hn] = eta_val
+
+            ts_raw = (
+                row.get("timestamp")
+                or row.get("updated_at")
+                or row.get("created_at")
+                or row.get("time")
+            )
+            ts = _parse_iso(ts_raw) if ts_raw else None
+            if ts:
+                self._status_ts_by_hn[hn] = ts
+
             prev = self._last_status_by_hn.get(hn)
             if prev == status:
                 continue
@@ -3949,9 +3974,11 @@ class Main(QtWidgets.QWidget):
         key = str(hn or "").strip()
         if not key:
             return (None, None)
-        info = self._monitor_meta_by_hn.get(key)
-        if info is not None:
-            return info
+
+        ts = self._status_ts_by_hn.get(key)
+        eta = self._eta_by_hn.get(key) if key in self._eta_by_hn else None
+        if ts is not None or key in self._eta_by_hn:
+            return (ts, eta)
 
         best_ts: Optional[datetime] = None
         eta_val: Optional[int] = None
@@ -3959,9 +3986,15 @@ class Main(QtWidgets.QWidget):
             row_hn = str(row.get("hn_full") or row.get("id") or "").strip()
             if row_hn != key:
                 continue
-            ts = _parse_iso(row.get("timestamp"))
-            if ts is not None and (best_ts is None or ts >= best_ts):
-                best_ts = ts
+            ts_candidate = (
+                row.get("timestamp")
+                or row.get("updated_at")
+                or row.get("created_at")
+                or row.get("time")
+            )
+            ts_parsed = _parse_iso(ts_candidate) if ts_candidate else None
+            if ts_parsed is not None and (best_ts is None or ts_parsed >= best_ts):
+                best_ts = ts_parsed
                 eta_candidate = row.get("eta_minutes")
                 try:
                     eta_val = int(eta_candidate) if eta_candidate not in (None, "") else None
@@ -3973,9 +4006,13 @@ class Main(QtWidgets.QWidget):
                     eta_val = int(eta_candidate) if eta_candidate not in (None, "") else eta_val
                 except Exception:
                     pass
+
+        if best_ts is not None:
+            self._status_ts_by_hn[key] = best_ts
         if key and (best_ts is not None or eta_val is not None):
-            self._monitor_meta_by_hn[key] = (best_ts, eta_val)
-        return self._monitor_meta_by_hn.get(key, (None, None))
+            self._eta_by_hn[key] = eta_val
+
+        return (self._status_ts_by_hn.get(key), self._eta_by_hn.get(key))
 
     def _is_entry_completed(self, e: ScheduleEntry) -> bool:
         """ตรวจว่ารายการถูกเติมข้อมูลหลังผ่าตัดครบถ้วนพอสำหรับการปิดเคส"""
@@ -4241,57 +4278,44 @@ class Main(QtWidgets.QWidget):
                         if monitor_status:
                             color = STATUS_COLORS.get(monitor_status, '#64748b')
                             alt_fn = None
+                            hn_key = str(entry.hn).strip()
 
                             if monitor_status == STATUS_OP_START:
-                                mon_ts, mon_eta = self._monitor_info_for_hn(entry.hn)
-                                end_dt: Optional[datetime] = None
-                                if mon_ts is not None and mon_eta is not None:
-                                    try:
-                                        end_dt = mon_ts + timedelta(minutes=int(mon_eta))
-                                    except Exception:
-                                        end_dt = None
-                                if end_dt is None:
-                                    end_txt = parse_time_hhmm_or_tf(getattr(entry, 'time_end', '') or '')
-                                    end_dt = _hhmm_on_base_date(end_txt, base_date)
+                                mon_ts, mon_eta = self._monitor_info_for_hn(hn_key)
+                                if mon_ts is not None and isinstance(mon_eta, int):
 
-                                if end_dt is not None:
-
-                                    def _alt_op():
+                                    def _alt_text(hn_key: str = hn_key) -> str:
                                         now = datetime.now()
-                                        td = end_dt - now
-                                        if td.total_seconds() >= 0:
-                                            return f"(เหลือ {_fmt_td(td)} นาที)"
-                                        else:
-                                            return f"(เกินเวลา {_fmt_td(td)} นาที)"
+                                        ts_local, eta_local = self._monitor_info_for_hn(hn_key)
+                                        if ts_local is None or not isinstance(eta_local, int):
+                                            return "-"
+                                        remain = ts_local + timedelta(minutes=int(eta_local)) - now
+                                        flag = "เหลือ" if remain.total_seconds() >= 0 else "เกินเวลา"
+                                        return f"({flag} {_fmt_td(remain)} นาที)"
 
-                                    alt_fn = _alt_op
+                                    alt_fn = _alt_text
 
                             elif monitor_status == STATUS_RECOVERY:
-                                start_txt = parse_time_hhmm_or_tf(
-                                    getattr(entry, 'time_recovery_start', '')
-                                    or getattr(entry, 'time_end', '')
-                                    or ''
-                                )
-                                start_dt = _hhmm_on_base_date(start_txt, base_date)
-                                if start_dt:
-                                    end_dt = start_dt + timedelta(minutes=RECOVERY_DURATION_MIN)
+                                mon_ts, _ = self._monitor_info_for_hn(hn_key)
+                                if mon_ts is not None:
 
-                                    def _alt_rec():
+                                    def _alt_text_rec(hn_key: str = hn_key) -> str:
                                         now = datetime.now()
-                                        td = end_dt - now
-                                        if td.total_seconds() >= 0:
-                                            return f"(เหลือ {_fmt_td(td)} นาที)"
-                                        else:
-                                            return f"(เกินเวลา {_fmt_td(td)} นาที)"
+                                        ts_local, _ = self._monitor_info_for_hn(hn_key)
+                                        if ts_local is None:
+                                            return "-"
+                                        remain = ts_local + timedelta(minutes=RECOVERY_DURATION_MIN) - now
+                                        flag = "เหลือ" if remain.total_seconds() >= 0 else "เกินเวลา"
+                                        return f"({flag} {_fmt_td(remain)} นาที)"
 
-                                    alt_fn = _alt_rec
+                                    alt_fn = _alt_text_rec
 
                             chip = StatusChipWidget(
                                 monitor_status,
                                 color,
                                 pulse=(monitor_status in PULSE_STATUS),
                                 alt_fn=alt_fn,
-                                alt_interval_ms=3000,
+                                alt_interval_ms=2000,
                             )
 
                             cell = QtWidgets.QWidget()
