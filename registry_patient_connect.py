@@ -2,7 +2,7 @@
 """
 (ปรับปรุงจาก registry_patient_connect.py — แก้ strike-through logic & ปรับสไตล์ตาราง)
 """
-import os, sys, json, argparse, csv, base64, secrets, hashlib, unicodedata, re
+import os, sys, json, argparse, csv, base64, secrets, hashlib, unicodedata, re, sqlite3
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Set, Union, Callable
 from datetime import datetime, timedelta, time as dtime, date
@@ -407,6 +407,237 @@ STATUS_COLORS = {
 }
 PULSE_STATUS = {STATUS_OP_START, STATUS_RECOVERY}
 RECOVERY_DURATION_MIN = 60
+
+WORKING_START = dtime(8, 30)
+WORKING_END = dtime(16, 30)
+
+
+def in_working_hours(dt: datetime | None = None) -> bool:
+    now = dt or datetime.now()
+    return WORKING_START <= now.time() < WORKING_END
+
+
+def next_deadline(dt: datetime | None = None) -> datetime:
+    now = dt or datetime.now()
+    if in_working_hours(now):
+        return datetime.combine(now.date(), WORKING_END)
+    if now.time() >= WORKING_END:
+        return datetime.combine(now.date() + timedelta(days=1), WORKING_START)
+    return datetime.combine(now.date(), WORKING_START)
+
+
+DB_PATH = Path.cwd() / "ornbh_postop.sqlite3"
+
+SCHEMA_SQL = """
+PRAGMA foreign_keys = ON;
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+
+CREATE TABLE IF NOT EXISTS postop_records (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  case_uid      TEXT UNIQUE,
+  hn            TEXT NOT NULL,
+  name          TEXT,
+  age           INTEGER,
+  or_room       TEXT,
+  ward          TEXT,
+  dept          TEXT,
+  doctor        TEXT,
+  case_size     TEXT CHECK (case_size IN ('Major','Minor')),
+  assist1       TEXT NOT NULL,
+  assist2       TEXT,
+  scrub         TEXT NOT NULL,
+  circulate     TEXT NOT NULL,
+  ops_json      TEXT NOT NULL,
+  diags_json    TEXT NOT NULL,
+  status        TEXT,
+  urgency       TEXT,
+  time_start_dt TEXT,
+  time_end_dt   TEXT,
+  created_at    TEXT DEFAULT (datetime('now')),
+  updated_at    TEXT DEFAULT (datetime('now')),
+
+  in_hours INTEGER GENERATED ALWAYS AS (
+    CASE
+      WHEN time(time_start_dt) >= '08:30' AND time(time_start_dt) < '16:30' THEN 1
+      ELSE 0
+    END
+  ) STORED,
+
+  bucket TEXT GENERATED ALWAYS AS (
+    CASE
+      WHEN lower(urgency) = 'emergency' AND in_hours = 1 THEN 'emergency_in_hours'
+      WHEN lower(urgency) = 'emergency' AND in_hours = 0 THEN 'emergency_off_hours'
+      ELSE 'elective'
+    END
+  ) STORED
+);
+
+CREATE INDEX IF NOT EXISTS idx_postop_date    ON postop_records (date(time_start_dt));
+CREATE INDEX IF NOT EXISTS idx_postop_bucket  ON postop_records (bucket);
+CREATE INDEX IF NOT EXISTS idx_postop_hn      ON postop_records (hn);
+CREATE INDEX IF NOT EXISTS idx_postop_status  ON postop_records (status);
+
+CREATE VIEW IF NOT EXISTS view_elective AS
+  SELECT * FROM postop_records WHERE bucket = 'elective';
+CREATE VIEW IF NOT EXISTS view_emergency_in_hours AS
+  SELECT * FROM postop_records WHERE bucket = 'emergency_in_hours';
+CREATE VIEW IF NOT EXISTS view_emergency_off_hours AS
+  SELECT * FROM postop_records WHERE bucket = 'emergency_off_hours';
+"""
+
+
+def _db_conn():
+    con = sqlite3.connect(str(DB_PATH))
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    return con
+
+
+def _init_db_once():
+    con = _db_conn()
+    try:
+        con.executescript(SCHEMA_SQL)
+        con.commit()
+    finally:
+        con.close()
+
+
+def save_postop_entry(entry):
+    con = _db_conn()
+    try:
+        ops_json = json.dumps(getattr(entry, "ops", []) or [], ensure_ascii=False)
+        diags_json = json.dumps(getattr(entry, "diags", []) or [], ensure_ascii=False)
+
+        def _normalize_date(obj) -> date:
+            if isinstance(obj, datetime):
+                return obj.date()
+            if isinstance(obj, date):
+                return obj
+            if hasattr(obj, "toPython"):
+                try:
+                    return obj.toPython()
+                except Exception:
+                    pass
+            if isinstance(obj, str):
+                try:
+                    return datetime.fromisoformat(obj).date()
+                except Exception:
+                    pass
+            return datetime.now().date()
+
+        base_date = _normalize_date(getattr(entry, "date", datetime.now().date()))
+
+        def _to_iso(hm: str):
+            if not hm or ":" not in str(hm):
+                return None
+            try:
+                h, m = map(int, str(hm).split(":")[:2])
+                dt = datetime.combine(base_date, dtime(h, m))
+                return dt.isoformat(timespec="seconds")
+            except Exception:
+                return None
+
+        time_start_iso = _to_iso(getattr(entry, "time_start", ""))
+        time_end_iso = _to_iso(getattr(entry, "time_end", ""))
+
+        try:
+            age_val = int(str(getattr(entry, "age", 0) or 0))
+        except Exception:
+            age_val = 0
+
+        case_uid = getattr(entry, "case_uid", "")
+        if not case_uid:
+            case_uid = f"{getattr(entry, 'hn', '')}-{getattr(entry, 'or_room', '')}-{getattr(entry, 'time', '')}"
+
+        con.execute(
+            """
+      INSERT INTO postop_records (
+        case_uid, hn, name, age, or_room, ward, dept, doctor, case_size,
+        assist1, assist2, scrub, circulate, ops_json, diags_json,
+        status, urgency, time_start_dt, time_end_dt, updated_at
+      )
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(case_uid) DO UPDATE SET
+        hn=excluded.hn, name=excluded.name, age=excluded.age,
+        or_room=excluded.or_room, ward=excluded.ward, dept=excluded.dept,
+        doctor=excluded.doctor, case_size=excluded.case_size,
+        assist1=excluded.assist1, assist2=excluded.assist2,
+        scrub=excluded.scrub, circulate=excluded.circulate,
+        ops_json=excluded.ops_json, diags_json=excluded.diags_json,
+        status=excluded.status, urgency=excluded.urgency,
+        time_start_dt=excluded.time_start_dt, time_end_dt=excluded.time_end_dt,
+        updated_at=excluded.updated_at
+    """,
+            (
+                case_uid,
+                getattr(entry, "hn", ""),
+                getattr(entry, "name", ""),
+                age_val,
+                getattr(entry, "or_room", ""),
+                getattr(entry, "ward", ""),
+                getattr(entry, "dept", ""),
+                getattr(entry, "doctor", ""),
+                getattr(entry, "case_size", ""),
+                getattr(entry, "assist1", ""),
+                getattr(entry, "assist2", ""),
+                getattr(entry, "scrub", ""),
+                getattr(entry, "circulate", ""),
+                ops_json,
+                diags_json,
+                getattr(entry, "status", ""),
+                getattr(entry, "urgency", ""),
+                time_start_iso,
+                time_end_iso,
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def missing_required_fields(entry) -> list[str]:
+    missing: list[str] = []
+
+    def _blank(val) -> bool:
+        if val is None:
+            return True
+        text = str(val).strip()
+        return text == "" or text.startswith("—")
+
+    if _blank(getattr(entry, "assist1", "")):
+        missing.append("Assist 1")
+    if _blank(getattr(entry, "scrub", "")):
+        missing.append("Scrub")
+    if _blank(getattr(entry, "circulate", "")):
+        missing.append("Circulate")
+    ops_list = getattr(entry, "ops", None)
+    if not (ops_list and len(ops_list) > 0):
+        missing.append("Operation (อย่างน้อย 1)")
+    diags_list = getattr(entry, "diags", None)
+    if not (diags_list and len(diags_list) > 0):
+        missing.append("Diagnosis (อย่างน้อย 1)")
+    if _blank(getattr(entry, "dept", "")):
+        missing.append("แผนก")
+    if _blank(getattr(entry, "case_size", "")):
+        missing.append("ขนาดเคส (Major/Minor)")
+    if _blank(getattr(entry, "time_start", "")):
+        missing.append("เวลาเริ่มผ่าตัด")
+    if _blank(getattr(entry, "time_end", "")):
+        missing.append("เวลาจบผ่าตัด")
+    try:
+        ts = getattr(entry, "time_start", "")
+        te = getattr(entry, "time_end", "")
+        if ts and te:
+            hs, ms = map(int, str(ts).split(":")[:2])
+            he, me = map(int, str(te).split(":")[:2])
+            if (he, me) <= (hs, ms):
+                missing.append("เวลาเริ่ม/จบ ไม่สมเหตุผล")
+    except Exception:
+        missing.append("รูปแบบเวลาไม่ถูกต้อง")
+    return missing
 DEFAULT_OR_ROOMS = ["OR1", "OR2", "OR3", "OR4", "OR5", "OR6", "OR8"]
 
 # --- สถานะจาก monitor ที่ใช้จับเวลา / auto-complete ---
@@ -600,6 +831,10 @@ class SweetAlert:
     @staticmethod
     def warning(parent: QtWidgets.QWidget, title: str, text: str) -> None:
         QtWidgets.QMessageBox.warning(parent, title, text)
+
+    @staticmethod
+    def error(parent: QtWidgets.QWidget, title: str, text: str) -> None:
+        QtWidgets.QMessageBox.critical(parent, title, text)
 
     @staticmethod
     def confirm(parent: QtWidgets.QWidget, title: str, text: str) -> bool:
@@ -2176,6 +2411,9 @@ class Main(QtWidgets.QWidget):
         self.resize(1360, 900)
         apply_modern_theme(self)
         self._build_ui();
+        _init_db_once()
+        self._reminded_keys: Set[str] = set()
+        self._start_unsaved_reminder()
         self._load_settings();
         self._pdpa_gate();
         self._start_timers()
@@ -2477,6 +2715,12 @@ class Main(QtWidgets.QWidget):
         self.btn_undo_clear.setProperty("variant", "ghost")
         self.btn_undo_clear.setEnabled(False)
         import_bar.addWidget(self.btn_undo_clear, 0)
+        self.btn_commit = QtWidgets.QPushButton("ยืนยันและบันทึกลงฐานข้อมูล")
+        self.btn_commit.setStyleSheet(
+            "QPushButton{background:#16a34a;color:#fff;padding:8px 12px;border-radius:8px;font-weight:700}"
+        )
+        self.btn_commit.clicked.connect(self._on_commit_clicked)
+        import_bar.addWidget(self.btn_commit, 0)
         import_bar.addStretch(1)
         gr2.addLayout(import_bar, 1, 0, 1, 1)
         gr2.setRowStretch(0, 1)
@@ -4362,6 +4606,105 @@ class Main(QtWidgets.QWidget):
                 hbar.setValue(min(hpos, hbar.maximum()))
 
             QtCore.QTimer.singleShot(0, _restore_scroll)
+
+    def _current_entry_in_result(self):
+        item = self.tree2.currentItem()
+        if not item:
+            return None
+        idx = item.data(0, QtCore.Qt.UserRole + 1)
+        if idx is None:
+            return None
+        try:
+            idx_int = int(idx)
+        except Exception:
+            return None
+        if not (0 <= idx_int < len(self.sched.entries)):
+            return None
+        return self.sched.entries[idx_int]
+
+    def _on_commit_clicked(self):
+        entry = self._current_entry_in_result()
+        if not entry:
+            try:
+                SweetAlert.info(self, "ยังไม่ได้เลือกผู้ป่วย", "กรุณาเลือกแถวในตารางก่อน")
+            except Exception:
+                QtWidgets.QMessageBox.information(self, "ยังไม่ได้เลือกผู้ป่วย", "กรุณาเลือกแถวในตารางก่อน")
+            return
+
+        missing = missing_required_fields(entry)
+        if missing:
+            msg = "จำเป็นต้องกรอกให้ครบก่อนบันทึกจริง (ยกเว้น Assist 2)\n\n- " + "\n- ".join(missing)
+            try:
+                SweetAlert.warning(self, "ข้อมูลยังไม่ครบ", msg)
+            except Exception:
+                QtWidgets.QMessageBox.warning(self, "ข้อมูลยังไม่ครบ", msg)
+            try:
+                self._load_form_from_entry(entry)
+                self.tabs.setCurrentIndex(0)
+            except Exception:
+                pass
+            return
+
+        now = datetime.now()
+        dl = next_deadline(now)
+        remain_txt = _fmt_td(dl - now)
+        if in_working_hours(now):
+            note = f"โปรดตรวจทานให้เรียบร้อย — เดดไลน์บันทึกวันนี้ 16:30 (เหลือ {remain_txt})"
+        else:
+            note = f"นอกเวลาทำการ — ควรบันทึกก่อน {dl.strftime('%d/%m %H:%M')} (เหลือ {remain_txt})"
+        try:
+            SweetAlert.info(self, "ยืนยันการบันทึก", note)
+        except Exception:
+            QtWidgets.QMessageBox.information(self, "ยืนยันการบันทึก", note)
+
+        try:
+            save_postop_entry(entry)
+            entry.postop_completed = True
+            try:
+                self.sched._save()
+            except Exception:
+                pass
+            key = f"{getattr(entry, 'hn', '')}|{getattr(entry, 'case_uid', '')}"
+            self._reminded_keys.discard(key)
+            try:
+                self.result_banner.set_icon("✅")
+                self.result_banner.set_title("บันทึกลงฐานข้อมูลสำเร็จ")
+                self.result_banner.set_subtitle(
+                    f"HN {entry.hn} | OR {entry.or_room} | เวลา {entry.time_start or '-'}–{entry.time_end or '-'}"
+                )
+            except Exception:
+                pass
+            self._render_tree2()
+        except Exception as exc:
+            try:
+                SweetAlert.error(self, "บันทึกไม่สำเร็จ", str(exc))
+            except Exception:
+                QtWidgets.QMessageBox.critical(self, "บันทึกไม่สำเร็จ", str(exc))
+
+    def _start_unsaved_reminder(self):
+        self._unsaved_timer = QtCore.QTimer(self)
+        self._unsaved_timer.setInterval(7 * 60 * 1000)
+        self._unsaved_timer.timeout.connect(self._remind_unsaved_cases)
+        self._unsaved_timer.start()
+
+    def _remind_unsaved_cases(self):
+        now = datetime.now()
+        dl = next_deadline(now)
+        remain = dl - now
+        for entry in getattr(self.sched, "entries", []):
+            if getattr(entry, "time_end", "") and not getattr(entry, "postop_completed", False):
+                key = f"{getattr(entry, 'hn', '')}|{getattr(entry, 'case_uid', '')}"
+                if key in self._reminded_keys:
+                    continue
+                text = (
+                    f"HN {getattr(entry, 'hn', '')} OR {getattr(entry, 'or_room', '')}\n"
+                    f"ควรบันทึกก่อน {dl.strftime('%d/%m %H:%M')} (เหลือ {_fmt_td(remain)})"
+                )
+                try:
+                    SweetAlert.warning(self, "ยังไม่บันทึกฐานข้อมูล", text)
+                except Exception:
+                    QtWidgets.QMessageBox.warning(self, "ยังไม่บันทึกฐานข้อมูล", text)
+                self._reminded_keys.add(key)
 
     def _apply_queue_select(self, uid: str, new_q: int):
         target = None;
