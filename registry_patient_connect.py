@@ -2505,9 +2505,21 @@ class Main(QtWidgets.QWidget):
         g.addWidget(self.op_adder, r, 0, 1, 6)
         r += 1
 
-        g.addWidget(section_header("Scrub Nurse / ทีมพยาบาล"), r, 0, 1, 6)
+        g.addWidget(
+            section_header(
+                "พยาบาลห้องผ่าตัด (Scrub Nurse) — สำหรับพยาบาลห้องผ่าตัดกรอกข้อมูล"
+            ),
+            r,
+            0,
+            1,
+            6,
+        )
         r += 1
-        row_n = QtWidgets.QHBoxLayout();
+
+        scrub_box = QtWidgets.QWidget()
+        scrub_box.setObjectName("scrubSection")
+        scrub_box.setProperty("role", "scrub-section")
+        row_n = QtWidgets.QHBoxLayout(scrub_box)
         row_n.setSpacing(8)
 
         def _hint(txt: str) -> QtWidgets.QLabel:
@@ -2516,44 +2528,55 @@ class Main(QtWidgets.QWidget):
             return lab
 
         self.cb_assist1 = make_search_combo(SCRUB_NURSES)
+        self.cb_assist1.setProperty("role", "assist1")
         self.cb_assist2 = make_search_combo(SCRUB_NURSES)
+        self.cb_assist2.setProperty("role", "assist2")
         self.cb_scrub = make_search_combo(SCRUB_NURSES)
+        self.cb_scrub.setProperty("role", "scrub")
         self.cb_circulate = make_search_combo(SCRUB_NURSES)
+        self.cb_circulate.setProperty("role", "circulate")
 
-        row_n.addWidget(_hint("Assist 1"));
+        row_n.addWidget(_hint("Assist 1"))
         row_n.addWidget(self.cb_assist1, 1)
-        row_n.addWidget(_hint("Assist 2"));
+        row_n.addWidget(_hint("Assist 2"))
         row_n.addWidget(self.cb_assist2, 1)
-        row_n.addWidget(_hint("Scrub"));
+        row_n.addWidget(_hint("Scrub"))
         row_n.addWidget(self.cb_scrub, 1)
-        row_n.addWidget(_hint("Circulate"));
+        row_n.addWidget(_hint("Circulate"))
         row_n.addWidget(self.cb_circulate, 1)
-        g.addLayout(row_n, r, 0, 1, 6)
+        g.addWidget(scrub_box, r, 0, 1, 6)
         r += 1
 
         g.addWidget(section_header("เวลาเริ่ม–จบผ่าตัด (ใส่หรือไม่ใส่ก็ได้)"), r, 0, 1, 6)
         r += 1
-        row_t = QtWidgets.QHBoxLayout();
+
+        time_box = QtWidgets.QWidget()
+        time_box.setObjectName("timeGroup")
+        time_box.setProperty("role", "time-group")
+        row_t = QtWidgets.QHBoxLayout(time_box)
         row_t.setSpacing(10)
+
         self.ck_time_start = QtWidgets.QCheckBox("ระบุเวลาเริ่ม")
+        self.ck_time_start.setProperty("role", "time-start-check")
         self.time_start = QtWidgets.QTimeEdit(QtCore.QTime.currentTime())
         self.time_start.setDisplayFormat("HH:mm")
         self.time_start.setEnabled(False)
+        self.time_start.setProperty("role", "time-start")
         self.ck_time_end = QtWidgets.QCheckBox("ระบุเวลาจบ")
+        self.ck_time_end.setProperty("role", "time-end-check")
         self.time_end = QtWidgets.QTimeEdit(QtCore.QTime.currentTime())
         self.time_end.setDisplayFormat("HH:mm")
         self.time_end.setEnabled(False)
+        self.time_end.setProperty("role", "time-end")
 
         self.ck_time_start.toggled.connect(lambda ch: self.time_start.setEnabled(ch))
         self.ck_time_end.toggled.connect(lambda ch: self.time_end.setEnabled(ch))
 
         row_t.addWidget(self.ck_time_start)
         row_t.addWidget(self.time_start)
-        row_t.addSpacing(16)
         row_t.addWidget(self.ck_time_end)
         row_t.addWidget(self.time_end)
-        row_t.addStretch(1)
-        g.addLayout(row_t, r, 0, 1, 6)
+        g.addWidget(time_box, r, 0, 1, 6)
         r += 1
 
         self.btn_add = QtWidgets.QPushButton("➕ เพิ่ม");
@@ -4144,19 +4167,7 @@ class Main(QtWidgets.QWidget):
                     display_or = format_or_display(or_room)
                     first_entry = entries_only[0] if entries_only else None
                     the_date = getattr(first_entry, 'date', base_date)
-                    plan_label = ""
-                    if actual_or not in {'', '-', OR_AFTER_HOURS}:
-                        plan_label = describe_or_plan_label(the_date, actual_or)
-
-                    if plan_label:
-                        header_text = f"{display_or} • {plan_label}"
-                    else:
-                        owner = resolve_or_owner(actual_or, the_date, getattr(first_entry, 'doctor', None)) or '-'
-                        owner_display = show_doctor_with_dept(owner) if owner and owner not in {'-', ''} else owner
-                        if owner_display and owner_display not in {'-', ''}:
-                            header_text = f"{display_or} • {owner_display}"
-                        else:
-                            header_text = display_or
+                    header_text = display_or
                     header_item.setText(0, header_text)
                     font = header_item.font(0)
                     font.setBold(True)
@@ -4170,9 +4181,12 @@ class Main(QtWidgets.QWidget):
                     for idx, entry in bucket_sorted:
                         diag_txt = ' ; '.join(entry.diags) if entry.diags else '-'
                         op_txt = ' ; '.join(entry.ops) if entry.ops else '-'
-                        or_time = display_or
-                        doctor_display = show_doctor_with_dept(entry.doctor) if entry.doctor else ''
-                        doctor_display = strip_doctor_dept(doctor_display) if doctor_display else ''
+                        or_time = (
+                            f"{display_or} • {entry.time}" if getattr(entry, "time", None) else display_or
+                        )
+                        from_this_patch_doctor_display = (
+                            normalize_doctor_name(entry.doctor) if entry.doctor else ''
+                        )
                         status_text = getattr(entry, 'status', '') or (entry.state or '') or '-'
                         extra = entry._extra if isinstance(getattr(entry, '_extra', None), dict) else {}
                         case_size_txt = (
@@ -4196,7 +4210,7 @@ class Main(QtWidgets.QWidget):
                             str(entry.age or 0),
                             diag_txt,
                             op_txt,
-                            doctor_display or '-',
+                            from_this_patch_doctor_display or '-',
                             entry.ward or '-',
                             case_size_txt,
                             dept_txt,
