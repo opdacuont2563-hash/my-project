@@ -15,6 +15,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QSettings, QUrl, QLocale
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QLinearGradient
 from PySide6.QtWebSockets import QWebSocket
+from PySide6.QtNetwork import QAbstractSocket
 from PySide6.QtWidgets import QDialog
 
 from icd10_catalog import (
@@ -314,79 +315,6 @@ class FastSearchIndex:
 DEFAULT_HOST = os.getenv("SURGIBOT_CLIENT_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.getenv("SURGIBOT_CLIENT_PORT", "8088"))
 DEFAULT_TOKEN = os.getenv("SURGIBOT_SECRET", "uTCoBelMyNfSSNmUulT_Kz6zrrCVkvD578MxEuLKZoaaXX0pVlpAD8toYHBxsFxI")
-
-# === Runner pickup service (FastAPI) ===
-RUNNER_BASE = os.getenv("SURGIBOT_RUNNER_BASE_URL", "http://127.0.0.1:8777").rstrip("/")
-RUNNER_UPDATE_API = "/runner/update"
-RUNNER_HEALTH_API = "/health"
-RUNNER_LIST_API = "/runner/list"
-RUNNER_ACK_API = "/runner/ack"
-RUNNER_ARRIVE_API = "/runner/arrive"
-RUNNER_FINISH_API = "/runner/finish"
-
-
-def runner_health_ok(timeout: float = 0.8) -> bool:
-    try:
-        r = requests.get(f"{RUNNER_BASE}{RUNNER_HEALTH_API}", timeout=timeout)
-        return bool(r.ok)
-    except requests.RequestException:
-        return False
-
-
-def _pickup_id_for_row(r: dict) -> str:
-    day = str(r.get("date") or r.get("วันที่") or date.today().isoformat()).strip()
-    hn = str(r.get("HN") or r.get("hn") or r.get("patient_id") or "").strip()
-    or_room = str(r.get("OR") or r.get("or") or r.get("or_room") or "").strip()
-    return f"{day}:{hn}:{or_room}"
-
-
-RUNNER_STATUS_LABELS = {
-    "waiting": "รอรับ",
-    "picking": "กำลังไปรับ",
-    "arrived": "ถึง OR",
-    "finished": "ผ่าตัดเสร็จแล้ว",
-}
-
-RUNNER_STATUS_COLORS = {
-    "waiting": "#64748b",
-    "picking": "#f59e0b",
-    "arrived": "#16a34a",
-    "finished": "#0f172a",
-}
-
-
-def _fetch_runner_status_map(day: str) -> Dict[str, dict]:
-    try:
-        resp = requests.get(
-            f"{RUNNER_BASE}{RUNNER_LIST_API}",
-            params={"date": day},
-            timeout=2.0,
-            headers={"Accept": "application/json"},
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        if isinstance(payload, dict):
-            for key in ("items", "data", "rows", "list"):
-                maybe = payload.get(key)
-                if isinstance(maybe, list):
-                    payload = maybe
-                    break
-            else:
-                payload = [payload]
-        if not isinstance(payload, list):
-            return {}
-        results: Dict[str, dict] = {}
-        for row in payload:
-            if not isinstance(row, dict):
-                continue
-            pid = row.get("pickup_id") or _pickup_id_for_row(row)
-            if not pid:
-                continue
-            results[str(pid)] = row
-        return results
-    except (requests.RequestException, ValueError):
-        return {}
-
 
 API_HEALTH = "/api/health";
 API_LIST = "/api/list";
@@ -2362,9 +2290,12 @@ class Main(QtWidgets.QWidget):
         self._last_status_by_hn: dict[str, str] = {}
         self._status_ts_by_hn: Dict[str, datetime] = {}
         self._eta_by_hn: Dict[str, Optional[int]] = {}
-        self._runner_status_cache: Dict[str, dict] = {}
-        self._last_runner_user: str = ""
-        self._runner_finished_sent: Set[str] = set()
+
+        self.CASE_UID_ROLE = QtCore.Qt.UserRole + 10
+        self.HN_ROLE = QtCore.Qt.UserRole + 11
+        self.OR_ROLE = QtCore.Qt.UserRole + 12
+
+        self.api_base_url = getattr(self, "api_base_url", "http://127.0.0.1:8000")
 
         # form edit mode
         self._edit_idx: Optional[int] = None
@@ -2696,15 +2627,12 @@ class Main(QtWidgets.QWidget):
         for i in (2, 4, 5):
             hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.Interactive)
         self.tree2.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
-        self.tree2.customContextMenuRequested.connect(self._result_ctx_menu)
+        self.tree2.customContextMenuRequested.connect(self._on_tree2_context_menu)
         gr2.addWidget(self.tree2, 0, 0, 1, 1)
 
         import_bar = QtWidgets.QHBoxLayout()
         import_bar.setContentsMargins(0, 6, 0, 0)
         import_bar.setSpacing(10)
-        self.btn_send_runner = QtWidgets.QPushButton("🚚 ส่งให้ Runner (วันนี้)")
-        self.btn_send_runner.setProperty("variant", "primary")
-        import_bar.addWidget(self.btn_send_runner, 0)
         self.btn_import_excel = QtWidgets.QPushButton("📥 นำเข้าจาก Excel")
         self.btn_import_excel.setProperty("variant", "ghost")
         import_bar.addWidget(self.btn_import_excel, 0)
@@ -2804,7 +2732,6 @@ class Main(QtWidgets.QWidget):
         self.btn_refresh.clicked.connect(lambda: self._refresh(True))
         self.btn_export.clicked.connect(self._export_csv)
         self.btn_export_deid.clicked.connect(self._export_deid_csv)
-        self.btn_send_runner.clicked.connect(self._on_send_runner_today)
         self.btn_import_excel.clicked.connect(self._on_import_excel)
         self.btn_clear_board.clicked.connect(self._on_clear_board_clicked)
         self.btn_undo_clear.clicked.connect(self._on_undo_clear_clicked)
@@ -3044,7 +2971,16 @@ class Main(QtWidgets.QWidget):
 
     def _on_ws_msg(self, msg):
         try:
-            rows = extract_rows(json.loads(msg))
+            payload = json.loads(msg)
+        except Exception:
+            return
+
+        if isinstance(payload, dict) and payload.get("event") == "case_moved":
+            self._handle_case_moved_event(payload)
+            return
+
+        try:
+            rows = extract_rows(payload)
             self._scan_monitor_status_transitions(rows)
             self._rebuild_table(rows)
         except Exception:
@@ -3112,15 +3048,6 @@ class Main(QtWidgets.QWidget):
                 matches.append(entry)
         return matches
 
-    def _pickup_id_for_entry(self, entry: "ScheduleEntry", override_or: Optional[str] = None) -> str:
-        entry_or = override_or if override_or is not None else getattr(entry, "or_room", "")
-        payload = {
-            "date": str(getattr(entry, "date", date.today())),
-            "HN": getattr(entry, "hn", ""),
-            "OR": entry_or,
-        }
-        return _pickup_id_for_row(payload)
-
     def _coerce_time_value(self, value) -> str:
         if value in (None, "", "TF"):
             return ""
@@ -3140,215 +3067,6 @@ class Main(QtWidgets.QWidget):
             except Exception:
                 return ""
         return text
-
-    def _entry_to_runner_payload(self, entry: "ScheduleEntry", override_or: Optional[str] = None) -> Optional[dict]:
-        hn = (entry.hn or "").strip()
-        or_room = (override_or if override_or is not None else entry.or_room or "").strip()
-        if not hn or not or_room:
-            return None
-
-        start_value = getattr(entry, "time_start", "") or getattr(entry, "time", "")
-        start_time = self._coerce_time_value(start_value)
-
-        pickup_id = self._pickup_id_for_entry(entry, or_room)
-
-        return {
-            "pickup_id": pickup_id,
-            "date": str(getattr(entry, "date", date.today())),
-            "hn": hn,
-            "name": getattr(entry, "name", ""),
-            "ward_from": getattr(entry, "ward", ""),
-            "or_to": or_room,
-            "call_time": datetime.now().strftime("%H:%M"),
-            "due_time": "",
-            "status": "waiting",
-            "assignee": "",
-            "ack_time": "",
-            "start_time": start_time,
-            "arrive_time": "",
-            "note": getattr(entry, "note", "") if hasattr(entry, "note") else "",
-        }
-
-    def _push_rows_to_runner(
-            self,
-            entries: List["ScheduleEntry"],
-            *,
-            runner_ready: Optional[bool] = None,
-            collect_failures: bool = False,
-    ) -> Tuple[int, List[str]]:
-        if not entries:
-            return (0, [])
-
-        if runner_ready is None:
-            runner_ready = runner_health_ok()
-        if not runner_ready:
-            return (0, [])
-
-        ok = 0
-        failed: List[str] = []
-        url = f"{RUNNER_BASE}{RUNNER_UPDATE_API}"
-
-        for entry in entries:
-            payload = self._entry_to_runner_payload(entry)
-            if not payload:
-                continue
-            try:
-                resp = requests.post(url, json=payload, timeout=2.0, headers={"Accept": "application/json"})
-                resp.raise_for_status()
-                ok += 1
-            except requests.RequestException:
-                if collect_failures:
-                    failed.append(payload.get("hn") or payload.get("pickup_id") or "-")
-        return ok, failed
-
-    def _runner_status_label(self, status: str) -> str:
-        status = (status or "").strip()
-        return RUNNER_STATUS_LABELS.get(status, status)
-
-    def _runner_status_tooltip(self, payload: dict) -> str:
-        hints: List[str] = []
-        mapping = [
-            ("status", "สถานะ"),
-            ("assignee", "ผู้รับเคส"),
-            ("ack_time", "เวลารับเคส"),
-            ("start_time", "เวลาเริ่มส่ง"),
-            ("arrive_time", "ถึง OR"),
-            ("note", "หมายเหตุ"),
-        ]
-        for key, label in mapping:
-            value = payload.get(key)
-            if value:
-                hints.append(f"{label}: {value}")
-        return "\n".join(hints)
-
-    def _ask_runner_name(self) -> str:
-        text, ok = QtWidgets.QInputDialog.getText(
-            self,
-            "ชื่อผู้ไปรับเคส",
-            "กรุณาระบุชื่อเจ้าหน้าที่ Runner:",
-            QtWidgets.QLineEdit.Normal,
-            self._last_runner_user,
-        )
-        if not ok:
-            return ""
-        text = str(text).strip()
-        if text:
-            self._last_runner_user = text
-        return text
-
-    def _runner_ack(self, pickup_id: str, user: str) -> bool:
-        try:
-            resp = requests.post(
-                f"{RUNNER_BASE}{RUNNER_ACK_API}",
-                json={"pickup_id": pickup_id, "user": user},
-                timeout=2.0,
-                headers={"Accept": "application/json"},
-            )
-            return bool(resp.ok)
-        except requests.RequestException:
-            return False
-
-    def _runner_arrive(self, pickup_id: str, user: str) -> bool:
-        try:
-            resp = requests.post(
-                f"{RUNNER_BASE}{RUNNER_ARRIVE_API}",
-                json={"pickup_id": pickup_id, "user": user},
-                timeout=2.0,
-                headers={"Accept": "application/json"},
-            )
-            return bool(resp.ok)
-        except requests.RequestException:
-            return False
-
-    def _runner_finish(self, pickup_id: str, user: str = "ระบบ") -> bool:
-        try:
-            resp = requests.post(
-                f"{RUNNER_BASE}{RUNNER_FINISH_API}",
-                json={"pickup_id": pickup_id, "user": user},
-                timeout=2.0,
-                headers={"Accept": "application/json"},
-            )
-            return bool(resp.ok)
-        except requests.RequestException:
-            return False
-
-    def _auto_finish_runner_cases(self, entries: List["ScheduleEntry"], status_map: Dict[str, dict]) -> None:
-        if not entries or not status_map:
-            return
-        for entry in entries:
-            if not self._is_entry_completed(entry):
-                continue
-            pickup_id = self._pickup_id_for_entry(entry)
-            if not pickup_id:
-                continue
-            row = status_map.get(pickup_id) or {}
-            if str(row.get("status") or "").strip() == "finished":
-                self._runner_finished_sent.discard(pickup_id)
-                continue
-            if pickup_id in self._runner_finished_sent:
-                continue
-            if self._runner_finish(pickup_id, user="ระบบ"):
-                self._runner_finished_sent.add(pickup_id)
-
-    def _handle_runner_action(self, entry: "ScheduleEntry", action: str) -> None:
-        pid = self._pickup_id_for_entry(entry)
-        if not pid:
-            self.toast.show_toast("ไม่พบข้อมูล OR/HN สำหรับ Runner")
-            return
-        if not runner_health_ok():
-            self.toast.show_toast("ไม่สามารถเชื่อมต่อ Runner ได้")
-            return
-        user = self._ask_runner_name()
-        if not user:
-            return
-        if action == "ack":
-            ok = self._runner_ack(pid, user)
-            success_msg = "รับเคสเรียบร้อย"
-        else:
-            ok = self._runner_arrive(pid, user)
-            success_msg = "บันทึกถึง OR แล้ว"
-        if ok:
-            self.toast.show_toast(success_msg)
-            self._render_tree2()
-        else:
-            self.toast.show_toast("ส่งข้อมูลไป Runner ไม่สำเร็จ")
-
-    def _on_send_runner_today(self):
-        rows = self._entries_of_selected_date()
-        if not rows:
-            SweetAlert.info(self, "ไม่มีรายการ", "ยังไม่มีเคสของวันที่เลือกที่จะส่งให้ Runner")
-            return
-
-        runner_ready = runner_health_ok()
-        if not runner_ready:
-            SweetAlert.warning(
-                self,
-                "ไม่สามารถเชื่อมต่อ",
-                f"เชื่อมต่อ Runner ไม่ได้ (ตรวจสอบ {RUNNER_BASE})",
-            )
-            return
-
-        dlg = SweetAlert.loading(self, "กำลังส่งข้อมูลไป Runner ...")
-        dlg.show()
-        QtWidgets.QApplication.processEvents()
-        try:
-            ok, failed = self._push_rows_to_runner(rows, runner_ready=runner_ready, collect_failures=True)
-        finally:
-            dlg.close()
-
-        if ok > 0 and not failed:
-            SweetAlert.success(self, "สำเร็จ", f"ส่งให้ Runner แล้ว {ok} รายการ", auto_close_msec=1600)
-        elif ok > 0 and failed:
-            SweetAlert.success(
-                self,
-                "สำเร็จบางส่วน",
-                f"สำเร็จ {ok} • ล้มเหลว {len(failed)}\n(HN: {', '.join(failed[:10])}{' …' if len(failed) > 10 else ''})",
-            )
-        else:
-            SweetAlert.warning(self, "ไม่สำเร็จ",
-                               f"ส่งให้ Runner ไม่ได้เลย — ตรวจสอบว่าเซิร์ฟเวอร์ Runner เปิดอยู่ที่ {RUNNER_BASE} หรือไม่")
-
-        self._render_tree2()
 
     def _on_import_excel(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -4317,26 +4035,6 @@ class Main(QtWidgets.QWidget):
 
             entries_for_day = [entry for entry in entries_snapshot if _resolved_date(entry) == base_date]
 
-            valid_pickups: Set[str] = set()
-            for entry in entries_for_day:
-                pid = self._pickup_id_for_entry(entry)
-                if pid:
-                    valid_pickups.add(pid)
-            if valid_pickups:
-                self._runner_finished_sent.intersection_update(valid_pickups)
-            else:
-                self._runner_finished_sent.clear()
-
-            runner_status_map: Dict[str, dict] = {}
-            runner_ready = False
-            if entries_for_day:
-                runner_ready = runner_health_ok()
-                if runner_ready:
-                    self._push_rows_to_runner(entries_for_day, runner_ready=True)
-                    runner_status_map = _fetch_runner_status_map(str(base_date))
-                    self._auto_finish_runner_cases(entries_for_day, runner_status_map)
-            self._runner_status_cache = runner_status_map
-
             indexed_entries: List[Tuple[int, ScheduleEntry]] = list(enumerate(entries_snapshot))
             if not indexed_entries:
                 empty = QtWidgets.QTreeWidgetItem(['— ไม่มีรายการ —'])
@@ -4504,31 +4202,13 @@ class Main(QtWidgets.QWidget):
                         ])
                         row.setData(0, QtCore.Qt.UserRole, entry.uid())
                         row.setData(0, QtCore.Qt.UserRole + 1, idx)
-                        pickup_id = self._pickup_id_for_entry(entry, actual_or)
-                        row.setData(0, QtCore.Qt.UserRole + 2, pickup_id)
+                        row.setData(0, self.CASE_UID_ROLE, getattr(entry, 'case_uid', ''))
+                        row.setData(0, self.HN_ROLE, entry.hn or '')
+                        row.setData(0, self.OR_ROLE, actual_or)
                         header_item.addChild(row)
 
                         badge = _period_badge(entry.period or 'in')
                         self.tree2.setItemWidget(row, 12, badge)
-
-                        runner_info = runner_status_map.get(pickup_id, {})
-                        runner_status = (runner_info or {}).get('status', '')
-                        runner_label = self._runner_status_label(runner_status)
-                        if runner_label:
-                            chip_color = RUNNER_STATUS_COLORS.get(runner_status, '#64748b')
-                            runner_chip = StatusChipWidget(runner_label, chip_color)
-                            self.tree2.setItemWidget(row, 17, runner_chip)
-                            row.setText(17, '')
-                            tooltip = self._runner_status_tooltip(runner_info)
-                            if tooltip:
-                                row.setToolTip(17, tooltip)
-                            name_txt = entry.name or '-'
-                            row.setText(2, f"[{runner_label}] {name_txt}")
-                        else:
-                            self.tree2.setItemWidget(row, 17, None)
-                            row.setText(17, status_text)
-                            row.setToolTip(17, '')
-                            row.setText(2, entry.name or '-')
 
                         monitor_status = self._last_status_by_hn.get(str(entry.hn).strip(), '')
 
@@ -4793,32 +4473,157 @@ class Main(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(0, lambda: hbar.setValue(min(old_hval, hbar.maximum())))
 
     # ---------- Result context menu / Double-click ----------
-    def _result_ctx_menu(self, pos: QtCore.QPoint):
-        it = self.tree2.itemAt(pos)
-        if not it: return
-        idx = it.data(0, QtCore.Qt.UserRole + 1)
-        if idx is None: return
-        idx_int = int(idx)
-        entry = self.sched.entries[idx_int] if 0 <= idx_int < len(self.sched.entries) else None
+    def _on_tree2_context_menu(self, pos: QtCore.QPoint):
+        item = self.tree2.itemAt(pos)
+        if not item or item.parent() is None:
+            return
+
+        idx = item.data(0, QtCore.Qt.UserRole + 1)
+        entry: Optional[ScheduleEntry] = None
+        if idx is not None:
+            idx_int = int(idx)
+            if 0 <= idx_int < len(self.sched.entries):
+                entry = self.sched.entries[idx_int]
+        else:
+            idx_int = -1
+
         menu = QtWidgets.QMenu(self)
-        a_edit = menu.addAction("แก้ไขรายการ")
-        a_del = menu.addAction("ลบรายการ")
-        runner_ack_action = runner_arrive_action = None
-        if entry:
-            pickup_id = it.data(0, QtCore.Qt.UserRole + 2)
-            if pickup_id:
-                menu.addSeparator()
-                runner_ack_action = menu.addAction("📥 Runner: รับเคส")
-                runner_arrive_action = menu.addAction("✅ Runner: ถึง OR")
-        act = menu.exec(self.tree2.viewport().mapToGlobal(pos))
-        if act == a_edit:
-            self._on_result_double_click(it, 0)
-        elif act == a_del:
+        act_edit = menu.addAction("แก้ไขรายการ")
+        act_delete = menu.addAction("ลบรายการ")
+
+        menu.addSeparator()
+        actions_move: List[QtGui.QAction] = []
+        from_or = item.data(0, self.OR_ROLE) or (getattr(entry, "or_room", "") if entry else "")
+        case_uid = item.data(0, self.CASE_UID_ROLE) or (getattr(entry, "case_uid", "") if entry else "")
+        hn_value = item.data(0, self.HN_ROLE) or (getattr(entry, "hn", "") if entry else "")
+
+        for n in range(1, 9):
+            or_name = f"OR{n}"
+            action = QtGui.QAction(f"ย้ายไป {or_name}", self)
+            action.setData(or_name)
+            if str(or_name).upper() == str(from_or or "").upper():
+                action.setEnabled(False)
+            menu.addAction(action)
+            actions_move.append(action)
+
+        chosen = menu.exec(self.tree2.viewport().mapToGlobal(pos))
+        if not chosen:
+            return
+        if chosen == act_edit and entry is not None:
+            self._on_result_double_click(item, 0)
+            return
+        if chosen == act_delete and entry is not None:
             self._delete_entry_idx(idx_int)
-        elif act and entry and runner_ack_action and act == runner_ack_action:
-            self._handle_runner_action(entry, "ack")
-        elif act and entry and runner_arrive_action and act == runner_arrive_action:
-            self._handle_runner_action(entry, "arrive")
+            return
+        if chosen in actions_move:
+            target_or = chosen.data()
+            if target_or:
+                self._move_case_to_or(
+                    case_uid=str(case_uid or ""),
+                    hn=str(hn_value or ""),
+                    from_or=str(from_or or ""),
+                    to_or=str(target_or),
+                )
+
+    def _move_case_to_or(self, case_uid: str, hn: str, from_or: str, to_or: str):
+        if not to_or or to_or == from_or:
+            return
+
+        entry: Optional[ScheduleEntry] = None
+        for candidate in self.sched.entries:
+            if case_uid and getattr(candidate, "case_uid", "") == case_uid:
+                entry = candidate
+                break
+            if hn and str(getattr(candidate, "hn", "")).strip() == str(hn).strip():
+                entry = candidate
+                break
+
+        if entry is None:
+            QtWidgets.QMessageBox.warning(self, "ไม่พบข้อมูลเคส", "ไม่พบข้อมูลเคสที่จะย้าย")
+            return
+
+        setattr(entry, "or_room", to_or)
+
+        try:
+            if hasattr(self.sched, "touch_entry"):
+                self.sched.touch_entry(entry)
+            elif hasattr(self.sched, "_save"):
+                self.sched._save()
+        except Exception:
+            pass
+
+        self._render_tree2()
+        self._notify_case_moved(case_uid=case_uid, hn=hn, from_or=from_or, to_or=to_or)
+
+        try:
+            QtWidgets.QMessageBox.information(self, "สำเร็จ", f"ย้ายเคสไป {to_or} แล้ว")
+        except Exception:
+            pass
+
+    def _notify_case_moved(self, case_uid: str, hn: str, from_or: str, to_or: str):
+        payload = {
+            "event": "case_moved",
+            "case_uid": case_uid or "",
+            "hn": hn or "",
+            "from_or": from_or or "",
+            "to_or": to_or,
+            "moved_at": datetime.now().isoformat(timespec="seconds"),
+            "moved_by": getattr(self, "current_user", "registry"),
+        }
+
+        try:
+            if self.ws and self.ws.state() == QAbstractSocket.ConnectedState:
+                import json as _json
+
+                self.ws.sendTextMessage(_json.dumps(payload, ensure_ascii=False))
+                return
+        except Exception:
+            pass
+
+        try:
+            import requests
+
+            url = f"{str(self.api_base_url).rstrip('/')}/api/broadcast/case_moved"
+            requests.post(url, json=payload, timeout=3)
+        except Exception:
+            pass
+
+    def _handle_case_moved_event(self, payload: dict):
+        if not isinstance(payload, dict):
+            return
+
+        case_uid = str(payload.get("case_uid") or "")
+        hn = str(payload.get("hn") or "").strip()
+        to_or = str(payload.get("to_or") or "")
+        if not to_or:
+            return
+
+        entry: Optional[ScheduleEntry] = None
+        for candidate in self.sched.entries:
+            if case_uid and getattr(candidate, "case_uid", "") == case_uid:
+                entry = candidate
+                break
+            if hn and str(getattr(candidate, "hn", "")).strip() == hn:
+                entry = candidate
+                break
+
+        if entry is None:
+            return
+
+        if str(getattr(entry, "or_room", "")) == to_or:
+            return
+
+        setattr(entry, "or_room", to_or)
+
+        try:
+            if hasattr(self.sched, "touch_entry"):
+                self.sched.touch_entry(entry)
+            elif hasattr(self.sched, "_save"):
+                self.sched._save()
+        except Exception:
+            pass
+
+        self._render_tree2()
 
     def _delete_entry_idx(self, idx: int):
         if 0 <= idx < len(self.sched.entries):

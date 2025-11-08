@@ -2717,9 +2717,66 @@ QCheckBox { color:#0f172a; }
     def _on_ws_message(self, msg: str):
         try:
             payload = json.loads(msg)
+        except Exception:
+            return
+
+        if isinstance(payload, dict) and payload.get("event") == "case_moved":
+            self._on_case_moved(payload)
+            return
+
+        try:
             rows, meta = self._extract_rows(payload)
-            if rows is not None:
-                self._rebuild(rows, meta)
+        except Exception:
+            return
+        if rows is not None:
+            self._rebuild(rows, meta)
+
+    def _on_case_moved(self, msg: dict):
+        if not isinstance(msg, dict):
+            return
+
+        case_uid = str(msg.get("case_uid") or "")
+        hn_value = str(msg.get("hn") or "").strip()
+        target_or = str(msg.get("to_or") or "")
+        if not target_or:
+            return
+
+        entry = None
+        for candidate in self.sched.entries:
+            if case_uid and getattr(candidate, "case_uid", "") == case_uid:
+                entry = candidate
+                break
+            if hn_value and str(getattr(candidate, "hn", "")).strip() == hn_value:
+                entry = candidate
+                break
+
+        if entry is None:
+            return
+
+        if str(getattr(entry, "or_room", "")) == target_or:
+            return
+
+        setattr(entry, "or_room", target_or)
+
+        try:
+            if hasattr(self.sched, "touch_entry"):
+                self.sched.touch_entry(entry)
+            elif hasattr(self.sched, "_save"):
+                self.sched._save()
+        except Exception:
+            pass
+
+        try:
+            self._render_schedule_tree()
+        except Exception:
+            pass
+
+        try:
+            QtWidgets.QMessageBox.information(
+                self,
+                "อัปเดตห้อง",
+                f"ย้ายเคส HN {getattr(entry, 'hn', '') or hn_value} ไป {target_or}",
+            )
         except Exception:
             pass
 
