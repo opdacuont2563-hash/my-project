@@ -792,7 +792,7 @@ class StatusChipWidget(QtWidgets.QWidget):
         color: str,
         pulse: bool = False,
         alt_fn: Optional[Callable[[], str]] = None,
-        alt_interval_ms: int = 2000,
+        alt_interval_ms: int = 4000,
         parent=None,
     ):
         super().__init__(parent)
@@ -802,7 +802,7 @@ class StatusChipWidget(QtWidgets.QWidget):
         self._pulse = pulse
         self._alt_fn = alt_fn
         self._show_primary = True
-        self._alt_interval_ms = max(800, int(alt_interval_ms or 2000))
+        self._alt_interval_ms = max(800, int(alt_interval_ms or 4000))
 
         if pulse:
             self.eff = QtWidgets.QGraphicsOpacityEffect(self)
@@ -4275,7 +4275,7 @@ class Main(QtWidgets.QWidget):
                                 color,
                                 pulse=(monitor_status in PULSE_STATUS),
                                 alt_fn=alt_fn,
-                                alt_interval_ms=2000,
+                                alt_interval_ms=4000,
                             )
 
                             cell = QtWidgets.QWidget()
