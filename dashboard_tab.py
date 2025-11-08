@@ -142,6 +142,12 @@ def clip_overlap_minutes(starts: pd.Series, ends: pd.Series, block_start_hhmm: s
 
 def enrich_cases(df_postop: pd.DataFrame, df_sched: pd.DataFrame) -> pd.DataFrame:
     df = df_postop.copy()
+    # Some SQLite queries may return empty frames without the expected datetime columns
+    # (e.g. when the table does not exist in a particular database). Ensure the columns
+    # exist so downstream datetime accessors do not raise KeyError.
+    for col in ("time_start_dt", "time_end_dt"):
+        if col not in df.columns:
+            df[col] = pd.NaT
     df = df.dropna(subset=["time_start_dt", "time_end_dt"])
     if df.empty:
         return df
