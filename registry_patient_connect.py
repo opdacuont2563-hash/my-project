@@ -4533,6 +4533,11 @@ class Main(QtWidgets.QWidget):
         if not chosen:
             return
         if chosen == act_edit and entry is not None:
+            # ทำให้แน่ใจว่าเลือกแถวไว้ก่อน แล้วใช้ workflow เดียวกับ double-click
+            try:
+                self.tree2.setCurrentItem(item)
+            except Exception:
+                pass
             self._on_result_double_click(item, 0)
             return
         if chosen == act_delete and entry is not None:
