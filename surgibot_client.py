@@ -11,7 +11,7 @@ import os, sys, json, argparse
 import math
 import hashlib
 from pathlib import Path
-from typing import Union, List, Dict
+from typing import Union, List, Dict, Optional
 from datetime import datetime, timedelta, time as dtime, date as ddate
 
 import requests
@@ -145,20 +145,53 @@ API_LIST   = "/api/list"
 API_LIST_FULL = "/api/list_full"
 API_WS = "/api/ws"
 
-STATUS_CHOICES = ["รอผ่าตัด", "กำลังผ่าตัด", "กำลังพักฟื้น", "กำลังส่งกลับตึก", "เลื่อนการผ่าตัด"]
+# --- Status constants / flow control ---
+STATUS_READY = "รอผ่าตัด"
+STATUS_OPERATING = "กำลังผ่าตัด"
+STATUS_RECOVERY = "กำลังพักฟื้น"
+STATUS_RETURNING = "กำลังส่งกลับตึก"
+STATUS_POSTPONE = "เลื่อนการผ่าตัด"
+
+STATUS_FLOW = [STATUS_READY, STATUS_OPERATING, STATUS_RECOVERY, STATUS_RETURNING]
+FLOW_INDEX = {s: i for i, s in enumerate(STATUS_FLOW)}
+POSTPONE_ALLOWED_FROM = {STATUS_READY}
+
+# ----- Post-op choices -----
+CASE_SIZES = ["Major", "Minor"]
+DEPARTMENTS_THAI = [
+    "ศัลยกรรมทั่วไป",
+    "ศัลยกรรมกระดูกและข้อ",
+    "ศัลยกรรมระบบทางเดินปัสสาวะ",
+    "ศัลยกรรม โสต ศอ นาสิก",
+    "สูติ-นรีเวช",
+    "จักษุ",
+    "ศัลยกรรมขากรรไกร",
+]
+
+STATUS_CHOICES = [
+    STATUS_READY,
+    STATUS_OPERATING,
+    STATUS_RECOVERY,
+    STATUS_RETURNING,
+    STATUS_POSTPONE,
+]
 OR_CHOICES     = ["OR1", "OR2", "OR3", "OR4", "OR5", "OR6", "OR8"]
 QUEUE_CHOICES  = ["0-1", "0-2", "0-3", "0-4", "0-5", "0-6", "0-7"]
 
-STATUS_OP_START = "กำลังผ่าตัด"
-STATUS_OP_END = "กำลังพักฟื้น"
-STATUS_RETURNING = "กำลังส่งกลับตึก"
+STATUS_OP_START = STATUS_OPERATING
+STATUS_OP_END = STATUS_RECOVERY
+
+PULSE_STATUS: set[str] = {STATUS_OP_START, STATUS_RECOVERY}
+
+RECOVERY_DURATION_MIN = 60
 
 STATUS_COLORS = {
-    "รอผ่าตัด": "#fde047",
-    "กำลังผ่าตัด": "#ef4444",
-    "กำลังพักฟื้น": "#22c55e",
-    "กำลังส่งกลับตึก": "#a855f7",
-    "เลื่อนการผ่าตัด": "#64748b",
+    STATUS_READY: "#facc15",
+    STATUS_OP_START: "#f97316",
+    STATUS_RECOVERY: "#38bdf8",
+    STATUS_RETURNING: "#a855f7",
+    STATUS_POSTPONE: "#64748b",
+    "ส่งกลับตึก": "#22c55e",
 }
 OR_HEADER_COLORS = {
     "OR1": "#3b82f6",
@@ -202,7 +235,7 @@ class _SchedEntry:
             "or", "date", "time", "hn", "name", "age", "dept", "doctor", "diags", "ops",
             "ward", "queue", "period", "case_size", "urgency", "assist1", "assist2",
             "scrub", "circulate", "time_start", "time_end", "status", "state",
-            "returning_started_at", "version", "updated_at"
+            "returning_started_at", "version", "updated_at", "post_case_size", "post_department"
         }
         self.or_room = str(d.get("or","") or "")
         self.date = str(d.get("date","") or "")
@@ -235,7 +268,13 @@ class _SchedEntry:
         except Exception:
             self.version = 0
         self.updated_at = str(d.get("updated_at", "") or "")
+        self.post_case_size = str(d.get("post_case_size", "") or "")
+        self.post_department = str(d.get("post_department", "") or "")
         self._extra = {k: v for k, v in d.items() if k not in known_keys}
+        if not self.post_case_size and isinstance(self._extra, dict):
+            self.post_case_size = str(self._extra.get("post_case_size", "") or "")
+        if not self.post_department and isinstance(self._extra, dict):
+            self.post_department = str(self._extra.get("post_department", "") or "")
 
     def uid(self) -> str:
         return f"{self.or_room}|{self.hn}|{self.time}|{self.date}"
@@ -268,6 +307,8 @@ class _SchedEntry:
             "returning_started_at": self.returning_started_at,
             "version": int(self.version or 0),
             "updated_at": self.updated_at,
+            "post_case_size": self.post_case_size,
+            "post_department": self.post_department,
         }
         payload.update(self._extra)
         return payload
@@ -332,8 +373,46 @@ class SharedScheduleModel(SharedScheduleReader):
                 return entry
         return None
 
+
+# --- ETA helpers for shared schedule ---------------------------------
+def _read_eta_minutes(entry) -> Optional[int]:
+    try:
+        value = None
+        extra = getattr(entry, "_extra", None)
+        if isinstance(extra, dict):
+            value = extra.get("eta_minutes", None)
+        if value is None:
+            value = getattr(entry, "eta_minutes", None)
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _write_eta_minutes(entry, eta_min: Optional[int]):
+    if eta_min is None:
+        return
+    try:
+        if not hasattr(entry, "_extra") or not isinstance(entry._extra, dict):  # type: ignore[attr-defined]
+            entry._extra = {}  # type: ignore[attr-defined]
+        entry._extra["eta_minutes"] = int(eta_min)  # type: ignore[index]
+    except Exception:
+        pass
+
+
 def _fmt_td(td: timedelta) -> str:
     total = int(abs(td.total_seconds()))
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _fmt_hms(td: timedelta) -> str:
+    total = int(td.total_seconds())
+    if total < 0:
+        total = 0
     h = total // 3600
     m = (total % 3600) // 60
     s = total % 60
@@ -632,7 +711,39 @@ class PostOpDialog(QtWidgets.QDialog):
         self.circulate.setEditText(entry.circulate)
         grid.addWidget(self.circulate, 1, 3)
 
+        # --- New: Case Size & Department ---
+        self.cb_case_size = QtWidgets.QComboBox(self)
+        self.cb_case_size.addItems(["— เลือก —"] + CASE_SIZES)
+
+        self.cb_department = QtWidgets.QComboBox(self)
+        self.cb_department.addItems(["— เลือก —"] + DEPARTMENTS_THAI)
+
         row = 2
+        grid.addWidget(QtWidgets.QLabel("ขนาดเคส", self), row, 0)
+        grid.addWidget(self.cb_case_size, row, 1)
+        grid.addWidget(QtWidgets.QLabel("แผนก", self), row, 2)
+        grid.addWidget(self.cb_department, row, 3)
+        row += 1
+
+        def _select_if_found(combo: QtWidgets.QComboBox, text: str):
+            if not text:
+                return
+            idx = combo.findText(text, QtCore.Qt.MatchFixedString)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+
+        old_case_size = None
+        old_department = None
+        if hasattr(self.entry, "_extra") and isinstance(self.entry._extra, dict):
+            old_case_size = self.entry._extra.get("post_case_size") or getattr(self.entry, "post_case_size", None)
+            old_department = self.entry._extra.get("post_department") or getattr(self.entry, "post_department", None)
+        else:
+            old_case_size = getattr(self.entry, "post_case_size", None)
+            old_department = getattr(self.entry, "post_department", None)
+
+        _select_if_found(self.cb_case_size, (old_case_size or "").strip())
+        _select_if_found(self.cb_department, (old_department or "").strip())
+
         op_label = QtWidgets.QLabel("Operation (หลังผ่าตัด)")
         grid.addWidget(op_label, row, 0, 1, 4)
         row += 1
@@ -662,14 +773,16 @@ class PostOpDialog(QtWidgets.QDialog):
 
         btn = QtWidgets.QPushButton("💾 บันทึกหลังผ่าตัด")
         btn.setProperty("variant", "primary")
-        btn.clicked.connect(self.accept)
+        btn.clicked.connect(self._on_save_clicked)
         layout.addWidget(btn, 0, QtCore.Qt.AlignRight)
 
-    def _refresh_dx_suggest(self, _items: list[str]):
-        suggestions = diagnosis_suggestions(self.specialty_key, self.op_adder.items())
-        self.dx_adder.set_suggestions(suggestions)
-
-    def values(self) -> Dict:
+    def _collect_values(self) -> Dict:
+        case_size = self.cb_case_size.currentText().strip()
+        dept = self.cb_department.currentText().strip()
+        if case_size in ("", "— เลือก —"):
+            case_size = ""
+        if dept in ("", "— เลือก —"):
+            dept = ""
         return {
             "assist1": self.assist1.currentText().strip(),
             "assist2": self.assist2.currentText().strip(),
@@ -677,7 +790,57 @@ class PostOpDialog(QtWidgets.QDialog):
             "circulate": self.circulate.currentText().strip(),
             "ops": self.op_adder.items(),
             "diags": self.dx_adder.items(),
+            "post_case_size": case_size,
+            "post_department": dept,
         }
+
+    def _on_save_clicked(self) -> None:
+        values = self._collect_values()
+        case_size = values.get("post_case_size", "")
+        dept = values.get("post_department", "")
+        if not case_size or not dept:
+            QtWidgets.QMessageBox.warning(self, "กรอกไม่ครบ", "กรุณาเลือก 'ขนาดเคส' และ 'แผนก'")
+            return
+
+        setattr(self.entry, "case_size", case_size)
+        setattr(self.entry, "dept", dept)
+        setattr(self.entry, "post_case_size", case_size)
+        setattr(self.entry, "post_department", dept)
+
+        if not hasattr(self.entry, "_extra") or not isinstance(self.entry._extra, dict):
+            self.entry._extra = {}
+        self.entry._extra["case_size"] = case_size
+        self.entry._extra["dept"] = dept
+        self.entry._extra["post_case_size"] = case_size
+        self.entry._extra["post_department"] = dept
+
+        parent = self.parent()
+        if parent is not None:
+            try:
+                sched = getattr(parent, "sched", None)
+                if sched is not None:
+                    sched.touch_entry(self.entry)
+            except Exception:
+                pass
+            try:
+                if hasattr(parent, "_render_schedule_tree"):
+                    parent._render_schedule_tree()
+                elif hasattr(parent, "_render_tree2"):
+                    parent._render_tree2()
+            except Exception:
+                pass
+
+        self._cached_values = values
+        super().accept()
+
+    def _refresh_dx_suggest(self, _items: list[str]):
+        suggestions = diagnosis_suggestions(self.specialty_key, self.op_adder.items())
+        self.dx_adder.set_suggestions(suggestions)
+
+    def values(self) -> Dict:
+        if hasattr(self, "_cached_values"):
+            return dict(self._cached_values)
+        return self._collect_values()
 
 class Card(QtWidgets.QFrame):
     def __init__(self, title="", parent=None):
@@ -1051,6 +1214,11 @@ class Main(QtWidgets.QWidget):
         self._tick = QtCore.QTimer(self); self._tick.timeout.connect(self._update_monitor_elapsed); self._tick.start(1000)
         self._pull = QtCore.QTimer(self); self._pull.timeout.connect(lambda: self._refresh(True)); self._pull.start(2000)
         self._sched_timer = QtCore.QTimer(self); self._sched_timer.timeout.connect(self._check_schedule_seq); self._sched_timer.start(1000)
+        # ตัวสลับข้อความสถานะทุก 3 วินาที
+        self._flip5s = False
+        self._statusTicker = QtCore.QTimer(self)
+        self._statusTicker.timeout.connect(self._tick_status_col)
+        self._statusTicker.start(3000)
         self._start_websocket()
 
     # ---------- Settings dialog ----------
@@ -1518,9 +1686,9 @@ QCheckBox { color:#0f172a; }
         )
         gs = self.card_sched.grid(); gs.setContentsMargins(0,0,0,0)
         self.tree_sched = QtWidgets.QTreeWidget()
-        self.tree_sched.setColumnCount(20)
+        self.tree_sched.setColumnCount(21)
         self.tree_sched.setHeaderLabels([
-            "บันทึก",
+            "สถานะ",
             "ช่วงเวลา",
             "OR/เวลา",
             "HN",
@@ -1540,13 +1708,14 @@ QCheckBox { color:#0f172a; }
             "จบ",
             "คิว",
             "ประเภทเคส",
+            "บันทึกหลังผ่าตัด",
         ])
         self.tree_sched.setUniformRowHeights(False)
         hdr = self.tree_sched.header()
         hdr.setStretchLastSection(False)
         hdr.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         hdr.setFixedHeight(42)
-        for i in range(20):
+        for i in range(21):
             hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
         self.tree_sched.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.tree_sched.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
@@ -1711,55 +1880,102 @@ QCheckBox { color:#0f172a; }
         entry = self._get_active_schedule_entry()
         if entry is None:
             return
-        self._apply_status_change(entry, text)
+        new_status = (text or "").strip()
+        ok, msg = self._validate_status_transition(entry, new_status)
+        if not ok:
+            QtWidgets.QMessageBox.warning(self, "ข้ามลำดับสถานะไม่ได้", msg)
+            self._set_status_combo(entry.status)
+            return
+        eta_minutes = self._current_eta_minutes_input() if new_status == STATUS_OPERATING else None
+        if new_status == STATUS_RETURNING and not entry.time_end:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "ยังผ่าตัดไม่จบ",
+                "ยังไม่มีเวลา 'จบผ่าตัด' ระบบฝั่งแม่จะไม่เริ่มนับ 3 นาทีจนกว่าจะมีเวลาจบ",
+            )
+        self._apply_status_change(entry, new_status, eta_minutes)
 
     def _get_active_schedule_entry(self) -> _SchedEntry | None:
         if not self._last_selected_uid:
             return None
         return self.sched.find_by_uid(self._last_selected_uid)
 
-    def _apply_status_change(self, entry: _SchedEntry, new_status: str):
+    def _current_eta_minutes_input(self) -> Optional[int]:
+        try:
+            text = self.ent_eta.text().strip()
+        except Exception:
+            return None
+        if text.isdigit():
+            return int(text)
+        return None
+
+    def _update_entry_status_fields(
+        self,
+        entry: _SchedEntry,
+        new_status: str,
+        eta_minutes: Optional[int] = None,
+    ) -> bool:
         changed = False
         now_hm = datetime.now().strftime("%H:%M")
 
-        if new_status == STATUS_OP_START:
+        if new_status == STATUS_OPERATING:
             if not entry.time_start:
                 entry.time_start = now_hm
                 changed = True
-            if entry.state in ("scheduled", "in_or", "operation_ended", "postop_pending", "") or not entry.state:
+            allowed_states = {"scheduled", "in_or", "operation_ended", "postop_pending", ""}
+            if (entry.state in allowed_states or not entry.state) and entry.state != "operation_started":
                 entry.state = "operation_started"
                 changed = True
+            if eta_minutes is not None:
+                prev_eta = _read_eta_minutes(entry)
+                if prev_eta != eta_minutes:
+                    _write_eta_minutes(entry, eta_minutes)
+                    changed = True
 
-        elif new_status == STATUS_OP_END:
+        elif new_status == STATUS_RECOVERY:
             if not entry.time_end:
                 entry.time_end = now_hm
                 changed = True
-            if entry.state in ("operation_started", "in_or", "scheduled", "") or not entry.state:
+            allowed_states = {"operation_started", "in_or", "scheduled", ""}
+            if (entry.state in allowed_states or not entry.state) and entry.state != "operation_ended":
                 entry.state = "operation_ended"
                 changed = True
 
         elif new_status == STATUS_RETURNING:
-            if not entry.time_end:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "ยังผ่าตัดไม่จบ",
-                    "ยังไม่มีเวลา 'จบผ่าตัด' ระบบฝั่งแม่จะไม่เริ่มนับ 3 นาทีจนกว่าจะมีเวลาจบ",
-                )
-            entry.state = "returning_to_ward"
-            entry.returning_started_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-            changed = True
+            if entry.state != "returning_to_ward":
+                entry.state = "returning_to_ward"
+                changed = True
+            if not getattr(entry, "returning_started_at", ""):
+                entry.returning_started_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                changed = True
 
         if entry.status != new_status:
             entry.status = new_status
             changed = True
 
+        return changed
+
+    def _commit_entry_change(self, entry: _SchedEntry, changed: bool):
+        if not changed:
+            return
+        entry.version = int(entry.version or 0) + 1
+        entry.updated_at = datetime.now().isoformat()
+        self.sched.touch_entry(entry)
+        self._render_schedule_tree()
+        self._flash_row_by_uid(entry.uid())
+
+    def _apply_status_change(
+        self,
+        entry: _SchedEntry,
+        new_status: str,
+        eta_minutes: Optional[int] = None,
+    ):
+        changed = self._update_entry_status_fields(entry, new_status, eta_minutes)
+        self._commit_entry_change(entry, changed)
         if changed:
-            entry.version = int(entry.version or 0) + 1
-            entry.updated_at = datetime.now().isoformat()
-            self.sched.touch_entry(entry)
-            self._render_schedule_tree()
-            self._flash_row_by_uid(entry.uid())
             self._set_status_combo(entry.status)
+        else:
+            self._toggle_eta_visibility()
 
     def _reset_form(self):
         self.ent_hn.clear(); self.ent_pid.clear(); self.ent_eta.clear()
@@ -1845,12 +2061,45 @@ QCheckBox { color:#0f172a; }
             entry.ops = ops
             changed = True
 
+        case_size = values.get("post_case_size", "")
+        department = values.get("post_department", "")
+        if getattr(entry, "case_size", "") != case_size:
+            entry.case_size = case_size
+            changed = True
+        if getattr(entry, "dept", "") != department:
+            entry.dept = department
+            changed = True
+        if getattr(entry, "post_case_size", "") != case_size:
+            entry.post_case_size = case_size
+            changed = True
+        if getattr(entry, "post_department", "") != department:
+            entry.post_department = department
+            changed = True
+        if not isinstance(entry._extra, dict):
+            entry._extra = {}
+        if entry._extra.get("post_case_size") != case_size:
+            entry._extra["post_case_size"] = case_size
+            changed = True
+        if entry._extra.get("post_department") != department:
+            entry._extra["post_department"] = department
+            changed = True
+        if entry._extra.get("case_size") != case_size:
+            entry._extra["case_size"] = case_size
+            changed = True
+        if entry._extra.get("dept") != department:
+            entry._extra["dept"] = department
+            changed = True
+
         if not changed:
             return
 
         entry.version = int(entry.version or 0) + 1
         entry.updated_at = datetime.now().isoformat()
         self.sched.touch_entry(entry)
+        try:
+            self.sched._save()
+        except Exception:
+            pass
         self._render_schedule_tree()
         self._flash_row_by_uid(entry.uid())
         self.toast.show_toast("บันทึกหลังผ่าตัดเรียบร้อย")
@@ -1898,6 +2147,190 @@ QCheckBox { color:#0f172a; }
         if not (entry.ops or entry.diags):
             return True
         return False
+
+    def _dt_from_date_and_hm(self, date_str: str, hm: str):
+        try:
+            hm = (hm or "").strip()
+            if not hm or ":" not in hm:
+                return None
+            base = _parse_date(date_str) if date_str else None
+            if base is None:
+                base = datetime.now().date()
+            h, m = hm.split(":", 1)
+            return datetime(base.year, base.month, base.day, int(h), int(m), 0)
+        except Exception:
+            return None
+
+    def _monitor_row_for_hn(self, hn: str) -> dict | None:
+        key = str(hn or "").strip()
+        if not key:
+            return None
+        best_row: dict | None = None
+        best_ts: datetime | None = None
+        for row in self.rows_cache:
+            row_hn = str(row.get("hn_full") or row.get("id") or "").strip()
+            if row_hn != key:
+                continue
+            ts = row.get("_ts")
+            if ts is None:
+                ts = _parse_iso(row.get("timestamp"))
+            if isinstance(ts, datetime):
+                if best_ts is None or ts >= best_ts:
+                    best_ts = ts
+                    best_row = row
+            elif best_row is None:
+                best_row = row
+        return best_row
+
+    def _monitor_recovery_start_dt(self, hn: str) -> Optional[datetime]:
+        row = self._monitor_row_for_hn(hn)
+        if not row:
+            return None
+        status_txt = str(row.get("status") or row.get("state") or "").strip()
+        if status_txt != STATUS_RECOVERY:
+            return None
+        ts_val = row.get("_ts")
+        if isinstance(ts_val, datetime):
+            return ts_val.replace(tzinfo=None)
+        for key in ("timestamp", "updated_at", "created_at", "ts"):
+            val = row.get(key)
+            dt_val = _parse_iso(val) if isinstance(val, str) else None
+            if isinstance(dt_val, datetime):
+                return dt_val
+        return None
+
+    def _recovery_start_dt_fallback(self, entry: _SchedEntry) -> Optional[datetime]:
+        if not entry:
+            return None
+        if entry.time_end:
+            dt = self._dt_from_date_and_hm(entry.date, entry.time_end)
+            if isinstance(dt, datetime):
+                return dt
+        return None
+
+    def _validate_status_transition(self, entry: _SchedEntry, new_status: str) -> tuple[bool, str]:
+        if entry is None:
+            return True, ""
+        target = (new_status or "").strip()
+        if not target:
+            return True, ""
+        current = (entry.status or STATUS_READY).strip() or STATUS_READY
+
+        if target == current:
+            return True, ""
+
+        if target == STATUS_POSTPONE:
+            if current in POSTPONE_ALLOWED_FROM:
+                return True, ""
+            return False, "อนุญาตให้ 'เลื่อนการผ่าตัด' ได้จากสถานะ 'รอผ่าตัด' เท่านั้น"
+
+        if current == STATUS_POSTPONE and target == STATUS_READY:
+            return True, ""
+
+        if target not in FLOW_INDEX or current not in FLOW_INDEX:
+            return False, "สถานะไม่อยู่ในลำดับที่ระบบรองรับ"
+
+        cur_i = FLOW_INDEX[current]
+        new_i = FLOW_INDEX[target]
+
+        if new_i < cur_i:
+            return False, "ไม่สามารถย้อนสถานะย้อนหลังได้"
+
+        if new_i > cur_i + 1:
+            need_idx = min(cur_i + 1, len(STATUS_FLOW) - 1)
+            need = STATUS_FLOW[need_idx]
+            flow_txt = " → ".join(STATUS_FLOW)
+            return False, (
+                "ไม่สามารถข้ามลำดับสถานะได้\n"
+                f"ลำดับที่ถูกต้อง: {flow_txt}\n"
+                f"สถานะปัจจุบัน: {current}\n"
+                f"กรุณาเลือก '{need}' ก่อน"
+            )
+
+        if current == STATUS_RECOVERY and target == STATUS_RETURNING:
+            hn = getattr(entry, "hn", "") or getattr(entry, "HN", "")
+            start_dt = self._monitor_recovery_start_dt(hn) or self._recovery_start_dt_fallback(entry)
+            if start_dt:
+                remain = (start_dt + timedelta(minutes=RECOVERY_DURATION_MIN)) - datetime.now()
+                if remain.total_seconds() > 0:
+                    return False, (
+                        f"ยังพักฟื้นไม่ครบ {RECOVERY_DURATION_MIN} นาที "
+                        f"(เหลือ {_fmt_hms(remain)})"
+                    )
+
+        return True, ""
+
+    def _status_countdown_text(self, entry: _SchedEntry) -> tuple[bool, str]:
+        now = datetime.now()
+        status = (entry.status or "").strip()
+        rec_start_extra = ""
+        try:
+            extra = getattr(entry, "_extra", {})
+            if isinstance(extra, dict):
+                rec_start_extra = str(extra.get("time_recovery_start") or "").strip()
+        except Exception:
+            rec_start_extra = ""
+
+        if status == STATUS_OP_START:
+            end_dt = None
+            monitor_row = self._monitor_row_for_hn(entry.hn)
+            if monitor_row:
+                ts_val = monitor_row.get("_ts")
+                if not isinstance(ts_val, datetime):
+                    ts_val = _parse_iso(monitor_row.get("timestamp"))
+                eta_val = monitor_row.get("eta_minutes")
+                if isinstance(ts_val, datetime) and isinstance(eta_val, int):
+                    end_dt = ts_val + timedelta(minutes=int(eta_val))
+            if end_dt is None:
+                end_dt = self._dt_from_date_and_hm(entry.date, entry.time_end)
+            if end_dt:
+                remain = end_dt - now
+                flag = "เหลือ" if remain.total_seconds() >= 0 else "เกินเวลา"
+                return True, f"({flag} {_fmt_td(remain)} นาที)"
+            return False, ""
+
+        if status == STATUS_RECOVERY:
+            start_dt = None
+            if rec_start_extra:
+                start_dt = _parse_iso(rec_start_extra)
+            if start_dt is None and entry.time_end:
+                start_dt = self._dt_from_date_and_hm(entry.date, entry.time_end)
+            if start_dt:
+                end_recovery = start_dt + timedelta(minutes=RECOVERY_DURATION_MIN)
+                remain = end_recovery - now
+                flag = "เหลือ" if remain.total_seconds() >= 0 else "เกินเวลา"
+                return True, f"({flag} {_fmt_td(remain)} นาที)"
+            return False, ""
+
+        return False, ""
+
+    def _status_label_for_entry(self, entry: _SchedEntry, flip: bool) -> str:
+        has_countdown, time_txt = self._status_countdown_text(entry)
+        base = (entry.status or "รอผ่าตัด").strip() or "รอผ่าตัด"
+        if has_countdown and flip:
+            return time_txt or base
+        return base
+
+    def _tick_status_col(self):
+        self._flip5s = not getattr(self, "_flip5s", False)
+        tree = getattr(self, "tree_sched", None)
+        if tree is None:
+            return
+        tree.setUpdatesEnabled(False)
+        try:
+            for i in range(tree.topLevelItemCount()):
+                parent = tree.topLevelItem(i)
+                if parent is None:
+                    continue
+                for j in range(parent.childCount()):
+                    child = parent.child(j)
+                    entry = child.data(0, QtCore.Qt.UserRole)
+                    if isinstance(entry, _SchedEntry):
+                        text = self._status_label_for_entry(entry, self._flip5s)
+                        if child.text(0) != text:
+                            child.setText(0, text)
+        finally:
+            tree.setUpdatesEnabled(True)
 
     def _first_visible_item(self) -> QtWidgets.QTreeWidgetItem | None:
         return None
@@ -2284,9 +2717,66 @@ QCheckBox { color:#0f172a; }
     def _on_ws_message(self, msg: str):
         try:
             payload = json.loads(msg)
+        except Exception:
+            return
+
+        if isinstance(payload, dict) and payload.get("event") == "case_moved":
+            self._on_case_moved(payload)
+            return
+
+        try:
             rows, meta = self._extract_rows(payload)
-            if rows is not None:
-                self._rebuild(rows, meta)
+        except Exception:
+            return
+        if rows is not None:
+            self._rebuild(rows, meta)
+
+    def _on_case_moved(self, msg: dict):
+        if not isinstance(msg, dict):
+            return
+
+        case_uid = str(msg.get("case_uid") or "")
+        hn_value = str(msg.get("hn") or "").strip()
+        target_or = str(msg.get("to_or") or "")
+        if not target_or:
+            return
+
+        entry = None
+        for candidate in self.sched.entries:
+            if case_uid and getattr(candidate, "case_uid", "") == case_uid:
+                entry = candidate
+                break
+            if hn_value and str(getattr(candidate, "hn", "")).strip() == hn_value:
+                entry = candidate
+                break
+
+        if entry is None:
+            return
+
+        if str(getattr(entry, "or_room", "")) == target_or:
+            return
+
+        setattr(entry, "or_room", target_or)
+
+        try:
+            if hasattr(self.sched, "touch_entry"):
+                self.sched.touch_entry(entry)
+            elif hasattr(self.sched, "_save"):
+                self.sched._save()
+        except Exception:
+            pass
+
+        try:
+            self._render_schedule_tree()
+        except Exception:
+            pass
+
+        try:
+            QtWidgets.QMessageBox.information(
+                self,
+                "อัปเดตห้อง",
+                f"ย้ายเคส HN {getattr(entry, 'hn', '') or hn_value} ไป {target_or}",
+            )
         except Exception:
             pass
 
@@ -2367,6 +2857,7 @@ QCheckBox { color:#0f172a; }
         or_room = None if pid else self.cb_or.currentText()
         q = None if pid else self.cb_q.currentText()
         status = self.cb_status.currentText() if action in ("add", "edit") else None
+        status_text = (status or "").strip()
 
         hn = self.ent_hn.text().strip()
         if action in ("add", "edit") and (not hn or len(hn) != 9 or not hn.isdigit()):
@@ -2374,9 +2865,29 @@ QCheckBox { color:#0f172a; }
             return
 
         eta_minutes = None
-        if self.cb_status.currentText() == "กำลังผ่าตัด":
+        if status_text == STATUS_OPERATING:
             eta_val = self.ent_eta.text().strip()
             eta_minutes = int(eta_val) if eta_val.isdigit() else None
+
+        entry = self._get_active_schedule_entry()
+        if action in ("add", "edit") and entry is not None and status_text:
+            ok, msg = self._validate_status_transition(entry, status_text)
+            if not ok:
+                QtWidgets.QMessageBox.warning(self, "ข้ามลำดับสถานะไม่ได้", msg)
+                self._set_status_combo(entry.status)
+                return
+            if status_text == STATUS_RETURNING and not entry.time_end:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "ยังผ่าตัดไม่จบ",
+                    "ยังไม่มีเวลา 'จบผ่าตัด' ระบบฝั่งแม่จะไม่เริ่มนับ 3 นาทีจนกว่าจะมีเวลาจบ",
+                )
+            updated = self._update_entry_status_fields(
+                entry,
+                status_text,
+                eta_minutes if status_text == STATUS_OPERATING else None,
+            )
+            self._commit_entry_change(entry, updated)
 
         eff_pid = pid or f"{or_room}-{q}"
         try:
@@ -2489,8 +3000,24 @@ QCheckBox { color:#0f172a; }
                 self._apply_or_expand_state(parent)
 
                 for e in sorted(groups[orr], key=row_sort_key):
+                    extra = e._extra if isinstance(getattr(e, "_extra", None), dict) else {}
+                    case_size_txt = (
+                        e.case_size
+                        or getattr(e, "post_case_size", "")
+                        or extra.get("post_case_size")
+                        or extra.get("case_size")
+                        or ""
+                    )
+                    dept_txt = (
+                        e.dept
+                        or getattr(e, "post_department", "")
+                        or extra.get("post_department")
+                        or extra.get("dept")
+                        or ""
+                    )
+
                     row = QtWidgets.QTreeWidgetItem([
-                        "",
+                        self._status_label_for_entry(e, False),
                         _period_label(e.period),
                         (e.time or "-"),
                         e.hn,
@@ -2500,22 +3027,28 @@ QCheckBox { color:#0f172a; }
                         (", ".join(e.ops) if getattr(e, "ops", None) else "-"),
                         (e.doctor or "-"),
                         (e.ward or "-"),
-                        (e.case_size or "-"),
-                        (e.dept or "-"),
+                        (case_size_txt or "-"),
+                        (dept_txt or "-"),
                         (e.assist1 or "-"),
                         (e.assist2 or "-"),
                         (e.scrub or "-"),
                         (e.circulate or "-"),
                         (e.time_start or "-"),
                         (e.time_end or "-"),
-                        (str(e.queue) if str(getattr(e, "queue", "0")).isdigit() and int(getattr(e, "queue", "0")) > 0 else "ตามเวลา"),
+                        (
+                            str(e.queue)
+                            if str(getattr(e, "queue", "0")).isdigit()
+                            and int(getattr(e, "queue", "0")) > 0
+                            else "ตามเวลา"
+                        ),
                         (e.urgency or "Elective"),
+                        "",
                     ])
                     row.setData(0, QtCore.Qt.UserRole, e)
                     parent.addChild(row)
 
                     if self._incomplete(e):
-                        tree.setItemWidget(row, 0, self._make_postop_button(e.uid()))
+                        tree.setItemWidget(row, 20, self._make_postop_button(e.uid()))
         finally:
             tree.setUpdatesEnabled(True)
 
