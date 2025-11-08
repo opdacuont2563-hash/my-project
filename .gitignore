@@ -37,3 +37,7 @@ qt.conf
 .env
 *.env
 data OR/
+
+# Node
+node_modules/
+or-dashboard/**/node_modules/

@@ -2,9 +2,9 @@
 """
 (ปรับปรุงจาก registry_patient_connect.py — แก้ strike-through logic & ปรับสไตล์ตาราง)
 """
-import os, sys, json, argparse, csv, base64, secrets, hashlib, unicodedata, re
+import os, sys, json, argparse, csv, base64, secrets, hashlib, unicodedata, re, sqlite3
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Set, Union
+from typing import List, Optional, Tuple, Dict, Set, Union, Callable
 from datetime import datetime, timedelta, time as dtime, date
 from concurrent.futures import ThreadPoolExecutor
 
@@ -15,6 +15,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QSettings, QUrl, QLocale
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QLinearGradient
 from PySide6.QtWebSockets import QWebSocket
+from PySide6.QtNetwork import QAbstractSocket
 from PySide6.QtWidgets import QDialog
 
 from icd10_catalog import (
@@ -24,6 +25,8 @@ from icd10_catalog import (
     get_diagnoses,
     get_operations,
 )
+
+from dashboard_tab import DashboardTab
 
 try:
     from rapidfuzz import fuzz, process  # type: ignore
@@ -315,95 +318,260 @@ DEFAULT_HOST = os.getenv("SURGIBOT_CLIENT_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.getenv("SURGIBOT_CLIENT_PORT", "8088"))
 DEFAULT_TOKEN = os.getenv("SURGIBOT_SECRET", "uTCoBelMyNfSSNmUulT_Kz6zrrCVkvD578MxEuLKZoaaXX0pVlpAD8toYHBxsFxI")
 
-# === Runner pickup service (FastAPI) ===
-RUNNER_BASE = os.getenv("SURGIBOT_RUNNER_BASE_URL", "http://127.0.0.1:8777").rstrip("/")
-RUNNER_UPDATE_API = "/runner/update"
-RUNNER_HEALTH_API = "/health"
-RUNNER_LIST_API = "/runner/list"
-RUNNER_ACK_API = "/runner/ack"
-RUNNER_ARRIVE_API = "/runner/arrive"
-RUNNER_FINISH_API = "/runner/finish"
-
-
-def runner_health_ok(timeout: float = 0.8) -> bool:
-    try:
-        r = requests.get(f"{RUNNER_BASE}{RUNNER_HEALTH_API}", timeout=timeout)
-        return bool(r.ok)
-    except requests.RequestException:
-        return False
-
-
-def _pickup_id_for_row(r: dict) -> str:
-    day = str(r.get("date") or r.get("วันที่") or date.today().isoformat()).strip()
-    hn = str(r.get("HN") or r.get("hn") or r.get("patient_id") or "").strip()
-    or_room = str(r.get("OR") or r.get("or") or r.get("or_room") or "").strip()
-    return f"{day}:{hn}:{or_room}"
-
-
-RUNNER_STATUS_LABELS = {
-    "waiting": "รอรับ",
-    "picking": "กำลังไปรับ",
-    "arrived": "ถึง OR",
-    "finished": "ผ่าตัดเสร็จแล้ว",
-}
-
-RUNNER_STATUS_COLORS = {
-    "waiting": "#64748b",
-    "picking": "#f59e0b",
-    "arrived": "#16a34a",
-    "finished": "#0f172a",
-}
-
-
-def _fetch_runner_status_map(day: str) -> Dict[str, dict]:
-    try:
-        resp = requests.get(
-            f"{RUNNER_BASE}{RUNNER_LIST_API}",
-            params={"date": day},
-            timeout=2.0,
-            headers={"Accept": "application/json"},
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        if isinstance(payload, dict):
-            for key in ("items", "data", "rows", "list"):
-                maybe = payload.get(key)
-                if isinstance(maybe, list):
-                    payload = maybe
-                    break
-            else:
-                payload = [payload]
-        if not isinstance(payload, list):
-            return {}
-        results: Dict[str, dict] = {}
-        for row in payload:
-            if not isinstance(row, dict):
-                continue
-            pid = row.get("pickup_id") or _pickup_id_for_row(row)
-            if not pid:
-                continue
-            results[str(pid)] = row
-        return results
-    except (requests.RequestException, ValueError):
-        return {}
-
-
 API_HEALTH = "/api/health";
 API_LIST = "/api/list";
 API_LIST_FULL = "/api/list_full";
 API_WS = "/api/ws"
 
+STATUS_OP_START = "กำลังผ่าตัด"
+STATUS_RECOVERY = "กำลังพักฟื้น"
+STATUS_RETURNING = "กำลังส่งกลับตึก"
+
 STATUS_COLORS = {
-    "รอผ่าตัด": "#fde047", "กำลังผ่าตัด": "#ef4444", "กำลังพักฟื้น": "#22c55e",
-    "กำลังส่งกลับตึก": "#a855f7", "เลื่อนการผ่าตัด": "#64748b",
+    STATUS_OP_START: "#f97316",
+    STATUS_RECOVERY: "#38bdf8",
+    "รอผ่าตัด": "#facc15",
+    "ส่งกลับตึก": "#22c55e",
+    STATUS_RETURNING: "#22c55e",
+    "เลื่อนการผ่าตัด": "#64748b",
 }
-PULSE_STATUS = {"กำลังผ่าตัด", "กำลังพักฟื้น", "กำลังส่งกลับตึก"}
+PULSE_STATUS = {STATUS_OP_START, STATUS_RECOVERY}
+RECOVERY_DURATION_MIN = 60
+
+WORKING_START = dtime(8, 30)
+WORKING_END = dtime(16, 30)
+
+
+def in_working_hours(dt: datetime | None = None) -> bool:
+    now = dt or datetime.now()
+    return WORKING_START <= now.time() < WORKING_END
+
+
+def next_deadline(dt: datetime | None = None) -> datetime:
+    now = dt or datetime.now()
+    if in_working_hours(now):
+        return datetime.combine(now.date(), WORKING_END)
+    if now.time() >= WORKING_END:
+        return datetime.combine(now.date() + timedelta(days=1), WORKING_START)
+    return datetime.combine(now.date(), WORKING_START)
+
+
+DB_PATH = Path.cwd() / "ornbh_postop.sqlite3"
+
+SCHEMA_SQL = """
+PRAGMA foreign_keys = ON;
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+
+CREATE TABLE IF NOT EXISTS postop_records (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  case_uid      TEXT UNIQUE,
+  hn            TEXT NOT NULL,
+  name          TEXT,
+  age           INTEGER,
+  or_room       TEXT,
+  ward          TEXT,
+  dept          TEXT,
+  doctor        TEXT,
+  case_size     TEXT CHECK (case_size IN ('Major','Minor')),
+  assist1       TEXT NOT NULL,
+  assist2       TEXT,
+  scrub         TEXT NOT NULL,
+  circulate     TEXT NOT NULL,
+  ops_json      TEXT NOT NULL,
+  diags_json    TEXT NOT NULL,
+  status        TEXT,
+  urgency       TEXT,
+  time_start_dt TEXT,
+  time_end_dt   TEXT,
+  created_at    TEXT DEFAULT (datetime('now')),
+  updated_at    TEXT DEFAULT (datetime('now')),
+
+  in_hours INTEGER GENERATED ALWAYS AS (
+    CASE
+      WHEN time(time_start_dt) >= '08:30' AND time(time_start_dt) < '16:30' THEN 1
+      ELSE 0
+    END
+  ) STORED,
+
+  bucket TEXT GENERATED ALWAYS AS (
+    CASE
+      WHEN lower(urgency) = 'emergency' AND in_hours = 1 THEN 'emergency_in_hours'
+      WHEN lower(urgency) = 'emergency' AND in_hours = 0 THEN 'emergency_off_hours'
+      ELSE 'elective'
+    END
+  ) STORED
+);
+
+CREATE INDEX IF NOT EXISTS idx_postop_date    ON postop_records (date(time_start_dt));
+CREATE INDEX IF NOT EXISTS idx_postop_bucket  ON postop_records (bucket);
+CREATE INDEX IF NOT EXISTS idx_postop_hn      ON postop_records (hn);
+CREATE INDEX IF NOT EXISTS idx_postop_status  ON postop_records (status);
+
+CREATE VIEW IF NOT EXISTS view_elective AS
+  SELECT * FROM postop_records WHERE bucket = 'elective';
+CREATE VIEW IF NOT EXISTS view_emergency_in_hours AS
+  SELECT * FROM postop_records WHERE bucket = 'emergency_in_hours';
+CREATE VIEW IF NOT EXISTS view_emergency_off_hours AS
+  SELECT * FROM postop_records WHERE bucket = 'emergency_off_hours';
+"""
+
+
+def _db_conn():
+    con = sqlite3.connect(str(DB_PATH))
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    return con
+
+
+def _init_db_once():
+    con = _db_conn()
+    try:
+        con.executescript(SCHEMA_SQL)
+        con.commit()
+    finally:
+        con.close()
+
+
+def save_postop_entry(entry):
+    con = _db_conn()
+    try:
+        ops_json = json.dumps(getattr(entry, "ops", []) or [], ensure_ascii=False)
+        diags_json = json.dumps(getattr(entry, "diags", []) or [], ensure_ascii=False)
+
+        def _normalize_date(obj) -> date:
+            if isinstance(obj, datetime):
+                return obj.date()
+            if isinstance(obj, date):
+                return obj
+            if hasattr(obj, "toPython"):
+                try:
+                    return obj.toPython()
+                except Exception:
+                    pass
+            if isinstance(obj, str):
+                try:
+                    return datetime.fromisoformat(obj).date()
+                except Exception:
+                    pass
+            return datetime.now().date()
+
+        base_date = _normalize_date(getattr(entry, "date", datetime.now().date()))
+
+        def _to_iso(hm: str):
+            if not hm or ":" not in str(hm):
+                return None
+            try:
+                h, m = map(int, str(hm).split(":")[:2])
+                dt = datetime.combine(base_date, dtime(h, m))
+                return dt.isoformat(timespec="seconds")
+            except Exception:
+                return None
+
+        time_start_iso = _to_iso(getattr(entry, "time_start", ""))
+        time_end_iso = _to_iso(getattr(entry, "time_end", ""))
+
+        try:
+            age_val = int(str(getattr(entry, "age", 0) or 0))
+        except Exception:
+            age_val = 0
+
+        case_uid = getattr(entry, "case_uid", "")
+        if not case_uid:
+            case_uid = f"{getattr(entry, 'hn', '')}-{getattr(entry, 'or_room', '')}-{getattr(entry, 'time', '')}"
+
+        con.execute(
+            """
+      INSERT INTO postop_records (
+        case_uid, hn, name, age, or_room, ward, dept, doctor, case_size,
+        assist1, assist2, scrub, circulate, ops_json, diags_json,
+        status, urgency, time_start_dt, time_end_dt, updated_at
+      )
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(case_uid) DO UPDATE SET
+        hn=excluded.hn, name=excluded.name, age=excluded.age,
+        or_room=excluded.or_room, ward=excluded.ward, dept=excluded.dept,
+        doctor=excluded.doctor, case_size=excluded.case_size,
+        assist1=excluded.assist1, assist2=excluded.assist2,
+        scrub=excluded.scrub, circulate=excluded.circulate,
+        ops_json=excluded.ops_json, diags_json=excluded.diags_json,
+        status=excluded.status, urgency=excluded.urgency,
+        time_start_dt=excluded.time_start_dt, time_end_dt=excluded.time_end_dt,
+        updated_at=excluded.updated_at
+    """,
+            (
+                case_uid,
+                getattr(entry, "hn", ""),
+                getattr(entry, "name", ""),
+                age_val,
+                getattr(entry, "or_room", ""),
+                getattr(entry, "ward", ""),
+                getattr(entry, "dept", ""),
+                getattr(entry, "doctor", ""),
+                getattr(entry, "case_size", ""),
+                getattr(entry, "assist1", ""),
+                getattr(entry, "assist2", ""),
+                getattr(entry, "scrub", ""),
+                getattr(entry, "circulate", ""),
+                ops_json,
+                diags_json,
+                getattr(entry, "status", ""),
+                getattr(entry, "urgency", ""),
+                time_start_iso,
+                time_end_iso,
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def missing_required_fields(entry) -> list[str]:
+    missing: list[str] = []
+
+    def _blank(val) -> bool:
+        if val is None:
+            return True
+        text = str(val).strip()
+        return text == "" or text.startswith("—")
+
+    if _blank(getattr(entry, "assist1", "")):
+        missing.append("Assist 1")
+    if _blank(getattr(entry, "scrub", "")):
+        missing.append("Scrub")
+    if _blank(getattr(entry, "circulate", "")):
+        missing.append("Circulate")
+    ops_list = getattr(entry, "ops", None)
+    if not (ops_list and len(ops_list) > 0):
+        missing.append("Operation (อย่างน้อย 1)")
+    diags_list = getattr(entry, "diags", None)
+    if not (diags_list and len(diags_list) > 0):
+        missing.append("Diagnosis (อย่างน้อย 1)")
+    if _blank(getattr(entry, "dept", "")):
+        missing.append("แผนก")
+    if _blank(getattr(entry, "case_size", "")):
+        missing.append("ขนาดเคส (Major/Minor)")
+    if _blank(getattr(entry, "time_start", "")):
+        missing.append("เวลาเริ่มผ่าตัด")
+    if _blank(getattr(entry, "time_end", "")):
+        missing.append("เวลาจบผ่าตัด")
+    try:
+        ts = getattr(entry, "time_start", "")
+        te = getattr(entry, "time_end", "")
+        if ts and te:
+            hs, ms = map(int, str(ts).split(":")[:2])
+            he, me = map(int, str(te).split(":")[:2])
+            if (he, me) <= (hs, ms):
+                missing.append("เวลาเริ่ม/จบ ไม่สมเหตุผล")
+    except Exception:
+        missing.append("รูปแบบเวลาไม่ถูกต้อง")
+    return missing
 DEFAULT_OR_ROOMS = ["OR1", "OR2", "OR3", "OR4", "OR5", "OR6", "OR8"]
 
 # --- สถานะจาก monitor ที่ใช้จับเวลา / auto-complete ---
-STATUS_OP_START = "กำลังผ่าตัด"
-STATUS_OP_END = "กำลังพักฟื้น"
-STATUS_RETURNING = "กำลังส่งกลับตึก"
+# NOTE: STATUS_OP_START / STATUS_RECOVERY / STATUS_RETURNING ประกาศด้านบน
 
 WARD_LIST = [
     "— กรุณาเลือก —",
@@ -595,6 +763,10 @@ class SweetAlert:
         QtWidgets.QMessageBox.warning(parent, title, text)
 
     @staticmethod
+    def error(parent: QtWidgets.QWidget, title: str, text: str) -> None:
+        QtWidgets.QMessageBox.critical(parent, title, text)
+
+    @staticmethod
     def confirm(parent: QtWidgets.QWidget, title: str, text: str) -> bool:
         box = QtWidgets.QMessageBox(parent)
         box.setIcon(QtWidgets.QMessageBox.Question)
@@ -616,39 +788,103 @@ class SweetAlert:
 
 
 class StatusChipWidget(QtWidgets.QWidget):
-    def __init__(self, text: str, color: str, pulse: bool = False, parent=None):
+    def __init__(
+        self,
+        text: str,
+        color: str,
+        pulse: bool = False,
+        alt_fn: Optional[Callable[[], str]] = None,
+        alt_interval_ms: int = 4000,
+        parent=None,
+    ):
         super().__init__(parent)
-        self._text = text;
-        self._color = color;
+        self._text_primary = text
+        self._text_display = text
+        self._color = color
         self._pulse = pulse
+        self._alt_fn = alt_fn
+        self._show_primary = True
+        self._alt_interval_ms = max(800, int(alt_interval_ms or 4000))
+
         if pulse:
-            self.eff = QtWidgets.QGraphicsOpacityEffect(self);
+            self.eff = QtWidgets.QGraphicsOpacityEffect(self)
             self.setGraphicsEffect(self.eff)
             self.anim = QtCore.QPropertyAnimation(self.eff, b"opacity", self)
-            self.anim.setDuration(1200);
-            self.anim.setStartValue(0.5);
+            self.anim.setDuration(1200)
+            self.anim.setStartValue(0.5)
             self.anim.setEndValue(1.0)
-            self.anim.setEasingCurve(QtCore.QEasingCurve.InOutQuad);
-            self.anim.setLoopCount(-1);
+            self.anim.setEasingCurve(QtCore.QEasingCurve.InOutQuad)
+            self.anim.setLoopCount(-1)
             self.anim.start()
 
-    def minimumSizeHint(self):
+        # อัปเดตตัวเลขทุก 1 วินาที
+        self._tick = QtCore.QTimer(self)
+        self._tick.setInterval(1000)
+        self._tick.timeout.connect(self._on_tick)
+
+        # สลับข้อความ primary <-> alt
+        self._swap = QtCore.QTimer(self)
+        self._swap.setInterval(self._alt_interval_ms)
+        self._swap.timeout.connect(self._on_swap)
+
+        if self._alt_fn:
+            self._tick.start()
+            self._swap.start()
+
+        self.setMinimumHeight(28)
+
+    def _on_tick(self):
+        if not self._alt_fn or self._show_primary:
+            return
+        try:
+            self._text_display = str(self._alt_fn()) or "-"
+        except Exception:
+            self._text_display = "-"
+        self.update()
+
+    def _on_swap(self):
+        if not self._alt_fn:
+            return
+        self._show_primary = not self._show_primary
+        if self._show_primary:
+            self._text_display = self._text_primary
+        else:
+            try:
+                self._text_display = str(self._alt_fn()) or "-"
+            except Exception:
+                self._text_display = "-"
+        self.update()
+
+    def sizeHint(self):
         fm = QtGui.QFontMetrics(self.font())
-        w = fm.horizontalAdvance(self._text) + 22 + 16
+        sample = ""
+        if self._alt_fn:
+            try:
+                sample = str(self._alt_fn()) or ""
+            except Exception:
+                pass
+        w = max(
+            fm.horizontalAdvance(self._text_primary),
+            fm.horizontalAdvance(sample),
+        ) + 22 + 16
         h = fm.height() + 10
         return QtCore.QSize(w, h)
 
     def paintEvent(self, e):
-        p = QtGui.QPainter(self);
+        p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
         rect = self.rect().adjusted(2, 2, -2, -2)
-        bg = QtGui.QColor(self._color);
+        bg = QtGui.QColor(self._color)
         bg.setAlpha(205)
-        p.setPen(QtCore.Qt.NoPen);
+        p.setPen(QtCore.Qt.NoPen)
         p.setBrush(bg)
         p.drawRoundedRect(rect, 10, 10)
         p.setPen(QtGui.QColor("#ffffff"))
-        p.drawText(rect.adjusted(12, 0, -8, 0), QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, self._text)
+        p.drawText(
+            rect.adjusted(12, 0, -8, 0),
+            QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft,
+            self._text_display,
+        )
 
 
 class PeriodBadge(QtWidgets.QWidget):
@@ -1051,6 +1287,16 @@ def _fmt_td(td: timedelta) -> str:
     m = (total % 3600) // 60;
     s = total % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _hhmm_on_base_date(hhmm: str, base_date: date) -> datetime | None:
+    if not hhmm or hhmm == "TF" or not isinstance(base_date, date):
+        return None
+    try:
+        hh, mm = map(int, hhmm.split(":", 1))
+        return datetime.combine(base_date, dtime(hour=hh, minute=mm))
+    except Exception:
+        return None
 
 
 def _parse_iso(ts: str):
@@ -1788,6 +2034,14 @@ def show_doctor_with_dept(name: str) -> str:
     return f"{normalized} — {dept}"
 
 
+def strip_doctor_dept(text: str) -> str:
+    """Return doctor name without the trailing department label."""
+    if not text:
+        return ""
+    head, sep, _ = text.partition("—")
+    return head.strip() if sep else text.strip()
+
+
 def format_or_display(or_key: str | None) -> str:
     if not or_key or or_key == "-":
         return "-"
@@ -2044,9 +2298,14 @@ class Main(QtWidgets.QWidget):
         self.tray.show()
 
         self._last_status_by_hn: dict[str, str] = {}
-        self._runner_status_cache: Dict[str, dict] = {}
-        self._last_runner_user: str = ""
-        self._runner_finished_sent: Set[str] = set()
+        self._status_ts_by_hn: Dict[str, datetime] = {}
+        self._eta_by_hn: Dict[str, Optional[int]] = {}
+
+        self.CASE_UID_ROLE = QtCore.Qt.UserRole + 10
+        self.HN_ROLE = QtCore.Qt.UserRole + 11
+        self.OR_ROLE = QtCore.Qt.UserRole + 12
+
+        self.api_base_url = getattr(self, "api_base_url", "http://127.0.0.1:8000")
 
         # form edit mode
         self._edit_idx: Optional[int] = None
@@ -2093,6 +2352,9 @@ class Main(QtWidgets.QWidget):
         self.resize(1360, 900)
         apply_modern_theme(self)
         self._build_ui();
+        _init_db_once()
+        self._reminded_keys: Set[str] = set()
+        self._start_unsaved_reminder()
         self._load_settings();
         self._pdpa_gate();
         self._start_timers()
@@ -2245,9 +2507,21 @@ class Main(QtWidgets.QWidget):
         g.addWidget(self.op_adder, r, 0, 1, 6)
         r += 1
 
-        g.addWidget(section_header("Scrub Nurse / ทีมพยาบาล"), r, 0, 1, 6)
+        g.addWidget(
+            section_header(
+                "พยาบาลห้องผ่าตัด (Scrub Nurse) — สำหรับพยาบาลห้องผ่าตัดกรอกข้อมูล"
+            ),
+            r,
+            0,
+            1,
+            6,
+        )
         r += 1
-        row_n = QtWidgets.QHBoxLayout();
+
+        scrub_box = QtWidgets.QWidget()
+        scrub_box.setObjectName("scrubSection")
+        scrub_box.setProperty("role", "scrub-section")
+        row_n = QtWidgets.QHBoxLayout(scrub_box)
         row_n.setSpacing(8)
 
         def _hint(txt: str) -> QtWidgets.QLabel:
@@ -2256,44 +2530,55 @@ class Main(QtWidgets.QWidget):
             return lab
 
         self.cb_assist1 = make_search_combo(SCRUB_NURSES)
+        self.cb_assist1.setProperty("role", "assist1")
         self.cb_assist2 = make_search_combo(SCRUB_NURSES)
+        self.cb_assist2.setProperty("role", "assist2")
         self.cb_scrub = make_search_combo(SCRUB_NURSES)
+        self.cb_scrub.setProperty("role", "scrub")
         self.cb_circulate = make_search_combo(SCRUB_NURSES)
+        self.cb_circulate.setProperty("role", "circulate")
 
-        row_n.addWidget(_hint("Assist 1"));
+        row_n.addWidget(_hint("Assist 1"))
         row_n.addWidget(self.cb_assist1, 1)
-        row_n.addWidget(_hint("Assist 2"));
+        row_n.addWidget(_hint("Assist 2"))
         row_n.addWidget(self.cb_assist2, 1)
-        row_n.addWidget(_hint("Scrub"));
+        row_n.addWidget(_hint("Scrub"))
         row_n.addWidget(self.cb_scrub, 1)
-        row_n.addWidget(_hint("Circulate"));
+        row_n.addWidget(_hint("Circulate"))
         row_n.addWidget(self.cb_circulate, 1)
-        g.addLayout(row_n, r, 0, 1, 6)
+        g.addWidget(scrub_box, r, 0, 1, 6)
         r += 1
 
         g.addWidget(section_header("เวลาเริ่ม–จบผ่าตัด (ใส่หรือไม่ใส่ก็ได้)"), r, 0, 1, 6)
         r += 1
-        row_t = QtWidgets.QHBoxLayout();
+
+        time_box = QtWidgets.QWidget()
+        time_box.setObjectName("timeGroup")
+        time_box.setProperty("role", "time-group")
+        row_t = QtWidgets.QHBoxLayout(time_box)
         row_t.setSpacing(10)
+
         self.ck_time_start = QtWidgets.QCheckBox("ระบุเวลาเริ่ม")
+        self.ck_time_start.setProperty("role", "time-start-check")
         self.time_start = QtWidgets.QTimeEdit(QtCore.QTime.currentTime())
         self.time_start.setDisplayFormat("HH:mm")
         self.time_start.setEnabled(False)
+        self.time_start.setProperty("role", "time-start")
         self.ck_time_end = QtWidgets.QCheckBox("ระบุเวลาจบ")
+        self.ck_time_end.setProperty("role", "time-end-check")
         self.time_end = QtWidgets.QTimeEdit(QtCore.QTime.currentTime())
         self.time_end.setDisplayFormat("HH:mm")
         self.time_end.setEnabled(False)
+        self.time_end.setProperty("role", "time-end")
 
         self.ck_time_start.toggled.connect(lambda ch: self.time_start.setEnabled(ch))
         self.ck_time_end.toggled.connect(lambda ch: self.time_end.setEnabled(ch))
 
         row_t.addWidget(self.ck_time_start)
         row_t.addWidget(self.time_start)
-        row_t.addSpacing(16)
         row_t.addWidget(self.ck_time_end)
         row_t.addWidget(self.time_end)
-        row_t.addStretch(1)
-        g.addLayout(row_t, r, 0, 1, 6)
+        g.addWidget(time_box, r, 0, 1, 6)
         r += 1
 
         self.btn_add = QtWidgets.QPushButton("➕ เพิ่ม");
@@ -2375,15 +2660,12 @@ class Main(QtWidgets.QWidget):
         for i in (2, 4, 5):
             hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.Interactive)
         self.tree2.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
-        self.tree2.customContextMenuRequested.connect(self._result_ctx_menu)
+        self.tree2.customContextMenuRequested.connect(self._on_tree2_context_menu)
         gr2.addWidget(self.tree2, 0, 0, 1, 1)
 
         import_bar = QtWidgets.QHBoxLayout()
         import_bar.setContentsMargins(0, 6, 0, 0)
         import_bar.setSpacing(10)
-        self.btn_send_runner = QtWidgets.QPushButton("🚚 ส่งให้ Runner (วันนี้)")
-        self.btn_send_runner.setProperty("variant", "primary")
-        import_bar.addWidget(self.btn_send_runner, 0)
         self.btn_import_excel = QtWidgets.QPushButton("📥 นำเข้าจาก Excel")
         self.btn_import_excel.setProperty("variant", "ghost")
         import_bar.addWidget(self.btn_import_excel, 0)
@@ -2394,6 +2676,12 @@ class Main(QtWidgets.QWidget):
         self.btn_undo_clear.setProperty("variant", "ghost")
         self.btn_undo_clear.setEnabled(False)
         import_bar.addWidget(self.btn_undo_clear, 0)
+        self.btn_commit = QtWidgets.QPushButton("ยืนยันและบันทึกลงฐานข้อมูล")
+        self.btn_commit.setStyleSheet(
+            "QPushButton{background:#16a34a;color:#fff;padding:8px 12px;border-radius:8px;font-weight:700}"
+        )
+        self.btn_commit.clicked.connect(self._on_commit_clicked)
+        import_bar.addWidget(self.btn_commit, 0)
         import_bar.addStretch(1)
         gr2.addLayout(import_bar, 1, 0, 1, 1)
         gr2.setRowStretch(0, 1)
@@ -2473,11 +2761,13 @@ class Main(QtWidgets.QWidget):
         t3.addWidget(mon, 1)
         self.tabs.addTab(tab3, "Monitor Realtime")
 
+        self.dashboard_tab = DashboardTab(self)
+        self.tabs.addTab(self.dashboard_tab, "Dashboard")
+
         # signals
         self.btn_refresh.clicked.connect(lambda: self._refresh(True))
         self.btn_export.clicked.connect(self._export_csv)
         self.btn_export_deid.clicked.connect(self._export_deid_csv)
-        self.btn_send_runner.clicked.connect(self._on_send_runner_today)
         self.btn_import_excel.clicked.connect(self._on_import_excel)
         self.btn_clear_board.clicked.connect(self._on_clear_board_clicked)
         self.btn_undo_clear.clicked.connect(self._on_undo_clear_clicked)
@@ -2657,6 +2947,8 @@ class Main(QtWidgets.QWidget):
 
     def _rebuild_table(self, rows):
         self.rows_cache = rows;
+        self._status_ts_by_hn.clear()
+        self._eta_by_hn.clear()
         self.table.setRowCount(0)
         if not rows:
             self.table.setRowCount(1);
@@ -2680,6 +2972,18 @@ class Main(QtWidgets.QWidget):
             ts = _parse_iso(r.get("timestamp"));
             txt = ""
             if ts: txt = _fmt_td(datetime.now() - ts)
+
+            hn_key = str(r.get("hn_full") or r.get("id") or "").strip()
+            eta_val = r.get("eta_minutes")
+            eta_int: Optional[int]
+            try:
+                eta_int = int(eta_val) if eta_val not in (None, "") else None
+            except Exception:
+                eta_int = None
+            if hn_key:
+                if ts is not None:
+                    self._status_ts_by_hn[hn_key] = ts
+                self._eta_by_hn[hn_key] = eta_int
             self.table.setItem(i, 3, QtWidgets.QTableWidgetItem(txt))
         # ให้ Result tree รีเฟรชเงื่อนไขแสดงผลด้วย เมื่อ monitor เปลี่ยน
         self._render_tree2()
@@ -2703,7 +3007,16 @@ class Main(QtWidgets.QWidget):
 
     def _on_ws_msg(self, msg):
         try:
-            rows = extract_rows(json.loads(msg))
+            payload = json.loads(msg)
+        except Exception:
+            return
+
+        if isinstance(payload, dict) and payload.get("event") == "case_moved":
+            self._handle_case_moved_event(payload)
+            return
+
+        try:
+            rows = extract_rows(payload)
             self._scan_monitor_status_transitions(rows)
             self._rebuild_table(rows)
         except Exception:
@@ -2771,15 +3084,6 @@ class Main(QtWidgets.QWidget):
                 matches.append(entry)
         return matches
 
-    def _pickup_id_for_entry(self, entry: "ScheduleEntry", override_or: Optional[str] = None) -> str:
-        entry_or = override_or if override_or is not None else getattr(entry, "or_room", "")
-        payload = {
-            "date": str(getattr(entry, "date", date.today())),
-            "HN": getattr(entry, "hn", ""),
-            "OR": entry_or,
-        }
-        return _pickup_id_for_row(payload)
-
     def _coerce_time_value(self, value) -> str:
         if value in (None, "", "TF"):
             return ""
@@ -2799,215 +3103,6 @@ class Main(QtWidgets.QWidget):
             except Exception:
                 return ""
         return text
-
-    def _entry_to_runner_payload(self, entry: "ScheduleEntry", override_or: Optional[str] = None) -> Optional[dict]:
-        hn = (entry.hn or "").strip()
-        or_room = (override_or if override_or is not None else entry.or_room or "").strip()
-        if not hn or not or_room:
-            return None
-
-        start_value = getattr(entry, "time_start", "") or getattr(entry, "time", "")
-        start_time = self._coerce_time_value(start_value)
-
-        pickup_id = self._pickup_id_for_entry(entry, or_room)
-
-        return {
-            "pickup_id": pickup_id,
-            "date": str(getattr(entry, "date", date.today())),
-            "hn": hn,
-            "name": getattr(entry, "name", ""),
-            "ward_from": getattr(entry, "ward", ""),
-            "or_to": or_room,
-            "call_time": datetime.now().strftime("%H:%M"),
-            "due_time": "",
-            "status": "waiting",
-            "assignee": "",
-            "ack_time": "",
-            "start_time": start_time,
-            "arrive_time": "",
-            "note": getattr(entry, "note", "") if hasattr(entry, "note") else "",
-        }
-
-    def _push_rows_to_runner(
-            self,
-            entries: List["ScheduleEntry"],
-            *,
-            runner_ready: Optional[bool] = None,
-            collect_failures: bool = False,
-    ) -> Tuple[int, List[str]]:
-        if not entries:
-            return (0, [])
-
-        if runner_ready is None:
-            runner_ready = runner_health_ok()
-        if not runner_ready:
-            return (0, [])
-
-        ok = 0
-        failed: List[str] = []
-        url = f"{RUNNER_BASE}{RUNNER_UPDATE_API}"
-
-        for entry in entries:
-            payload = self._entry_to_runner_payload(entry)
-            if not payload:
-                continue
-            try:
-                resp = requests.post(url, json=payload, timeout=2.0, headers={"Accept": "application/json"})
-                resp.raise_for_status()
-                ok += 1
-            except requests.RequestException:
-                if collect_failures:
-                    failed.append(payload.get("hn") or payload.get("pickup_id") or "-")
-        return ok, failed
-
-    def _runner_status_label(self, status: str) -> str:
-        status = (status or "").strip()
-        return RUNNER_STATUS_LABELS.get(status, status)
-
-    def _runner_status_tooltip(self, payload: dict) -> str:
-        hints: List[str] = []
-        mapping = [
-            ("status", "สถานะ"),
-            ("assignee", "ผู้รับเคส"),
-            ("ack_time", "เวลารับเคส"),
-            ("start_time", "เวลาเริ่มส่ง"),
-            ("arrive_time", "ถึง OR"),
-            ("note", "หมายเหตุ"),
-        ]
-        for key, label in mapping:
-            value = payload.get(key)
-            if value:
-                hints.append(f"{label}: {value}")
-        return "\n".join(hints)
-
-    def _ask_runner_name(self) -> str:
-        text, ok = QtWidgets.QInputDialog.getText(
-            self,
-            "ชื่อผู้ไปรับเคส",
-            "กรุณาระบุชื่อเจ้าหน้าที่ Runner:",
-            QtWidgets.QLineEdit.Normal,
-            self._last_runner_user,
-        )
-        if not ok:
-            return ""
-        text = str(text).strip()
-        if text:
-            self._last_runner_user = text
-        return text
-
-    def _runner_ack(self, pickup_id: str, user: str) -> bool:
-        try:
-            resp = requests.post(
-                f"{RUNNER_BASE}{RUNNER_ACK_API}",
-                json={"pickup_id": pickup_id, "user": user},
-                timeout=2.0,
-                headers={"Accept": "application/json"},
-            )
-            return bool(resp.ok)
-        except requests.RequestException:
-            return False
-
-    def _runner_arrive(self, pickup_id: str, user: str) -> bool:
-        try:
-            resp = requests.post(
-                f"{RUNNER_BASE}{RUNNER_ARRIVE_API}",
-                json={"pickup_id": pickup_id, "user": user},
-                timeout=2.0,
-                headers={"Accept": "application/json"},
-            )
-            return bool(resp.ok)
-        except requests.RequestException:
-            return False
-
-    def _runner_finish(self, pickup_id: str, user: str = "ระบบ") -> bool:
-        try:
-            resp = requests.post(
-                f"{RUNNER_BASE}{RUNNER_FINISH_API}",
-                json={"pickup_id": pickup_id, "user": user},
-                timeout=2.0,
-                headers={"Accept": "application/json"},
-            )
-            return bool(resp.ok)
-        except requests.RequestException:
-            return False
-
-    def _auto_finish_runner_cases(self, entries: List["ScheduleEntry"], status_map: Dict[str, dict]) -> None:
-        if not entries or not status_map:
-            return
-        for entry in entries:
-            if not self._is_entry_completed(entry):
-                continue
-            pickup_id = self._pickup_id_for_entry(entry)
-            if not pickup_id:
-                continue
-            row = status_map.get(pickup_id) or {}
-            if str(row.get("status") or "").strip() == "finished":
-                self._runner_finished_sent.discard(pickup_id)
-                continue
-            if pickup_id in self._runner_finished_sent:
-                continue
-            if self._runner_finish(pickup_id, user="ระบบ"):
-                self._runner_finished_sent.add(pickup_id)
-
-    def _handle_runner_action(self, entry: "ScheduleEntry", action: str) -> None:
-        pid = self._pickup_id_for_entry(entry)
-        if not pid:
-            self.toast.show_toast("ไม่พบข้อมูล OR/HN สำหรับ Runner")
-            return
-        if not runner_health_ok():
-            self.toast.show_toast("ไม่สามารถเชื่อมต่อ Runner ได้")
-            return
-        user = self._ask_runner_name()
-        if not user:
-            return
-        if action == "ack":
-            ok = self._runner_ack(pid, user)
-            success_msg = "รับเคสเรียบร้อย"
-        else:
-            ok = self._runner_arrive(pid, user)
-            success_msg = "บันทึกถึง OR แล้ว"
-        if ok:
-            self.toast.show_toast(success_msg)
-            self._render_tree2()
-        else:
-            self.toast.show_toast("ส่งข้อมูลไป Runner ไม่สำเร็จ")
-
-    def _on_send_runner_today(self):
-        rows = self._entries_of_selected_date()
-        if not rows:
-            SweetAlert.info(self, "ไม่มีรายการ", "ยังไม่มีเคสของวันที่เลือกที่จะส่งให้ Runner")
-            return
-
-        runner_ready = runner_health_ok()
-        if not runner_ready:
-            SweetAlert.warning(
-                self,
-                "ไม่สามารถเชื่อมต่อ",
-                f"เชื่อมต่อ Runner ไม่ได้ (ตรวจสอบ {RUNNER_BASE})",
-            )
-            return
-
-        dlg = SweetAlert.loading(self, "กำลังส่งข้อมูลไป Runner ...")
-        dlg.show()
-        QtWidgets.QApplication.processEvents()
-        try:
-            ok, failed = self._push_rows_to_runner(rows, runner_ready=runner_ready, collect_failures=True)
-        finally:
-            dlg.close()
-
-        if ok > 0 and not failed:
-            SweetAlert.success(self, "สำเร็จ", f"ส่งให้ Runner แล้ว {ok} รายการ", auto_close_msec=1600)
-        elif ok > 0 and failed:
-            SweetAlert.success(
-                self,
-                "สำเร็จบางส่วน",
-                f"สำเร็จ {ok} • ล้มเหลว {len(failed)}\n(HN: {', '.join(failed[:10])}{' …' if len(failed) > 10 else ''})",
-            )
-        else:
-            SweetAlert.warning(self, "ไม่สำเร็จ",
-                               f"ส่งให้ Runner ไม่ได้เลย — ตรวจสอบว่าเซิร์ฟเวอร์ Runner เปิดอยู่ที่ {RUNNER_BASE} หรือไม่")
-
-        self._render_tree2()
 
     def _on_import_excel(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -3822,6 +3917,25 @@ class Main(QtWidgets.QWidget):
             if not status:
                 continue
 
+            eta = row.get("eta_minutes")
+            if isinstance(eta, str) and eta.isdigit():
+                eta_val: Optional[int] = int(eta)
+            elif isinstance(eta, int):
+                eta_val = eta
+            else:
+                eta_val = None
+            self._eta_by_hn[hn] = eta_val
+
+            ts_raw = (
+                row.get("timestamp")
+                or row.get("updated_at")
+                or row.get("created_at")
+                or row.get("time")
+            )
+            ts = _parse_iso(ts_raw) if ts_raw else None
+            if ts:
+                self._status_ts_by_hn[hn] = ts
+
             prev = self._last_status_by_hn.get(hn)
             if prev == status:
                 continue
@@ -3837,7 +3951,7 @@ class Main(QtWidgets.QWidget):
                 if entry.state in {"scheduled", "in_or", "operation_ended", "postop_pending", ""}:
                     entry.state = "operation_started"
                     changed = True
-            elif status == STATUS_OP_END:
+            elif status == STATUS_RECOVERY:
                 self._set_time_end_if_empty(entry)
                 if entry.state in {"operation_started", "in_or", "scheduled", ""}:
                     entry.state = "operation_ended"
@@ -3853,6 +3967,50 @@ class Main(QtWidgets.QWidget):
 
             if changed:
                 self.sched._save()
+
+    def _monitor_info_for_hn(self, hn: str) -> tuple[Optional[datetime], Optional[int]]:
+        key = str(hn or "").strip()
+        if not key:
+            return (None, None)
+
+        ts = self._status_ts_by_hn.get(key)
+        eta = self._eta_by_hn.get(key) if key in self._eta_by_hn else None
+        if ts is not None or key in self._eta_by_hn:
+            return (ts, eta)
+
+        best_ts: Optional[datetime] = None
+        eta_val: Optional[int] = None
+        for row in self.rows_cache:
+            row_hn = str(row.get("hn_full") or row.get("id") or "").strip()
+            if row_hn != key:
+                continue
+            ts_candidate = (
+                row.get("timestamp")
+                or row.get("updated_at")
+                or row.get("created_at")
+                or row.get("time")
+            )
+            ts_parsed = _parse_iso(ts_candidate) if ts_candidate else None
+            if ts_parsed is not None and (best_ts is None or ts_parsed >= best_ts):
+                best_ts = ts_parsed
+                eta_candidate = row.get("eta_minutes")
+                try:
+                    eta_val = int(eta_candidate) if eta_candidate not in (None, "") else None
+                except Exception:
+                    eta_val = None
+            elif best_ts is None:
+                eta_candidate = row.get("eta_minutes")
+                try:
+                    eta_val = int(eta_candidate) if eta_candidate not in (None, "") else eta_val
+                except Exception:
+                    pass
+
+        if best_ts is not None:
+            self._status_ts_by_hn[key] = best_ts
+        if key and (best_ts is not None or eta_val is not None):
+            self._eta_by_hn[key] = eta_val
+
+        return (self._status_ts_by_hn.get(key), self._eta_by_hn.get(key))
 
     def _is_entry_completed(self, e: ScheduleEntry) -> bool:
         """ตรวจว่ารายการถูกเติมข้อมูลหลังผ่าตัดครบถ้วนพอสำหรับการปิดเคส"""
@@ -3912,26 +4070,6 @@ class Main(QtWidgets.QWidget):
                 return base_date
 
             entries_for_day = [entry for entry in entries_snapshot if _resolved_date(entry) == base_date]
-
-            valid_pickups: Set[str] = set()
-            for entry in entries_for_day:
-                pid = self._pickup_id_for_entry(entry)
-                if pid:
-                    valid_pickups.add(pid)
-            if valid_pickups:
-                self._runner_finished_sent.intersection_update(valid_pickups)
-            else:
-                self._runner_finished_sent.clear()
-
-            runner_status_map: Dict[str, dict] = {}
-            runner_ready = False
-            if entries_for_day:
-                runner_ready = runner_health_ok()
-                if runner_ready:
-                    self._push_rows_to_runner(entries_for_day, runner_ready=True)
-                    runner_status_map = _fetch_runner_status_map(str(base_date))
-                    self._auto_finish_runner_cases(entries_for_day, runner_status_map)
-            self._runner_status_cache = runner_status_map
 
             indexed_entries: List[Tuple[int, ScheduleEntry]] = list(enumerate(entries_snapshot))
             if not indexed_entries:
@@ -4034,19 +4172,7 @@ class Main(QtWidgets.QWidget):
                     display_or = format_or_display(or_room)
                     first_entry = entries_only[0] if entries_only else None
                     the_date = getattr(first_entry, 'date', base_date)
-                    plan_label = ""
-                    if actual_or not in {'', '-', OR_AFTER_HOURS}:
-                        plan_label = describe_or_plan_label(the_date, actual_or)
-
-                    if plan_label:
-                        header_text = f"{display_or} • {plan_label}"
-                    else:
-                        owner = resolve_or_owner(actual_or, the_date, getattr(first_entry, 'doctor', None)) or '-'
-                        owner_display = show_doctor_with_dept(owner) if owner and owner not in {'-', ''} else owner
-                        if owner_display and owner_display not in {'-', ''}:
-                            header_text = f"{display_or} • {owner_display}"
-                        else:
-                            header_text = display_or
+                    header_text = display_or
                     header_item.setText(0, header_text)
                     font = header_item.font(0)
                     font.setBold(True)
@@ -4060,11 +4186,28 @@ class Main(QtWidgets.QWidget):
                     for idx, entry in bucket_sorted:
                         diag_txt = ' ; '.join(entry.diags) if entry.diags else '-'
                         op_txt = ' ; '.join(entry.ops) if entry.ops else '-'
-                        or_time = f"{display_or} • {entry.time or 'TF'}"
-                        doctor_display = show_doctor_with_dept(entry.doctor) if entry.doctor else ''
+                        or_time = (
+                            f"{display_or} • {entry.time}" if getattr(entry, "time", None) else display_or
+                        )
+                        from_this_patch_doctor_display = (
+                            normalize_doctor_name(entry.doctor) if entry.doctor else ''
+                        )
                         status_text = getattr(entry, 'status', '') or (entry.state or '') or '-'
-                        case_size_txt = getattr(entry, 'case_size', '') or '-'
-                        dept_txt = getattr(entry, 'dept', '') or '-'
+                        extra = entry._extra if isinstance(getattr(entry, '_extra', None), dict) else {}
+                        case_size_txt = (
+                            getattr(entry, 'case_size', '')
+                            or getattr(entry, 'post_case_size', '')
+                            or extra.get('post_case_size')
+                            or extra.get('case_size')
+                            or ''
+                        ) or '-'
+                        dept_txt = (
+                            getattr(entry, 'dept', '')
+                            or getattr(entry, 'post_department', '')
+                            or extra.get('post_department')
+                            or extra.get('dept')
+                            or ''
+                        ) or '-'
                         row = QtWidgets.QTreeWidgetItem([
                             or_time,
                             entry.hn or '-',
@@ -4072,7 +4215,7 @@ class Main(QtWidgets.QWidget):
                             str(entry.age or 0),
                             diag_txt,
                             op_txt,
-                            doctor_display or '-',
+                            from_this_patch_doctor_display or '-',
                             entry.ward or '-',
                             case_size_txt,
                             dept_txt,
@@ -4087,36 +4230,59 @@ class Main(QtWidgets.QWidget):
                         ])
                         row.setData(0, QtCore.Qt.UserRole, entry.uid())
                         row.setData(0, QtCore.Qt.UserRole + 1, idx)
-                        pickup_id = self._pickup_id_for_entry(entry, actual_or)
-                        row.setData(0, QtCore.Qt.UserRole + 2, pickup_id)
+                        row.setData(0, self.CASE_UID_ROLE, getattr(entry, 'case_uid', ''))
+                        row.setData(0, self.HN_ROLE, entry.hn or '')
+                        row.setData(0, self.OR_ROLE, actual_or)
                         header_item.addChild(row)
 
                         badge = _period_badge(entry.period or 'in')
                         self.tree2.setItemWidget(row, 12, badge)
 
-                        runner_info = runner_status_map.get(pickup_id, {})
-                        runner_status = (runner_info or {}).get('status', '')
-                        runner_label = self._runner_status_label(runner_status)
-                        if runner_label:
-                            chip_color = RUNNER_STATUS_COLORS.get(runner_status, '#64748b')
-                            runner_chip = StatusChipWidget(runner_label, chip_color)
-                            self.tree2.setItemWidget(row, 17, runner_chip)
-                            row.setText(17, '')
-                            tooltip = self._runner_status_tooltip(runner_info)
-                            if tooltip:
-                                row.setToolTip(17, tooltip)
-                            name_txt = entry.name or '-'
-                            row.setText(2, f"[{runner_label}] {name_txt}")
-                        else:
-                            self.tree2.setItemWidget(row, 17, None)
-                            row.setText(17, status_text)
-                            row.setToolTip(17, '')
-                            row.setText(2, entry.name or '-')
-
                         monitor_status = self._last_status_by_hn.get(str(entry.hn).strip(), '')
+
                         if monitor_status:
                             color = STATUS_COLORS.get(monitor_status, '#64748b')
-                            chip = StatusChipWidget(monitor_status, color, pulse=(monitor_status in PULSE_STATUS))
+                            alt_fn = None
+                            hn_key = str(entry.hn).strip()
+
+                            if monitor_status == STATUS_OP_START:
+                                mon_ts, mon_eta = self._monitor_info_for_hn(hn_key)
+                                if mon_ts is not None and isinstance(mon_eta, int):
+
+                                    def _alt_text(hn_key: str = hn_key) -> str:
+                                        now = datetime.now()
+                                        ts_local, eta_local = self._monitor_info_for_hn(hn_key)
+                                        if ts_local is None or not isinstance(eta_local, int):
+                                            return "-"
+                                        remain = ts_local + timedelta(minutes=int(eta_local)) - now
+                                        flag = "เหลือ" if remain.total_seconds() >= 0 else "เกินเวลา"
+                                        return f"({flag} {_fmt_td(remain)} นาที)"
+
+                                    alt_fn = _alt_text
+
+                            elif monitor_status == STATUS_RECOVERY:
+                                mon_ts, _ = self._monitor_info_for_hn(hn_key)
+                                if mon_ts is not None:
+
+                                    def _alt_text_rec(hn_key: str = hn_key) -> str:
+                                        now = datetime.now()
+                                        ts_local, _ = self._monitor_info_for_hn(hn_key)
+                                        if ts_local is None:
+                                            return "-"
+                                        remain = ts_local + timedelta(minutes=RECOVERY_DURATION_MIN) - now
+                                        flag = "เหลือ" if remain.total_seconds() >= 0 else "เกินเวลา"
+                                        return f"({flag} {_fmt_td(remain)} นาที)"
+
+                                    alt_fn = _alt_text_rec
+
+                            chip = StatusChipWidget(
+                                monitor_status,
+                                color,
+                                pulse=(monitor_status in PULSE_STATUS),
+                                alt_fn=alt_fn,
+                                alt_interval_ms=4000,
+                            )
+
                             cell = QtWidgets.QWidget()
                             lay = QtWidgets.QHBoxLayout(cell)
                             lay.setContentsMargins(0, 0, 0, 0)
@@ -4161,6 +4327,105 @@ class Main(QtWidgets.QWidget):
                 hbar.setValue(min(hpos, hbar.maximum()))
 
             QtCore.QTimer.singleShot(0, _restore_scroll)
+
+    def _current_entry_in_result(self):
+        item = self.tree2.currentItem()
+        if not item:
+            return None
+        idx = item.data(0, QtCore.Qt.UserRole + 1)
+        if idx is None:
+            return None
+        try:
+            idx_int = int(idx)
+        except Exception:
+            return None
+        if not (0 <= idx_int < len(self.sched.entries)):
+            return None
+        return self.sched.entries[idx_int]
+
+    def _on_commit_clicked(self):
+        entry = self._current_entry_in_result()
+        if not entry:
+            try:
+                SweetAlert.info(self, "ยังไม่ได้เลือกผู้ป่วย", "กรุณาเลือกแถวในตารางก่อน")
+            except Exception:
+                QtWidgets.QMessageBox.information(self, "ยังไม่ได้เลือกผู้ป่วย", "กรุณาเลือกแถวในตารางก่อน")
+            return
+
+        missing = missing_required_fields(entry)
+        if missing:
+            msg = "จำเป็นต้องกรอกให้ครบก่อนบันทึกจริง (ยกเว้น Assist 2)\n\n- " + "\n- ".join(missing)
+            try:
+                SweetAlert.warning(self, "ข้อมูลยังไม่ครบ", msg)
+            except Exception:
+                QtWidgets.QMessageBox.warning(self, "ข้อมูลยังไม่ครบ", msg)
+            try:
+                self._load_form_from_entry(entry)
+                self.tabs.setCurrentIndex(0)
+            except Exception:
+                pass
+            return
+
+        now = datetime.now()
+        dl = next_deadline(now)
+        remain_txt = _fmt_td(dl - now)
+        if in_working_hours(now):
+            note = f"โปรดตรวจทานให้เรียบร้อย — เดดไลน์บันทึกวันนี้ 16:30 (เหลือ {remain_txt})"
+        else:
+            note = f"นอกเวลาทำการ — ควรบันทึกก่อน {dl.strftime('%d/%m %H:%M')} (เหลือ {remain_txt})"
+        try:
+            SweetAlert.info(self, "ยืนยันการบันทึก", note)
+        except Exception:
+            QtWidgets.QMessageBox.information(self, "ยืนยันการบันทึก", note)
+
+        try:
+            save_postop_entry(entry)
+            entry.postop_completed = True
+            try:
+                self.sched._save()
+            except Exception:
+                pass
+            key = f"{getattr(entry, 'hn', '')}|{getattr(entry, 'case_uid', '')}"
+            self._reminded_keys.discard(key)
+            try:
+                self.result_banner.set_icon("✅")
+                self.result_banner.set_title("บันทึกลงฐานข้อมูลสำเร็จ")
+                self.result_banner.set_subtitle(
+                    f"HN {entry.hn} | OR {entry.or_room} | เวลา {entry.time_start or '-'}–{entry.time_end or '-'}"
+                )
+            except Exception:
+                pass
+            self._render_tree2()
+        except Exception as exc:
+            try:
+                SweetAlert.error(self, "บันทึกไม่สำเร็จ", str(exc))
+            except Exception:
+                QtWidgets.QMessageBox.critical(self, "บันทึกไม่สำเร็จ", str(exc))
+
+    def _start_unsaved_reminder(self):
+        self._unsaved_timer = QtCore.QTimer(self)
+        self._unsaved_timer.setInterval(7 * 60 * 1000)
+        self._unsaved_timer.timeout.connect(self._remind_unsaved_cases)
+        self._unsaved_timer.start()
+
+    def _remind_unsaved_cases(self):
+        now = datetime.now()
+        dl = next_deadline(now)
+        remain = dl - now
+        for entry in getattr(self.sched, "entries", []):
+            if getattr(entry, "time_end", "") and not getattr(entry, "postop_completed", False):
+                key = f"{getattr(entry, 'hn', '')}|{getattr(entry, 'case_uid', '')}"
+                if key in self._reminded_keys:
+                    continue
+                text = (
+                    f"HN {getattr(entry, 'hn', '')} OR {getattr(entry, 'or_room', '')}\n"
+                    f"ควรบันทึกก่อน {dl.strftime('%d/%m %H:%M')} (เหลือ {_fmt_td(remain)})"
+                )
+                try:
+                    SweetAlert.warning(self, "ยังไม่บันทึกฐานข้อมูล", text)
+                except Exception:
+                    QtWidgets.QMessageBox.warning(self, "ยังไม่บันทึกฐานข้อมูล", text)
+                self._reminded_keys.add(key)
 
     def _apply_queue_select(self, uid: str, new_q: int):
         target = None;
@@ -4236,32 +4501,162 @@ class Main(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(0, lambda: hbar.setValue(min(old_hval, hbar.maximum())))
 
     # ---------- Result context menu / Double-click ----------
-    def _result_ctx_menu(self, pos: QtCore.QPoint):
-        it = self.tree2.itemAt(pos)
-        if not it: return
-        idx = it.data(0, QtCore.Qt.UserRole + 1)
-        if idx is None: return
-        idx_int = int(idx)
-        entry = self.sched.entries[idx_int] if 0 <= idx_int < len(self.sched.entries) else None
+    def _on_tree2_context_menu(self, pos: QtCore.QPoint):
+        item = self.tree2.itemAt(pos)
+        if not item or item.parent() is None:
+            return
+
+        idx = item.data(0, QtCore.Qt.UserRole + 1)
+        entry: Optional[ScheduleEntry] = None
+        if idx is not None:
+            idx_int = int(idx)
+            if 0 <= idx_int < len(self.sched.entries):
+                entry = self.sched.entries[idx_int]
+        else:
+            idx_int = -1
+
         menu = QtWidgets.QMenu(self)
-        a_edit = menu.addAction("แก้ไขรายการ")
-        a_del = menu.addAction("ลบรายการ")
-        runner_ack_action = runner_arrive_action = None
-        if entry:
-            pickup_id = it.data(0, QtCore.Qt.UserRole + 2)
-            if pickup_id:
-                menu.addSeparator()
-                runner_ack_action = menu.addAction("📥 Runner: รับเคส")
-                runner_arrive_action = menu.addAction("✅ Runner: ถึง OR")
-        act = menu.exec(self.tree2.viewport().mapToGlobal(pos))
-        if act == a_edit:
-            self._on_result_double_click(it, 0)
-        elif act == a_del:
+        act_edit = menu.addAction("แก้ไขรายการ")
+        act_delete = menu.addAction("ลบรายการ")
+
+        menu.addSeparator()
+        actions_move: List[QtGui.QAction] = []
+        from_or = item.data(0, self.OR_ROLE) or (getattr(entry, "or_room", "") if entry else "")
+        case_uid = item.data(0, self.CASE_UID_ROLE) or (getattr(entry, "case_uid", "") if entry else "")
+        hn_value = item.data(0, self.HN_ROLE) or (getattr(entry, "hn", "") if entry else "")
+
+        for n in range(1, 9):
+            or_name = f"OR{n}"
+            action = QtGui.QAction(f"ย้ายไป {or_name}", self)
+            action.setData(or_name)
+            if str(or_name).upper() == str(from_or or "").upper():
+                action.setEnabled(False)
+            menu.addAction(action)
+            actions_move.append(action)
+
+        chosen = menu.exec(self.tree2.viewport().mapToGlobal(pos))
+        if not chosen:
+            return
+        if chosen == act_edit and entry is not None:
+            # ทำให้แน่ใจว่าเลือกแถวไว้ก่อน แล้วใช้ workflow เดียวกับ double-click
+            try:
+                self.tree2.setCurrentItem(item)
+            except Exception:
+                pass
+            self._on_result_double_click(item, 0)
+            return
+        if chosen == act_delete and entry is not None:
             self._delete_entry_idx(idx_int)
-        elif act and entry and runner_ack_action and act == runner_ack_action:
-            self._handle_runner_action(entry, "ack")
-        elif act and entry and runner_arrive_action and act == runner_arrive_action:
-            self._handle_runner_action(entry, "arrive")
+            return
+        if chosen in actions_move:
+            target_or = chosen.data()
+            if target_or:
+                self._move_case_to_or(
+                    case_uid=str(case_uid or ""),
+                    hn=str(hn_value or ""),
+                    from_or=str(from_or or ""),
+                    to_or=str(target_or),
+                )
+
+    def _move_case_to_or(self, case_uid: str, hn: str, from_or: str, to_or: str):
+        if not to_or or to_or == from_or:
+            return
+
+        entry: Optional[ScheduleEntry] = None
+        for candidate in self.sched.entries:
+            if case_uid and getattr(candidate, "case_uid", "") == case_uid:
+                entry = candidate
+                break
+            if hn and str(getattr(candidate, "hn", "")).strip() == str(hn).strip():
+                entry = candidate
+                break
+
+        if entry is None:
+            QtWidgets.QMessageBox.warning(self, "ไม่พบข้อมูลเคส", "ไม่พบข้อมูลเคสที่จะย้าย")
+            return
+
+        setattr(entry, "or_room", to_or)
+
+        try:
+            if hasattr(self.sched, "touch_entry"):
+                self.sched.touch_entry(entry)
+            elif hasattr(self.sched, "_save"):
+                self.sched._save()
+        except Exception:
+            pass
+
+        self._render_tree2()
+        self._notify_case_moved(case_uid=case_uid, hn=hn, from_or=from_or, to_or=to_or)
+
+        try:
+            QtWidgets.QMessageBox.information(self, "สำเร็จ", f"ย้ายเคสไป {to_or} แล้ว")
+        except Exception:
+            pass
+
+    def _notify_case_moved(self, case_uid: str, hn: str, from_or: str, to_or: str):
+        payload = {
+            "event": "case_moved",
+            "case_uid": case_uid or "",
+            "hn": hn or "",
+            "from_or": from_or or "",
+            "to_or": to_or,
+            "moved_at": datetime.now().isoformat(timespec="seconds"),
+            "moved_by": getattr(self, "current_user", "registry"),
+        }
+
+        try:
+            if self.ws and self.ws.state() == QAbstractSocket.ConnectedState:
+                import json as _json
+
+                self.ws.sendTextMessage(_json.dumps(payload, ensure_ascii=False))
+                return
+        except Exception:
+            pass
+
+        try:
+            import requests
+
+            url = f"{str(self.api_base_url).rstrip('/')}/api/broadcast/case_moved"
+            requests.post(url, json=payload, timeout=3)
+        except Exception:
+            pass
+
+    def _handle_case_moved_event(self, payload: dict):
+        if not isinstance(payload, dict):
+            return
+
+        case_uid = str(payload.get("case_uid") or "")
+        hn = str(payload.get("hn") or "").strip()
+        to_or = str(payload.get("to_or") or "")
+        if not to_or:
+            return
+
+        entry: Optional[ScheduleEntry] = None
+        for candidate in self.sched.entries:
+            if case_uid and getattr(candidate, "case_uid", "") == case_uid:
+                entry = candidate
+                break
+            if hn and str(getattr(candidate, "hn", "")).strip() == hn:
+                entry = candidate
+                break
+
+        if entry is None:
+            return
+
+        if str(getattr(entry, "or_room", "")) == to_or:
+            return
+
+        setattr(entry, "or_room", to_or)
+
+        try:
+            if hasattr(self.sched, "touch_entry"):
+                self.sched.touch_entry(entry)
+            elif hasattr(self.sched, "_save"):
+                self.sched._save()
+        except Exception:
+            pass
+
+        self._render_tree2()
 
     def _delete_entry_idx(self, idx: int):
         if 0 <= idx < len(self.sched.entries):
