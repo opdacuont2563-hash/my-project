@@ -2032,6 +2032,14 @@ def show_doctor_with_dept(name: str) -> str:
     return f"{normalized} — {dept}"
 
 
+def strip_doctor_dept(text: str) -> str:
+    """Return doctor name without the trailing department label."""
+    if not text:
+        return ""
+    head, sep, _ = text.partition("—")
+    return head.strip() if sep else text.strip()
+
+
 def format_or_display(or_key: str | None) -> str:
     if not or_key or or_key == "-":
         return "-"
@@ -4162,8 +4170,9 @@ class Main(QtWidgets.QWidget):
                     for idx, entry in bucket_sorted:
                         diag_txt = ' ; '.join(entry.diags) if entry.diags else '-'
                         op_txt = ' ; '.join(entry.ops) if entry.ops else '-'
-                        or_time = f"{display_or} • {entry.time or 'TF'}"
+                        or_time = display_or
                         doctor_display = show_doctor_with_dept(entry.doctor) if entry.doctor else ''
+                        doctor_display = strip_doctor_dept(doctor_display) if doctor_display else ''
                         status_text = getattr(entry, 'status', '') or (entry.state or '') or '-'
                         extra = entry._extra if isinstance(getattr(entry, '_extra', None), dict) else {}
                         case_size_txt = (
