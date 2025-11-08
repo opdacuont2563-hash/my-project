@@ -195,7 +195,7 @@ def enrich_cases(df_postop: pd.DataFrame, df_sched: pd.DataFrame) -> pd.DataFram
                 return None
 
         df["operation"] = df_postop.get("ops_json", pd.Series([None] * len(df_postop))).map(parse_ops)
-        df["diagnosis"] = df_postop.get("diags_json", pd.Series([None] * len(df_postop)))
+        df["diagnosis"] = df_postop.get("diags_json", pd.Series([None] * len(df_postop)])
 
     return df
 
@@ -649,4 +649,3 @@ class DashboardTab(QtWidgets.QWidget):
             self.heatmapChart,
         ]:
             chart.clear()
-
