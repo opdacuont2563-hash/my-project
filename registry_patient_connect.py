@@ -26,6 +26,8 @@ from icd10_catalog import (
     get_operations,
 )
 
+from dashboard_tab import DashboardTab
+
 try:
     from rapidfuzz import fuzz, process  # type: ignore
 
@@ -2758,6 +2760,9 @@ class Main(QtWidgets.QWidget):
         gm.setColumnStretch(2, 1)
         t3.addWidget(mon, 1)
         self.tabs.addTab(tab3, "Monitor Realtime")
+
+        self.dashboard_tab = DashboardTab(self)
+        self.tabs.addTab(self.dashboard_tab, "Dashboard")
 
         # signals
         self.btn_refresh.clicked.connect(lambda: self._refresh(True))
