@@ -15,6 +15,7 @@ from typing import Tuple, Union
 
 import numpy as np
 import pandas as pd
+from pandas.errors import DatabaseError as PandasDatabaseError
 
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Qt
@@ -55,7 +56,10 @@ def safe_read_sqlite(db_path: Path, sql: str, parse_dates: Tuple[str, ...] = ())
         return pd.DataFrame()
     con = sqlite3.connect(str(db_path))
     try:
-        df = pd.read_sql_query(sql, con)
+        try:
+            df = pd.read_sql_query(sql, con)
+        except (sqlite3.Error, PandasDatabaseError):
+            return pd.DataFrame()
         for col in parse_dates:
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
