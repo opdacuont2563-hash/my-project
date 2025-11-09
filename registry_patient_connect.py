@@ -4,7 +4,7 @@
 """
 import os, sys, json, argparse, csv, base64, secrets, hashlib, unicodedata, re, sqlite3
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Set, Union, Callable
+from typing import List, Optional, Tuple, Dict, Set, Union, Callable, Sequence
 from datetime import datetime, timedelta, time as dtime, date
 from concurrent.futures import ThreadPoolExecutor
 
@@ -327,9 +327,73 @@ API_WS = "/api/ws"
 ALLOW_SAVE_ANYTIME = True
 SHOW_DEADLINE_NOTE = False
 
+# --------- Excel/CSV schema (หัวตารางที่คาดหวัง) ---------
+EXPECTED_COLUMNS = [
+    "OR/เวลา",
+    "HN",
+    "ชื่อ-สกุล",
+    "อายุ",
+    "Diagnosis",
+    "Operation",
+    "แพทย์",
+    "Ward",
+    "ขนาดเคส",
+    "แผนก",
+    "เริ่ม",
+    "จบ",
+    "ความเร่งด่วน",
+    "ประเภทเวลา",
+    "Assist 1",
+    "Assist 2",
+    "Scrub",
+    "Cir",
+    "สถานะ",
+]
+
+
+def validate_excel_columns(columns: Sequence[str]) -> List[str]:
+    """ยืนยันว่าหัวคอลัมน์จากไฟล์นำเข้ามีครบตาม schema ที่กำหนด"""
+
+    missing = [c for c in EXPECTED_COLUMNS if c not in columns]
+    if missing:
+        raise ValueError("คอลัมน์ในไฟล์ขาด: " + ", ".join(missing))
+    # คืนลิสต์คอลัมน์ตามลำดับมาตรฐาน (ตัดคอลัมน์ที่ระบบไม่รู้จักออก)
+    return [c for c in EXPECTED_COLUMNS if c in columns]
+
 STATUS_OP_START = "กำลังผ่าตัด"
 STATUS_RECOVERY = "กำลังพักฟื้น"
 STATUS_RETURNING = "กำลังส่งกลับตึก"
+
+EXPECTED_DB_COLUMNS = {
+    "id",
+    "uuid",
+    "or_room",
+    "hn",
+    "patient_name",
+    "age",
+    "diagnosis",
+    "operation",
+    "surgeon",
+    "ward",
+    "case_size",
+    "department",
+    "start_time",
+    "end_time",
+    "urgency",
+    "service_window",
+    "time_bucket",
+    "assist1",
+    "assist2",
+    "scrub",
+    "cir",
+    "status",
+    "reason",
+    "repeat_24h",
+    "created_at",
+    "updated_at",
+    "saved_at",
+}
+
 
 ALLOWED_STATUSES = (
     "saved",
@@ -502,7 +566,7 @@ def ensure_schema(con: sqlite3.Connection) -> None:
     if existing:
         info = con.execute("PRAGMA table_info(surgery_cases)").fetchall()
         have_cols = {row[1] for row in info}
-        missing = EXPECTED_COLUMNS.difference(have_cols)
+        missing = EXPECTED_DB_COLUMNS.difference(have_cols)
         needs_upgrade = bool(missing)
         if not needs_upgrade:
             schema_sql = con.execute(
@@ -3456,6 +3520,7 @@ class Main(QtWidgets.QWidget):
                 return []
 
             headers = [str(col).strip() if col is not None else "" for col in header]
+            ordered_headers = validate_excel_columns(headers)
             results: List[dict] = []
             for row in rows_iter:
                 row_dict: Dict[str, object] = {}
@@ -3467,7 +3532,8 @@ class Main(QtWidgets.QWidget):
                     if not has_value and str(value or "").strip():
                         has_value = True
                 if row_dict and has_value:
-                    results.append(row_dict)
+                    normalized = {key: row_dict.get(key, "") for key in ordered_headers}
+                    results.append(normalized)
             return results
 
         if suffix == ".csv":
@@ -3476,6 +3542,7 @@ class Main(QtWidgets.QWidget):
                 reader = csv.DictReader(fh)
                 if reader.fieldnames is None:
                     return []
+                ordered_headers = validate_excel_columns([str(h).strip() for h in reader.fieldnames])
                 for row in reader:
                     row_dict: Dict[str, object] = {}
                     has_value = False
@@ -3487,7 +3554,8 @@ class Main(QtWidgets.QWidget):
                         if not has_value and str(value or "").strip():
                             has_value = True
                     if row_dict and has_value:
-                        results.append(row_dict)
+                        normalized = {key: row_dict.get(key, "") for key in ordered_headers}
+                        results.append(normalized)
             return results
 
         raise ValueError("รองรับเฉพาะไฟล์ Excel (.xlsx/.xlsm) หรือ CSV")
