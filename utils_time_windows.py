@@ -41,4 +41,17 @@ def decide_service_window(urgency: str, start: datetime, end: datetime) -> str:
     return "InHours" if overlaps_in_hours(start, end) else "OutOfHours"
 
 
-__all__ = ["IN_START", "IN_END", "overlaps_in_hours", "decide_service_window"]
+def categorize_timebucket(dt: datetime) -> str:
+    """Return the Thai time bucket label (ในเวลา/นอกเวลา) for a timestamp."""
+    weekday = dt.weekday()
+    in_hours = 0 <= weekday <= 4 and IN_START <= dt.time() < IN_END
+    return "ในเวลา" if in_hours else "นอกเวลา"
+
+
+__all__ = [
+    "IN_START",
+    "IN_END",
+    "overlaps_in_hours",
+    "decide_service_window",
+    "categorize_timebucket",
+]

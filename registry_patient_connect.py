@@ -27,7 +27,7 @@ from icd10_catalog import (
 )
 
 from dashboard_tab import DashboardTab
-from utils_time_windows import decide_service_window
+from utils_time_windows import categorize_timebucket, decide_service_window
 
 try:
     from rapidfuzz import fuzz, process  # type: ignore
@@ -331,6 +331,17 @@ STATUS_OP_START = "กำลังผ่าตัด"
 STATUS_RECOVERY = "กำลังพักฟื้น"
 STATUS_RETURNING = "กำลังส่งกลับตึก"
 
+ALLOWED_STATUSES = (
+    "saved",
+    "postponed",
+    "offcase",
+    "scheduled",
+    "in-progress",
+    "done",
+    "cancelled",
+)
+
+
 STATUS_COLORS = {
     STATUS_OP_START: "#f97316",
     STATUS_RECOVERY: "#38bdf8",
@@ -360,13 +371,9 @@ def next_deadline(dt: datetime | None = None) -> datetime:
     return datetime.combine(now.date(), WORKING_START)
 
 
-DB_PATH = Path.cwd() / "or_registry.sqlite3"
+DB_PATH = Path.cwd() / "ornbh.db"
 
-SCHEMA_SQL = """
-PRAGMA foreign_keys = ON;
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-
+TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS surgery_cases (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     uuid            TEXT NOT NULL UNIQUE,
@@ -384,26 +391,55 @@ CREATE TABLE IF NOT EXISTS surgery_cases (
     end_time        TEXT,
     urgency         TEXT NOT NULL CHECK (urgency IN ('Elective','Emergency')),
     service_window  TEXT NOT NULL CHECK (service_window IN ('InHours','OutOfHours')),
+    time_bucket     TEXT NOT NULL DEFAULT 'ในเวลา'
+                    CHECK (time_bucket IN ('ในเวลา','นอกเวลา')),
     assist1         TEXT,
     assist2         TEXT,
     scrub           TEXT,
     cir             TEXT,
-    status          TEXT NOT NULL DEFAULT 'scheduled'
-                    CHECK (status IN ('scheduled','in-progress','done','cancelled','postponed')),
+    status          TEXT NOT NULL DEFAULT 'saved'
+                    CHECK (
+                        status IN (
+                            'saved','postponed','offcase',
+                            'scheduled','in-progress','done','cancelled'
+                        )
+                    ),
+    reason          TEXT,
+    repeat_24h      INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    saved_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
+"""
 
+INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_cases_hn ON surgery_cases (hn);
 CREATE INDEX IF NOT EXISTS idx_cases_start ON surgery_cases (start_time);
+CREATE INDEX IF NOT EXISTS idx_cases_hn_start ON surgery_cases (hn, start_time);
 CREATE INDEX IF NOT EXISTS idx_cases_urgency ON surgery_cases (urgency);
 CREATE INDEX IF NOT EXISTS idx_cases_service_window ON surgery_cases (service_window);
+CREATE INDEX IF NOT EXISTS idx_cases_time_bucket ON surgery_cases (time_bucket);
 CREATE INDEX IF NOT EXISTS idx_cases_status ON surgery_cases (status);
+"""
 
+VIEW_SQL = """
 CREATE VIEW IF NOT EXISTS v_cases_today AS
 SELECT * FROM surgery_cases
 WHERE date(start_time) = date('now','localtime')
-ORDER BY urgency DESC, service_window DESC, start_time, or_room;
+ORDER BY urgency DESC, time_bucket DESC, start_time, or_room;
+"""
+
+SCHEMA_SQL = """
+PRAGMA foreign_keys = ON;
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+
+{table}
+
+{indexes}
+
+{view}
+""".format(table=TABLE_SQL.strip(), indexes=INDEX_SQL.strip(), view=VIEW_SQL.strip())
 """
 
 
@@ -421,8 +457,161 @@ def _init_db_once():
         con.close()
 
 
+def _check_repeat_24h(con: sqlite3.Connection, hn: str, start_dt: datetime) -> int:
+    if not hn or not start_dt:
+        return 0
+    window_start = (start_dt - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M")
+    window_end = start_dt.strftime("%Y-%m-%d %H:%M")
+    cur = con.execute(
+        "SELECT COUNT(*) FROM surgery_cases WHERE hn = ? AND start_time BETWEEN ? AND ?",
+        (hn, window_start, window_end),
+    )
+    count = cur.fetchone()[0] if cur else 0
+    return 1 if count else 0
+
+
+def _normalize_status(value: str | None) -> str:
+    if not value:
+        return "saved"
+    text = str(value).strip().lower()
+    mapping = {
+        "off case": "offcase",
+        "off-case": "offcase",
+        "offcase": "offcase",
+        "postponed": "postponed",
+        "เลื่อน": "postponed",
+        "เลื่อนผ่าตัด": "postponed",
+        "saved": "saved",
+        "done": "done",
+        "cancelled": "cancelled",
+        "canceled": "cancelled",
+        "in-progress": "in-progress",
+        "in progress": "in-progress",
+        "scheduled": "scheduled",
+    }
+    if text in mapping:
+        return mapping[text]
+    if text in ALLOWED_STATUSES:
+        return text
+    return "saved"
+
+
 def ensure_schema(con: sqlite3.Connection) -> None:
+    cur = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='surgery_cases'")
+    existing = cur.fetchone()
+    needs_upgrade = False
+    if existing:
+        info = con.execute("PRAGMA table_info(surgery_cases)").fetchall()
+        have_cols = {row[1] for row in info}
+        missing = EXPECTED_COLUMNS.difference(have_cols)
+        needs_upgrade = bool(missing)
+        if not needs_upgrade:
+            schema_sql = con.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='surgery_cases'"
+            ).fetchone()
+            if schema_sql:
+                sql_text = schema_sql[0] or ""
+                for status in ("'saved'", "'offcase'", "'postponed'"):
+                    if status not in sql_text:
+                        needs_upgrade = True
+                        break
+                if "time_bucket" not in sql_text:
+                    needs_upgrade = True
+    if needs_upgrade:
+        _upgrade_schema(con)
     con.executescript(SCHEMA_SQL)
+
+
+def _upgrade_schema(con: sqlite3.Connection) -> None:
+    cur = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='surgery_cases'")
+    if not cur.fetchone():
+        return
+    old_factory = con.row_factory
+    try:
+        con.row_factory = sqlite3.Row
+        rows = con.execute("SELECT * FROM surgery_cases").fetchall()
+    except sqlite3.Error:
+        rows = []
+    finally:
+        con.row_factory = old_factory
+
+    con.execute("DROP TABLE IF EXISTS surgery_cases_new")
+    table_sql = TABLE_SQL.replace("surgery_cases", "surgery_cases_new", 1)
+    con.executescript(table_sql)
+
+    insert_sql = (
+        "INSERT INTO surgery_cases_new ("
+        " uuid, or_room, hn, patient_name, age, diagnosis, operation,"
+        " surgeon, ward, case_size, department, start_time, end_time,"
+        " urgency, service_window, time_bucket, assist1, assist2, scrub,"
+        " cir, status, reason, repeat_24h, created_at, updated_at, saved_at"
+        " ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    )
+
+    for row in rows:
+        row_dict = dict(row)
+        start_iso = row_dict.get("start_time")
+        start_dt: datetime | None = None
+        if start_iso:
+            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+                try:
+                    start_dt = datetime.strptime(start_iso, fmt)
+                    break
+                except Exception:
+                    continue
+            if start_dt is None:
+                try:
+                    start_dt = datetime.fromisoformat(start_iso)
+                except Exception:
+                    start_dt = None
+        time_bucket = row_dict.get("time_bucket")
+        if not time_bucket:
+            if start_dt:
+                time_bucket = categorize_timebucket(start_dt)
+            else:
+                time_bucket = "นอกเวลา"
+        status_val = row_dict.get("status") or "saved"
+        if status_val not in ALLOWED_STATUSES:
+            status_val = "saved"
+        created_at = row_dict.get("created_at") or datetime.now().strftime("%Y-%m-%d %H:%M")
+        updated_at = row_dict.get("updated_at") or created_at
+        saved_at = row_dict.get("saved_at") or created_at
+        reason = row_dict.get("reason")
+        repeat_flag = int(row_dict.get("repeat_24h") or 0)
+
+        values = (
+            row_dict.get("uuid"),
+            row_dict.get("or_room"),
+            row_dict.get("hn"),
+            row_dict.get("patient_name"),
+            row_dict.get("age"),
+            row_dict.get("diagnosis"),
+            row_dict.get("operation"),
+            row_dict.get("surgeon"),
+            row_dict.get("ward"),
+            row_dict.get("case_size"),
+            row_dict.get("department"),
+            row_dict.get("start_time"),
+            row_dict.get("end_time"),
+            row_dict.get("urgency"),
+            row_dict.get("service_window"),
+            time_bucket,
+            row_dict.get("assist1"),
+            row_dict.get("assist2"),
+            row_dict.get("scrub"),
+            row_dict.get("cir"),
+            status_val,
+            reason,
+            repeat_flag,
+            created_at,
+            updated_at,
+            saved_at,
+        )
+        con.execute(insert_sql, values)
+
+    con.execute("DROP TABLE IF EXISTS surgery_cases")
+    con.execute("ALTER TABLE surgery_cases_new RENAME TO surgery_cases")
+    con.commit()
 
 
 def save_postop_entry(entry):
@@ -475,8 +664,21 @@ def save_postop_entry(entry):
         case_uid = getattr(entry, "case_uid", "") or f"{getattr(entry, 'hn', '')}-{getattr(entry, 'or_room', '')}-{getattr(entry, 'time', '')}"
         urgency = (getattr(entry, "urgency", "Elective") or "Elective").title()
         service_window = decide_service_window(urgency, start_dt, end_dt)
+        time_bucket = categorize_timebucket(start_dt)
+        repeat_flag = _check_repeat_24h(con, str(getattr(entry, "hn", "")).strip(), start_dt)
+        status_value = _normalize_status(getattr(entry, "state", None))
+        reason_value_raw = (
+            getattr(entry, "status_reason", None)
+            or getattr(entry, "postpone_reason", None)
+            or getattr(entry, "offcase_reason", None)
+            or getattr(entry, "reason", None)
+        )
+        reason_value = str(reason_value_raw).strip() if reason_value_raw else None
+        saved_at = datetime.now().strftime("%Y-%m-%d %H:%M")
         setattr(entry, "cross_midnight", cross_midnight)
         entry.service_window = service_window
+        entry.time_bucket = time_bucket
+        entry.repeat_24h = repeat_flag
 
         def _flatten(values) -> str:
             if isinstance(values, (list, tuple)):
@@ -500,42 +702,53 @@ def save_postop_entry(entry):
             end_dt.strftime("%Y-%m-%d %H:%M"),
             urgency,
             service_window,
+            time_bucket,
             getattr(entry, "assist1", ""),
             getattr(entry, "assist2", ""),
             getattr(entry, "scrub", ""),
             getattr(entry, "circulate", ""),
-            getattr(entry, "state", "scheduled") or "scheduled",
+            status_value,
+            reason_value,
+            repeat_flag,
+            saved_at,
         )
 
         con.execute(
-            """
-        INSERT INTO surgery_cases (
-            uuid, or_room, hn, patient_name, age, diagnosis, operation,
-            surgeon, ward, case_size, department, start_time, end_time,
-            urgency, service_window, assist1, assist2, scrub, cir, status, updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'))
-        ON CONFLICT(uuid) DO UPDATE SET
-            or_room=excluded.or_room,
-            hn=excluded.hn,
-            patient_name=excluded.patient_name,
-            age=excluded.age,
-            diagnosis=excluded.diagnosis,
-            operation=excluded.operation,
-            surgeon=excluded.surgeon,
-            ward=excluded.ward,
-            case_size=excluded.case_size,
-            department=excluded.department,
-            start_time=excluded.start_time,
-            end_time=excluded.end_time,
-            urgency=excluded.urgency,
-            service_window=excluded.service_window,
-            assist1=excluded.assist1,
-            assist2=excluded.assist2,
-            scrub=excluded.scrub,
-            cir=excluded.cir,
-            status=excluded.status,
-            updated_at=datetime('now')
-        """,
+            "INSERT INTO surgery_cases ("
+            " uuid, or_room, hn, patient_name, age, diagnosis, operation,"
+            " surgeon, ward, case_size, department, start_time, end_time,"
+            " urgency, service_window, time_bucket, assist1, assist2, scrub,"
+            " cir, status, reason, repeat_24h, saved_at, updated_at"
+            " ) VALUES ("
+            " ?,?,?,?,?,?,?,?,?,?,"
+            " ?,?,?,?,?,?,?,?,?,?,"
+            " ?,?,?,?, datetime('now')"
+            " )"
+            " ON CONFLICT(uuid) DO UPDATE SET"
+            " or_room=excluded.or_room,"
+            " hn=excluded.hn,"
+            " patient_name=excluded.patient_name,"
+            " age=excluded.age,"
+            " diagnosis=excluded.diagnosis,"
+            " operation=excluded.operation,"
+            " surgeon=excluded.surgeon,"
+            " ward=excluded.ward,"
+            " case_size=excluded.case_size,"
+            " department=excluded.department,"
+            " start_time=excluded.start_time,"
+            " end_time=excluded.end_time,"
+            " urgency=excluded.urgency,"
+            " service_window=excluded.service_window,"
+            " time_bucket=excluded.time_bucket,"
+            " assist1=excluded.assist1,"
+            " assist2=excluded.assist2,"
+            " scrub=excluded.scrub,"
+            " cir=excluded.cir,"
+            " status=excluded.status,"
+            " reason=excluded.reason,"
+            " repeat_24h=excluded.repeat_24h,"
+            " saved_at=excluded.saved_at,"
+            " updated_at=datetime('now')",
             payload,
         )
         con.commit()
@@ -712,10 +925,10 @@ def _dept_to_specialty_key(label: str) -> str:
 class Toast(QtWidgets.QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet("""
-            QFrame{background:#111827; color:#fff; border-radius:12px; padding:10px 14px;}
-            QLabel{color:#fff;}
-        """)
+        self.setStyleSheet(
+            "QFrame{background:#111827; color:#fff; border-radius:12px; padding:10px 14px;}"
+            "QLabel{color:#fff;}"
+        )
         add_shadow(self, blur=30, x=0, y=8, color="#40000000")
         self.lab = QtWidgets.QLabel("", self)
         lay = QtWidgets.QHBoxLayout(self)
@@ -1155,40 +1368,36 @@ class LocalDBLogger:
     def _init(self, conn):
         cur = conn.cursor()
         cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS schedule(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                urgency TEXT,
-                service_window TEXT,
-                or_room TEXT,
-                date TEXT,
-                time TEXT,
-                hn TEXT,
-                name TEXT,
-                age INTEGER,
-                dept TEXT,
-                doctor TEXT,
-                diagnosis TEXT,
-                operation TEXT,
-                ward TEXT,
-                queue INTEGER,
-                time_start TEXT,
-                time_end TEXT,
-                case_size TEXT
-            )
-            """
+            "CREATE TABLE IF NOT EXISTS schedule("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " timestamp TEXT,"
+            " urgency TEXT,"
+            " service_window TEXT,"
+            " or_room TEXT,"
+            " date TEXT,"
+            " time TEXT,"
+            " hn TEXT,"
+            " name TEXT,"
+            " age INTEGER,"
+            " dept TEXT,"
+            " doctor TEXT,"
+            " diagnosis TEXT,"
+            " operation TEXT,"
+            " ward TEXT,"
+            " queue INTEGER,"
+            " time_start TEXT,"
+            " time_end TEXT,"
+            " case_size TEXT"
+            " )"
         )
         cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS surgery_events(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                case_uid TEXT,
-                event TEXT,
-                at TEXT,
-                details TEXT
-            )
-            """
+            "CREATE TABLE IF NOT EXISTS surgery_events("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " case_uid TEXT,"
+            " event TEXT,"
+            " at TEXT,"
+            " details TEXT"
+            " )"
         )
         conn.commit()
 
@@ -1218,15 +1427,12 @@ class LocalDBLogger:
         conn = self.conn_x if str(e.urgency).lower() == "emergency" else self.conn_e
         cur = conn.cursor()
         cur.execute(
-            """
-            INSERT INTO schedule(
-                timestamp, urgency, service_window, or_room, date, time,
-                hn, name, age, dept, doctor,
-                diagnosis, operation, ward, queue,
-                time_start, time_end, case_size
-            )
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
+            "INSERT INTO schedule(" \
+            " timestamp, urgency, service_window, or_room, date, time," \
+            " hn, name, age, dept, doctor," \
+            " diagnosis, operation, ward, queue," \
+            " time_start, time_end, case_size" \
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             row,
         )
         conn.commit()

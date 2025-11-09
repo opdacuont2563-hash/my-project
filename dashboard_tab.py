@@ -2,7 +2,7 @@
 """
 Dashboard Tab สำหรับ OR — ใช้กับ PySide6 + SQLite (single registry)
 กราฟ: Matplotlib (ฝังใน QWidget)
-แหล่งข้อมูล: or_registry.sqlite3
+แหล่งข้อมูล: ornbh.db
 ตารางที่ใช้: surgery_cases
 """
 
@@ -25,7 +25,7 @@ import matplotlib.ticker as mticker
 
 # ----------------------------- Config -----------------------------
 APP_DIR = Path(__file__).resolve().parent
-DB_PATH = Path.cwd() / "or_registry.sqlite3"
+DB_PATH = Path.cwd() / "ornbh.db"
 
 DEFAULT_BLOCK_START = "08:30"  # ใช้กับ Emergency ตามที่คุย
 DEFAULT_BLOCK_END = "16:30"
@@ -48,15 +48,38 @@ CREATE TABLE IF NOT EXISTS surgery_cases (
     end_time TEXT,
     urgency TEXT NOT NULL CHECK (urgency IN ('Elective','Emergency')),
     service_window TEXT NOT NULL CHECK (service_window IN ('InHours','OutOfHours')),
+    time_bucket TEXT NOT NULL DEFAULT 'ในเวลา'
+        CHECK (time_bucket IN ('ในเวลา','นอกเวลา')),
     assist1 TEXT,
     assist2 TEXT,
     scrub TEXT,
     cir TEXT,
-    status TEXT NOT NULL DEFAULT 'scheduled'
-        CHECK (status IN ('scheduled','in-progress','done','cancelled','postponed')),
+    status TEXT NOT NULL DEFAULT 'saved'
+        CHECK (
+            status IN (
+                'saved','postponed','offcase',
+                'scheduled','in-progress','done','cancelled'
+            )
+        ),
+    reason TEXT,
+    repeat_24h INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    saved_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE INDEX IF NOT EXISTS idx_cases_hn ON surgery_cases (hn);
+CREATE INDEX IF NOT EXISTS idx_cases_start ON surgery_cases (start_time);
+CREATE INDEX IF NOT EXISTS idx_cases_hn_start ON surgery_cases (hn, start_time);
+CREATE INDEX IF NOT EXISTS idx_cases_urgency ON surgery_cases (urgency);
+CREATE INDEX IF NOT EXISTS idx_cases_service_window ON surgery_cases (service_window);
+CREATE INDEX IF NOT EXISTS idx_cases_time_bucket ON surgery_cases (time_bucket);
+CREATE INDEX IF NOT EXISTS idx_cases_status ON surgery_cases (status);
+
+CREATE VIEW IF NOT EXISTS v_cases_today AS
+SELECT * FROM surgery_cases
+WHERE date(start_time) = date('now','localtime')
+ORDER BY urgency DESC, time_bucket DESC, start_time, or_room;
 """
 
 # ----------------------------- Utils ------------------------------
@@ -115,9 +138,9 @@ def load_bundle(kind: str) -> DataBundle:
         params = (kind.title(),)
     sql = f"""
         SELECT uuid, hn, patient_name, department, surgeon, or_room,
-               case_size, urgency, service_window, status,
-               start_time, end_time, diagnosis, operation, ward,
-               assist1, assist2, scrub, cir
+               case_size, urgency, service_window, time_bucket, status,
+               repeat_24h, reason, start_time, end_time, diagnosis,
+               operation, ward, assist1, assist2, scrub, cir, saved_at
         FROM surgery_cases
         {where}
     """
