@@ -546,13 +546,25 @@ class DashboardTab(QtWidgets.QWidget):
 
     def _plot_heatmap(self, hm: pd.DataFrame):
         chart = self.heatmapChart; chart.clear(); ax = chart.ax
-        if hm.empty: chart.canvas.draw(); return
-        pivot = hm.pivot_table(index="dow", columns="hour", values="cases", aggfunc="sum", fill_value=0)
+        if hm.empty:
+            chart.canvas.draw()
+            return
+
+        pivot = hm.pivot_table(
+            index="dow",
+            columns="hour",
+            values="cases",
+            aggfunc="sum",
+            fill_value=0,
+        )
+        pivot = pivot.reindex(index=range(7), columns=range(24), fill_value=0)
+
         im = ax.imshow(pivot.values, aspect="auto", cmap="Blues")
-        ax.set_yticks(range(len(pivot.index)))
+
+        ax.set_yticks(range(7))
         ax.set_yticklabels(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
         ax.set_xticks(range(0, 24, 2))
-        ax.set_xticklabels([str(h) for h in range(0, 24, 2)])
+        ax.set_xticklabels([f"{h:02d}" for h in range(0, 24, 2)])
         ax.set_xlabel("Hour"); ax.set_ylabel("Day"); ax.set_title("Heatmap (Cases)")
         chart._colorbar = chart.fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         chart.canvas.draw()
