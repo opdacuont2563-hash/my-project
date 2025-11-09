@@ -440,7 +440,6 @@ PRAGMA synchronous = NORMAL;
 
 {view}
 """.format(table=TABLE_SQL.strip(), indexes=INDEX_SQL.strip(), view=VIEW_SQL.strip())
-"""
 
 
 def _db_conn():
@@ -1491,7 +1490,7 @@ class PDPANoticeDialog(QDialog):
         text.setReadOnly(True)
         text.setMinimumHeight(220)
         text.setStyleSheet("QTextEdit{background:#fff;border:1px solid #e6eaf2;border-radius:12px;padding:10px;}")
-        text.setText(
+        text.setPlainText(
             "วัตถุประสงค์การใช้ข้อมูล:\n"
             "- ใช้เพื่อการลงทะเบียน/บริหารจัดการคิวผ่าตัด และสื่อสารการทำงานในห้องผ่าตัด\n"
             "- ใช้สถิติภาพรวมแบบไม่ระบุตัวตน (de-identified) เพื่อปรับปรุงคุณภาพบริการ (QI)\n\n"
@@ -2714,8 +2713,15 @@ class Main(QtWidgets.QWidget):
         self.time.setLocale(QLocale("en_US"))
         g.addWidget(self.time, r, 3)
         g.addWidget(QtWidgets.QLabel("แผนก"), r, 4)
-        self.cb_dept = QtWidgets.QComboBox();
-        self.cb_dept.addItems(["— เลือกแผนก —"] + list(DEPT_DOCTORS.keys()))
+        dept_choices = sorted(DEPT_DOCTORS.keys(), key=str.casefold)
+        self.cb_dept = NoWheelComboBox()
+        self.cb_dept.setEditable(True)
+        self.cb_dept.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.cb_dept.addItems(["— เลือกแผนก —"] + dept_choices)
+        dept_completer = QtWidgets.QCompleter(sorted(DEPT_KEY_MAP.keys(), key=str.casefold))
+        dept_completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        dept_completer.setFilterMode(QtCore.Qt.MatchContains)
+        self.cb_dept.setCompleter(dept_completer)
         g.addWidget(self.cb_dept, r, 5)
         r += 1
         self.lbl_warn = QtWidgets.QLabel("");
@@ -5215,11 +5221,11 @@ class WrapItemDelegate(QtWidgets.QStyledItemDelegate):
 
 
 class SearchSelectAdder(QtWidgets.QWidget):
-    """Searchable selector with a multi-select list.
+    '''Searchable selector with a multi-select list.
 
     - Enter / ปุ่ม "➕ เพิ่ม"  : เพิ่มลงรายการของเคส (ไม่แตะคลังหลัก)
     - ปุ่ม "💾 บันทึกเป็นรายการใหม่" : ส่งสัญญาณให้ภายนอกบันทึกเข้าคลังหลัก
-    """
+    '''
 
     itemsChanged = QtCore.Signal(list)
     requestPersist = QtCore.Signal(str)
