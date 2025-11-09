@@ -458,6 +458,12 @@ def save_postop_entry(entry):
         if not (start_dt and end_dt):
             raise ValueError("จำเป็นต้องระบุเวลาเริ่มและจบผ่าตัด")
 
+        cross_midnight = False
+        if end_dt <= start_dt:
+            # ถือว่าเป็นเคสข้ามเที่ยงคืน -> ขยับ end_dt ไปวันถัดไป
+            end_dt = end_dt + timedelta(days=1)
+            cross_midnight = True
+
         try:
             age_val = int(str(getattr(entry, "age", 0) or 0))
         except Exception:
@@ -466,6 +472,7 @@ def save_postop_entry(entry):
         case_uid = getattr(entry, "case_uid", "") or f"{getattr(entry, 'hn', '')}-{getattr(entry, 'or_room', '')}-{getattr(entry, 'time', '')}"
         urgency = (getattr(entry, "urgency", "Elective") or "Elective").title()
         service_window = decide_service_window(urgency, start_dt, end_dt)
+        setattr(entry, "cross_midnight", cross_midnight)
         entry.service_window = service_window
 
         def _flatten(values) -> str:
@@ -571,8 +578,11 @@ def missing_required_fields(entry) -> list[str]:
         if ts and te:
             hs, ms = map(int, str(ts).split(":")[:2])
             he, me = map(int, str(te).split(":")[:2])
-            if (he, me) <= (hs, ms):
-                missing.append("เวลาเริ่ม/จบ ไม่สมเหตุผล")
+            # อนุญาตเคสข้ามเที่ยงคืน: end สามารถน้อยกว่า start ได้
+            # แต่ถ้า "เท่ากันเป๊ะ" ให้ถือว่าไม่สมเหตุผล
+            if (he, me) == (hs, ms):
+                missing.append("เวลาเริ่ม/จบ ไม่สมเหตุผล (เริ่ม=จบ)")
+            # else: ข้ามวันได้ ไม่ต้อง append error
     except Exception:
         missing.append("รูปแบบเวลาไม่ถูกต้อง")
     return missing
@@ -2592,6 +2602,14 @@ class Main(QtWidgets.QWidget):
         self.time_end.setEnabled(False)
         self.time_end.setProperty("role", "time-end")
 
+        self.cross_midnight_badge = QtWidgets.QLabel("ข้ามวัน +1")
+        self.cross_midnight_badge.setObjectName("crossMidnightBadge")
+        self.cross_midnight_badge.setStyleSheet(
+            "QLabel#crossMidnightBadge{background:#fb923c;color:#fff;font-weight:700;padding:4px 10px;border-radius:12px;}"
+        )
+        self.cross_midnight_badge.setToolTip("ระบบจะบันทึกเวลาจบเป็นวันถัดไปอัตโนมัติ")
+        self.cross_midnight_badge.hide()
+
         def _toggle_start(ch: bool):
             self.time_start.setEnabled(ch)
             self._update_service_window_info()
@@ -2609,6 +2627,8 @@ class Main(QtWidgets.QWidget):
         row_t.addWidget(self.time_start)
         row_t.addWidget(self.ck_time_end)
         row_t.addWidget(self.time_end)
+        row_t.addWidget(self.cross_midnight_badge)
+        row_t.addStretch(1)
         g.addWidget(time_box, r, 0, 1, 6)
         r += 1
 
@@ -3457,6 +3477,23 @@ class Main(QtWidgets.QWidget):
             self.lbl_period_info.setText(
                 f"ระบบกำหนดประเภทเวลาอัตโนมัติ: {_service_window_label(auto)} (อ้างอิง {dt:%d/%m/%Y %H:%M})"
             )
+        if hasattr(self, "cross_midnight_badge"):
+            show_badge = False
+            try:
+                if (
+                    hasattr(self, "ck_time_start")
+                    and hasattr(self, "ck_time_end")
+                    and self.ck_time_start.isChecked()
+                    and self.ck_time_end.isChecked()
+                ):
+                    start_qt = self.time_start.time()
+                    end_qt = self.time_end.time()
+                    start_pair = (start_qt.hour(), start_qt.minute())
+                    end_pair = (end_qt.hour(), end_qt.minute())
+                    show_badge = end_pair < start_pair
+            except Exception:
+                show_badge = False
+            self.cross_midnight_badge.setVisible(show_badge)
         return auto
 
     def _on_dept_changed(self, dept_label: str):
@@ -3701,9 +3738,13 @@ class Main(QtWidgets.QWidget):
         urgency_val = self.cb_urgency.currentText().strip() or "Elective"
         start_txt = self.time_start.time().toString("HH:mm") if self.ck_time_start.isChecked() else ""
         end_txt = self.time_end.time().toString("HH:mm") if self.ck_time_end.isChecked() else ""
+        cross_midnight = False
         if start_txt and end_txt:
             start_dt = datetime(qd.year(), qd.month(), qd.day(), int(start_txt[:2]), int(start_txt[3:]))
             end_dt = datetime(qd.year(), qd.month(), qd.day(), int(end_txt[:2]), int(end_txt[3:]))
+            if end_dt <= start_dt:
+                end_dt = end_dt + timedelta(days=1)
+                cross_midnight = end_dt.date() != start_dt.date()
             service_window = decide_service_window(urgency_val, start_dt, end_dt)
         else:
             service_window = _auto_service_window(dt)
@@ -3711,7 +3752,7 @@ class Main(QtWidgets.QWidget):
         ward_text = self.cb_ward.currentText().strip()
         if ward_text == WARD_PLACEHOLDER:
             ward_text = ""
-        return ScheduleEntry(
+        entry = ScheduleEntry(
             or_room=self.cb_or.currentText().strip(), dt=dt.date(), time_str=self.time.time().toString("HH:mm"),
             hn=self.ent_hn.text().strip(), name=self.ent_name.text().strip(), age=self.ent_age.text().strip() or "0",
             dept=(self.cb_dept.currentText().strip() if not self.cb_dept.currentText().startswith("—") else ""),
@@ -3730,6 +3771,8 @@ class Main(QtWidgets.QWidget):
             time_start=start_txt,
             time_end=end_txt,
         )
+        setattr(entry, "cross_midnight", cross_midnight)
+        return entry
 
     def _clear_form(self):
         self.cb_or.setCurrentIndex(0)
@@ -3871,6 +3914,8 @@ class Main(QtWidgets.QWidget):
             self.ck_time_end.setChecked(False)
             self.time_end.setEnabled(False)
             self.time_end.setTime(QtCore.QTime.currentTime())
+
+        self._update_service_window_info()
 
     def _on_add_or_update(self):
         e = self._collect()

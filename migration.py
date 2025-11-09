@@ -115,6 +115,8 @@ def _migrate_rows(conn: sqlite3.Connection, rows: Iterable[Dict[str, object]], d
             end_dt = start_dt + timedelta(minutes=60)
         if not (start_dt and end_dt):
             continue
+        if end_dt <= start_dt:
+            end_dt = end_dt + timedelta(days=1)
         service_window = decide_service_window(urgency, start_dt, end_dt)
         record_uuid = str(row.get("uuid") or row.get("case_uid") or uuid.uuid4())
         payload = (
