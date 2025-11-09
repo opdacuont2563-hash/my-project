@@ -51,17 +51,23 @@ ORDER BY urgency DESC, service_window DESC, start_time, or_room;
 """
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
-    """Ensure the unified registry schema exists."""
+def ensure_schema(conn: sqlite3.Connection | None = None) -> None:
+    """Ensure the unified registry schema exists on the configured database."""
+    if conn is None:
+        with sqlite3.connect(DB_PATH) as connection:
+            connection.executescript(SCHEMA_SQL)
+            connection.commit()
+        return
+
     conn.executescript(SCHEMA_SQL)
 
 
 def ensure_schema_at_path(path: Path | None = None) -> None:
     """Convenience helper to ensure the schema on the provided database path."""
-    target = path or DB_PATH
-    with sqlite3.connect(target) as conn:
-        ensure_schema(conn)
-        conn.commit()
+    target = Path(path or DB_PATH)
+    with sqlite3.connect(target) as connection:
+        connection.executescript(SCHEMA_SQL)
+        connection.commit()
 
 
 if __name__ == "__main__":

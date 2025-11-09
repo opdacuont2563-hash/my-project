@@ -27,8 +27,36 @@ from icd10_catalog import (
 )
 
 from dashboard_tab import DashboardTab
-from migration import DB_PATH, ensure_schema
 from utils_time_windows import decide_service_window
+
+# === DB bootstrap ===
+try:
+    from migration import ensure_schema, DB_PATH
+except Exception:  # pragma: no cover - fallback if migration import fails
+    DB_PATH = Path.cwd() / "or_registry.sqlite3"
+
+    def ensure_schema(*_args, **_kwargs):  # type: ignore[override]
+        return None
+
+_DB_INITED = False
+
+
+def _init_db_once() -> None:
+    """Ensure the registry database exists exactly once per process."""
+    global _DB_INITED
+    if _DB_INITED:
+        return
+    try:
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        ensure_schema()
+    except TypeError:
+        with sqlite3.connect(str(DB_PATH)) as con:
+            ensure_schema(con)
+            con.commit()
+    _DB_INITED = True
 
 try:
     from rapidfuzz import fuzz, process  # type: ignore
