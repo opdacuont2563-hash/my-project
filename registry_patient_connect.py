@@ -324,6 +324,9 @@ API_LIST = "/api/list";
 API_LIST_FULL = "/api/list_full";
 API_WS = "/api/ws"
 
+ALLOW_SAVE_ANYTIME = True
+SHOW_DEADLINE_NOTE = False
+
 STATUS_OP_START = "กำลังผ่าตัด"
 STATUS_RECOVERY = "กำลังพักฟื้น"
 STATUS_RETURNING = "กำลังส่งกลับตึก"
@@ -4459,18 +4462,21 @@ class Main(QtWidgets.QWidget):
                 pass
             return
 
-        now = datetime.now()
-        dl = next_deadline(now)
-        remain_txt = _fmt_td(dl - now)
-        if in_working_hours(now):
-            note = f"โปรดตรวจทานให้เรียบร้อย — เดดไลน์บันทึกวันนี้ 16:30 (เหลือ {remain_txt})"
-        else:
-            note = f"นอกเวลาทำการ — ควรบันทึกก่อน {dl.strftime('%d/%m %H:%M')} (เหลือ {remain_txt})"
-        try:
-            SweetAlert.info(self, "ยืนยันการบันทึก", note)
-        except Exception:
-            QtWidgets.QMessageBox.information(self, "ยืนยันการบันทึก", note)
+        if SHOW_DEADLINE_NOTE and not ALLOW_SAVE_ANYTIME:
+            now = datetime.now()
+            dl = next_deadline(now)
+            remain_txt = _fmt_td(dl - now)
+            note = (
+                f"โปรดตรวจทานให้เรียบร้อย — เดดไลน์บันทึกวันนี้ 16:30 (เหลือ {remain_txt})"
+                if in_working_hours(now)
+                else f"นอกเวลาทำการ — ควรบันทึกก่อน {dl.strftime('%d/%m %H:%M')} (เหลือ {remain_txt})"
+            )
+            try:
+                SweetAlert.info(self, "ยืนยันการบันทึก", note)
+            except Exception:
+                QtWidgets.QMessageBox.information(self, "ยืนยันการบันทึก", note)
 
+        # อนุญาตให้บันทึกได้ทุกเวลา (ไม่ต้องเตือน/เดดไลน์)
         try:
             save_postop_entry(entry)
             entry.postop_completed = True
