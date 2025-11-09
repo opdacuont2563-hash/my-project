@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path.cwd() / "or_registry.sqlite3"
+DB_PATH = Path.cwd() / "ornbh.db"
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;

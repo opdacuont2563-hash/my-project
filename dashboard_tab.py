@@ -2,7 +2,7 @@
 """
 Dashboard Tab สำหรับ OR — ใช้กับ PySide6 + SQLite (single registry)
 กราฟ: Matplotlib (ฝังใน QWidget)
-แหล่งข้อมูล: or_registry.sqlite3
+แหล่งข้อมูล: ornbh.db
 ตารางที่ใช้: surgery_cases
 """
 
@@ -23,11 +23,48 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.ticker as mticker
 
-from migration import DB_PATH as REGISTRY_DB_PATH, ensure_schema
+DB_PATH = Path.cwd() / "ornbh.db"
+
+
+def _ensure_minimal_schema(con: sqlite3.Connection) -> None:
+    # Ensure the main table exists (no-op if already there)
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS surgery_cases (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          uuid TEXT UNIQUE,
+          hn TEXT,
+          patient_name TEXT,
+          department TEXT,
+          surgeon TEXT,
+          or_room TEXT,
+          case_size TEXT,
+          urgency TEXT,
+          service_window TEXT,
+          status TEXT,
+          reason TEXT,
+          start_time TEXT,
+          end_time TEXT,
+          diagnosis TEXT,
+          operation TEXT,
+          ward TEXT,
+          assist1 TEXT,
+          assist2 TEXT,
+          scrub TEXT,
+          cir TEXT,
+          saved_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+    cols = {r[1] for r in con.execute("PRAGMA table_info(surgery_cases)").fetchall()}
+    if "repeat_24h" not in cols:
+        con.execute("ALTER TABLE surgery_cases ADD COLUMN repeat_24h INTEGER NOT NULL DEFAULT 0")
+    if "saved_at" not in cols:
+        con.execute("ALTER TABLE surgery_cases ADD COLUMN saved_at TEXT NOT NULL DEFAULT (datetime('now'))")
+    con.commit()
 
 # ----------------------------- Config -----------------------------
 APP_DIR = Path(__file__).resolve().parent
-DB_PATH = REGISTRY_DB_PATH
 
 DEFAULT_BLOCK_START = "08:30"  # ใช้กับ Emergency ตามที่คุย
 DEFAULT_BLOCK_END = "16:30"
@@ -54,7 +91,7 @@ def sec_to_hhmm(sec: float) -> str:
 def safe_read_sqlite(db_path: Path, sql: str, parse_dates: Tuple[str, ...] = ()) -> pd.DataFrame:
     con = sqlite3.connect(str(db_path))
     try:
-        ensure_schema(con)
+        _ensure_minimal_schema(con)
         try:
             df = pd.read_sql_query(sql, con)
         except (sqlite3.Error, PandasDatabaseError):
@@ -96,7 +133,7 @@ def load_bundle(kind: str) -> DataBundle:
     """
     con = sqlite3.connect(str(DB_PATH))
     try:
-        ensure_schema(con)
+        _ensure_minimal_schema(con)
         postop = pd.read_sql_query(sql, con, params=params or None)
     finally:
         con.close()

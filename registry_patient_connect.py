@@ -29,14 +29,51 @@ from icd10_catalog import (
 from dashboard_tab import DashboardTab
 from utils_time_windows import decide_service_window
 
-# === DB bootstrap ===
-try:
-    from migration import ensure_schema, DB_PATH
-except Exception:  # pragma: no cover - fallback if migration import fails
-    DB_PATH = Path.cwd() / "or_registry.sqlite3"
+DB_PATH = Path.cwd() / "ornbh.db"
 
-    def ensure_schema(*_args, **_kwargs):  # type: ignore[override]
-        return None
+try:
+    from migration import ensure_schema  # type: ignore
+except Exception:  # pragma: no cover - fallback if migration import fails
+    ensure_schema = None  # type: ignore[assignment]
+
+
+def _ensure_minimal_schema(con: sqlite3.Connection) -> None:
+    """Ensure the minimally required columns exist for runtime compatibility."""
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS surgery_cases (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          uuid TEXT UNIQUE,
+          hn TEXT,
+          patient_name TEXT,
+          department TEXT,
+          surgeon TEXT,
+          or_room TEXT,
+          case_size TEXT,
+          urgency TEXT,
+          service_window TEXT,
+          status TEXT,
+          reason TEXT,
+          start_time TEXT,
+          end_time TEXT,
+          diagnosis TEXT,
+          operation TEXT,
+          ward TEXT,
+          assist1 TEXT,
+          assist2 TEXT,
+          scrub TEXT,
+          cir TEXT,
+          saved_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+    cols = {row[1] for row in con.execute("PRAGMA table_info(surgery_cases)").fetchall()}
+    if "repeat_24h" not in cols:
+        con.execute("ALTER TABLE surgery_cases ADD COLUMN repeat_24h INTEGER NOT NULL DEFAULT 0")
+    if "saved_at" not in cols:
+        con.execute("ALTER TABLE surgery_cases ADD COLUMN saved_at TEXT NOT NULL DEFAULT (datetime('now'))")
+    con.commit()
+
 
 _DB_INITED = False
 
@@ -47,15 +84,20 @@ def _init_db_once() -> None:
     if _DB_INITED:
         return
     try:
-        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
+    con = sqlite3.connect(str(DB_PATH))
     try:
-        ensure_schema()
-    except TypeError:
-        with sqlite3.connect(str(DB_PATH)) as con:
-            ensure_schema(con)
-            con.commit()
+        _ensure_minimal_schema(con)
+        if ensure_schema is not None:
+            try:
+                ensure_schema(con)
+            except TypeError:
+                ensure_schema()
+        con.commit()
+    finally:
+        con.close()
     _DB_INITED = True
 
 try:
@@ -435,7 +477,13 @@ def next_deadline(dt: datetime | None = None) -> datetime:
 
 def _db_conn():
     con = sqlite3.connect(str(DB_PATH))
-    ensure_schema(con)
+    _ensure_minimal_schema(con)
+    if ensure_schema is not None:
+        try:
+            ensure_schema(con)
+        except TypeError:
+            ensure_schema()
+    con.commit()
     con.row_factory = sqlite3.Row
     return con
 
