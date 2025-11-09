@@ -27,7 +27,8 @@ from icd10_catalog import (
 )
 
 from dashboard_tab import DashboardTab
-from utils_time_windows import categorize_timebucket, decide_service_window
+from migration import DB_PATH, ensure_schema
+from utils_time_windows import decide_service_window
 
 try:
     from rapidfuzz import fuzz, process  # type: ignore
@@ -364,46 +365,15 @@ STATUS_OP_START = "กำลังผ่าตัด"
 STATUS_RECOVERY = "กำลังพักฟื้น"
 STATUS_RETURNING = "กำลังส่งกลับตึก"
 
-EXPECTED_DB_COLUMNS = {
-    "id",
-    "uuid",
-    "or_room",
-    "hn",
-    "patient_name",
-    "age",
-    "diagnosis",
-    "operation",
-    "surgeon",
-    "ward",
-    "case_size",
-    "department",
-    "start_time",
-    "end_time",
-    "urgency",
-    "service_window",
-    "time_bucket",
-    "assist1",
-    "assist2",
-    "scrub",
-    "cir",
-    "status",
-    "reason",
-    "repeat_24h",
-    "created_at",
-    "updated_at",
-    "saved_at",
-}
-
+ACTION_COLUMN = 19
 
 ALLOWED_STATUSES = (
     "saved",
     "postponed",
     "offcase",
-    "scheduled",
-    "in-progress",
-    "done",
-    "cancelled",
 )
+
+REASONS = ["ผู้ป่วยปฏิเสธผ่าตัด", "แพทย์ไม่พร้อม", "Lab ไม่พร้อม"]
 
 
 STATUS_COLORS = {
@@ -435,102 +405,11 @@ def next_deadline(dt: datetime | None = None) -> datetime:
     return datetime.combine(now.date(), WORKING_START)
 
 
-DB_PATH = Path.cwd() / "ornbh.db"
-
-TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS surgery_cases (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    uuid            TEXT NOT NULL UNIQUE,
-    or_room         TEXT,
-    hn              TEXT NOT NULL,
-    patient_name    TEXT NOT NULL,
-    age             INTEGER,
-    diagnosis       TEXT,
-    operation       TEXT,
-    surgeon         TEXT,
-    ward            TEXT,
-    case_size       TEXT,
-    department      TEXT,
-    start_time      TEXT,
-    end_time        TEXT,
-    urgency         TEXT NOT NULL CHECK (urgency IN ('Elective','Emergency')),
-    service_window  TEXT NOT NULL CHECK (service_window IN ('InHours','OutOfHours')),
-    time_bucket     TEXT NOT NULL DEFAULT 'ในเวลา'
-                    CHECK (time_bucket IN ('ในเวลา','นอกเวลา')),
-    assist1         TEXT,
-    assist2         TEXT,
-    scrub           TEXT,
-    cir             TEXT,
-    status          TEXT NOT NULL DEFAULT 'saved'
-                    CHECK (
-                        status IN (
-                            'saved','postponed','offcase',
-                            'scheduled','in-progress','done','cancelled'
-                        )
-                    ),
-    reason          TEXT,
-    repeat_24h      INTEGER NOT NULL DEFAULT 0,
-    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
-    saved_at        TEXT NOT NULL DEFAULT (datetime('now'))
-);
-"""
-
-INDEX_SQL = """
-CREATE INDEX IF NOT EXISTS idx_cases_hn ON surgery_cases (hn);
-CREATE INDEX IF NOT EXISTS idx_cases_start ON surgery_cases (start_time);
-CREATE INDEX IF NOT EXISTS idx_cases_hn_start ON surgery_cases (hn, start_time);
-CREATE INDEX IF NOT EXISTS idx_cases_urgency ON surgery_cases (urgency);
-CREATE INDEX IF NOT EXISTS idx_cases_service_window ON surgery_cases (service_window);
-CREATE INDEX IF NOT EXISTS idx_cases_time_bucket ON surgery_cases (time_bucket);
-CREATE INDEX IF NOT EXISTS idx_cases_status ON surgery_cases (status);
-"""
-
-VIEW_SQL = """
-CREATE VIEW IF NOT EXISTS v_cases_today AS
-SELECT * FROM surgery_cases
-WHERE date(start_time) = date('now','localtime')
-ORDER BY urgency DESC, time_bucket DESC, start_time, or_room;
-"""
-
-SCHEMA_SQL = """
-PRAGMA foreign_keys = ON;
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-
-{table}
-
-{indexes}
-
-{view}
-""".format(table=TABLE_SQL.strip(), indexes=INDEX_SQL.strip(), view=VIEW_SQL.strip())
-
-
 def _db_conn():
     con = sqlite3.connect(str(DB_PATH))
     ensure_schema(con)
+    con.row_factory = sqlite3.Row
     return con
-
-
-def _init_db_once():
-    con = _db_conn()
-    try:
-        con.commit()
-    finally:
-        con.close()
-
-
-def _check_repeat_24h(con: sqlite3.Connection, hn: str, start_dt: datetime) -> int:
-    if not hn or not start_dt:
-        return 0
-    window_start = (start_dt - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M")
-    window_end = start_dt.strftime("%Y-%m-%d %H:%M")
-    cur = con.execute(
-        "SELECT COUNT(*) FROM surgery_cases WHERE hn = ? AND start_time BETWEEN ? AND ?",
-        (hn, window_start, window_end),
-    )
-    count = cur.fetchone()[0] if cur else 0
-    return 1 if count else 0
 
 
 def _normalize_status(value: str | None) -> str:
@@ -545,12 +424,6 @@ def _normalize_status(value: str | None) -> str:
         "เลื่อน": "postponed",
         "เลื่อนผ่าตัด": "postponed",
         "saved": "saved",
-        "done": "done",
-        "cancelled": "cancelled",
-        "canceled": "cancelled",
-        "in-progress": "in-progress",
-        "in progress": "in-progress",
-        "scheduled": "scheduled",
     }
     if text in mapping:
         return mapping[text]
@@ -559,122 +432,28 @@ def _normalize_status(value: str | None) -> str:
     return "saved"
 
 
-def ensure_schema(con: sqlite3.Connection) -> None:
-    cur = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='surgery_cases'")
-    existing = cur.fetchone()
-    needs_upgrade = False
-    if existing:
-        info = con.execute("PRAGMA table_info(surgery_cases)").fetchall()
-        have_cols = {row[1] for row in info}
-        missing = EXPECTED_DB_COLUMNS.difference(have_cols)
-        needs_upgrade = bool(missing)
-        if not needs_upgrade:
-            schema_sql = con.execute(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='surgery_cases'"
-            ).fetchone()
-            if schema_sql:
-                sql_text = schema_sql[0] or ""
-                for status in ("'saved'", "'offcase'", "'postponed'"):
-                    if status not in sql_text:
-                        needs_upgrade = True
-                        break
-                if "time_bucket" not in sql_text:
-                    needs_upgrade = True
-    if needs_upgrade:
-        _upgrade_schema(con)
-    con.executescript(SCHEMA_SQL)
+def _is_repeat_24h(con: sqlite3.Connection, hn: str, start_iso: str) -> int:
+    if not hn or not start_iso:
+        return 0
+    sql = """
+    SELECT 1 FROM surgery_cases
+    WHERE hn=? AND ABS(strftime('%s', start_time) - strftime('%s', ?)) <= 86400
+    LIMIT 1
+    """
+    cur = con.execute(sql, (hn, start_iso))
+    return 1 if cur.fetchone() else 0
 
 
-def _upgrade_schema(con: sqlite3.Connection) -> None:
-    cur = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='surgery_cases'")
-    if not cur.fetchone():
+def _update_case_status(case_id: int, status: str, reason: str | None) -> None:
+    if not case_id:
         return
-    old_factory = con.row_factory
-    try:
-        con.row_factory = sqlite3.Row
-        rows = con.execute("SELECT * FROM surgery_cases").fetchall()
-    except sqlite3.Error:
-        rows = []
-    finally:
-        con.row_factory = old_factory
-
-    con.execute("DROP TABLE IF EXISTS surgery_cases_new")
-    table_sql = TABLE_SQL.replace("surgery_cases", "surgery_cases_new", 1)
-    con.executescript(table_sql)
-
-    insert_sql = (
-        "INSERT INTO surgery_cases_new ("
-        " uuid, or_room, hn, patient_name, age, diagnosis, operation,"
-        " surgeon, ward, case_size, department, start_time, end_time,"
-        " urgency, service_window, time_bucket, assist1, assist2, scrub,"
-        " cir, status, reason, repeat_24h, created_at, updated_at, saved_at"
-        " ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-    )
-
-    for row in rows:
-        row_dict = dict(row)
-        start_iso = row_dict.get("start_time")
-        start_dt: datetime | None = None
-        if start_iso:
-            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
-                try:
-                    start_dt = datetime.strptime(start_iso, fmt)
-                    break
-                except Exception:
-                    continue
-            if start_dt is None:
-                try:
-                    start_dt = datetime.fromisoformat(start_iso)
-                except Exception:
-                    start_dt = None
-        time_bucket = row_dict.get("time_bucket")
-        if not time_bucket:
-            if start_dt:
-                time_bucket = categorize_timebucket(start_dt)
-            else:
-                time_bucket = "นอกเวลา"
-        status_val = row_dict.get("status") or "saved"
-        if status_val not in ALLOWED_STATUSES:
-            status_val = "saved"
-        created_at = row_dict.get("created_at") or datetime.now().strftime("%Y-%m-%d %H:%M")
-        updated_at = row_dict.get("updated_at") or created_at
-        saved_at = row_dict.get("saved_at") or created_at
-        reason = row_dict.get("reason")
-        repeat_flag = int(row_dict.get("repeat_24h") or 0)
-
-        values = (
-            row_dict.get("uuid"),
-            row_dict.get("or_room"),
-            row_dict.get("hn"),
-            row_dict.get("patient_name"),
-            row_dict.get("age"),
-            row_dict.get("diagnosis"),
-            row_dict.get("operation"),
-            row_dict.get("surgeon"),
-            row_dict.get("ward"),
-            row_dict.get("case_size"),
-            row_dict.get("department"),
-            row_dict.get("start_time"),
-            row_dict.get("end_time"),
-            row_dict.get("urgency"),
-            row_dict.get("service_window"),
-            time_bucket,
-            row_dict.get("assist1"),
-            row_dict.get("assist2"),
-            row_dict.get("scrub"),
-            row_dict.get("cir"),
-            status_val,
-            reason,
-            repeat_flag,
-            created_at,
-            updated_at,
-            saved_at,
+    status_norm = _normalize_status(status)
+    with _db_conn() as con:
+        con.execute(
+            "UPDATE surgery_cases SET status=?, reason=?, updated_at=datetime('now') WHERE id=?",
+            (status_norm, reason, case_id),
         )
-        con.execute(insert_sql, values)
-
-    con.execute("DROP TABLE IF EXISTS surgery_cases")
-    con.execute("ALTER TABLE surgery_cases_new RENAME TO surgery_cases")
-    con.commit()
+        con.commit()
 
 
 def save_postop_entry(entry):
@@ -713,22 +492,32 @@ def save_postop_entry(entry):
         if not (start_dt and end_dt):
             raise ValueError("จำเป็นต้องระบุเวลาเริ่มและจบผ่าตัด")
 
-        cross_midnight = False
         if end_dt <= start_dt:
-            # ถือว่าเป็นเคสข้ามเที่ยงคืน -> ขยับ end_dt ไปวันถัดไป
             end_dt = end_dt + timedelta(days=1)
-            cross_midnight = True
 
         try:
             age_val = int(str(getattr(entry, "age", 0) or 0))
         except Exception:
             age_val = 0
 
-        case_uid = getattr(entry, "case_uid", "") or f"{getattr(entry, 'hn', '')}-{getattr(entry, 'or_room', '')}-{getattr(entry, 'time', '')}"
+        def _flatten(values) -> str:
+            if isinstance(values, (list, tuple)):
+                items = [str(v).strip() for v in values if str(v).strip()]
+                return ", ".join(items)
+            return str(values or "")
+
         urgency = (getattr(entry, "urgency", "Elective") or "Elective").title()
         service_window = decide_service_window(urgency, start_dt, end_dt)
-        time_bucket = categorize_timebucket(start_dt)
-        repeat_flag = _check_repeat_24h(con, str(getattr(entry, "hn", "")).strip(), start_dt)
+        now_txt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        start_iso = start_dt.strftime("%Y-%m-%d %H:%M")
+        end_iso = end_dt.strftime("%Y-%m-%d %H:%M")
+
+        case_uid = getattr(entry, "case_uid", "") or f"{getattr(entry, 'hn', '')}-{getattr(entry, 'or_room', '')}-{getattr(entry, 'time', '')}"
+        hn = str(getattr(entry, "hn", "")).strip()
+        patient_name = getattr(entry, "patient_name", getattr(entry, "name", "")) or ""
+        department = getattr(entry, "department", getattr(entry, "dept", "")) or ""
+        cir_value = getattr(entry, "cir", getattr(entry, "circulate", "")) or ""
+
         status_value = _normalize_status(getattr(entry, "state", None))
         reason_value_raw = (
             getattr(entry, "status_reason", None)
@@ -737,134 +526,132 @@ def save_postop_entry(entry):
             or getattr(entry, "reason", None)
         )
         reason_value = str(reason_value_raw).strip() if reason_value_raw else None
-        saved_at = datetime.now().strftime("%Y-%m-%d %H:%M")
-        setattr(entry, "cross_midnight", cross_midnight)
-        entry.service_window = service_window
-        entry.time_bucket = time_bucket
-        entry.repeat_24h = repeat_flag
 
-        def _flatten(values) -> str:
-            if isinstance(values, (list, tuple)):
-                items = [str(v).strip() for v in values if str(v).strip()]
-                return ", ".join(items)
-            return str(values or "")
+        payload = {
+            "uuid": case_uid,
+            "or_room": getattr(entry, "or_room", ""),
+            "hn": hn,
+            "patient_name": patient_name,
+            "age": age_val,
+            "diagnosis": _flatten(getattr(entry, "diags", [])),
+            "operation": _flatten(getattr(entry, "ops", [])),
+            "surgeon": getattr(entry, "doctor", ""),
+            "ward": getattr(entry, "ward", ""),
+            "case_size": getattr(entry, "case_size", ""),
+            "department": department,
+            "start_time": start_iso,
+            "end_time": end_iso,
+            "urgency": urgency,
+            "service_window": service_window,
+            "assist1": getattr(entry, "assist1", ""),
+            "assist2": getattr(entry, "assist2", ""),
+            "scrub": getattr(entry, "scrub", ""),
+            "cir": cir_value,
+            "status": status_value,
+            "reason": reason_value,
+            "saved_at": now_txt,
+        }
 
-        payload = (
-            case_uid,
-            getattr(entry, "or_room", ""),
-            getattr(entry, "hn", ""),
-            getattr(entry, "name", ""),
-            age_val,
-            _flatten(getattr(entry, "diags", [])),
-            _flatten(getattr(entry, "ops", [])),
-            getattr(entry, "doctor", ""),
-            getattr(entry, "ward", ""),
-            getattr(entry, "case_size", ""),
-            getattr(entry, "dept", ""),
-            start_dt.strftime("%Y-%m-%d %H:%M"),
-            end_dt.strftime("%Y-%m-%d %H:%M"),
-            urgency,
-            service_window,
-            time_bucket,
-            getattr(entry, "assist1", ""),
-            getattr(entry, "assist2", ""),
-            getattr(entry, "scrub", ""),
-            getattr(entry, "circulate", ""),
-            status_value,
-            reason_value,
-            repeat_flag,
-            saved_at,
+        payload["repeat_24h"] = _is_repeat_24h(con, payload["hn"], payload["start_time"])
+
+        columns = (
+            "uuid, or_room, hn, patient_name, age, diagnosis, operation, surgeon, ward, case_size, "
+            "department, start_time, end_time, urgency, service_window, assist1, assist2, scrub, cir, status, reason, repeat_24h, saved_at"
         )
+        values = [
+            payload["uuid"],
+            payload["or_room"],
+            payload["hn"],
+            payload["patient_name"],
+            payload["age"],
+            payload["diagnosis"],
+            payload["operation"],
+            payload["surgeon"],
+            payload["ward"],
+            payload["case_size"],
+            payload["department"],
+            payload["start_time"],
+            payload["end_time"],
+            payload["urgency"],
+            payload["service_window"],
+            payload["assist1"],
+            payload["assist2"],
+            payload["scrub"],
+            payload["cir"],
+            payload["status"],
+            payload["reason"],
+            payload["repeat_24h"],
+            payload["saved_at"],
+        ]
 
-        con.execute(
-            "INSERT INTO surgery_cases ("
-            " uuid, or_room, hn, patient_name, age, diagnosis, operation,"
-            " surgeon, ward, case_size, department, start_time, end_time,"
-            " urgency, service_window, time_bucket, assist1, assist2, scrub,"
-            " cir, status, reason, repeat_24h, saved_at, updated_at"
-            " ) VALUES ("
-            " ?,?,?,?,?,?,?,?,?,?,"
-            " ?,?,?,?,?,?,?,?,?,?,"
-            " ?,?,?,?, datetime('now')"
-            " )"
-            " ON CONFLICT(uuid) DO UPDATE SET"
-            " or_room=excluded.or_room,"
-            " hn=excluded.hn,"
-            " patient_name=excluded.patient_name,"
-            " age=excluded.age,"
-            " diagnosis=excluded.diagnosis,"
-            " operation=excluded.operation,"
-            " surgeon=excluded.surgeon,"
-            " ward=excluded.ward,"
-            " case_size=excluded.case_size,"
-            " department=excluded.department,"
-            " start_time=excluded.start_time,"
-            " end_time=excluded.end_time,"
-            " urgency=excluded.urgency,"
-            " service_window=excluded.service_window,"
-            " time_bucket=excluded.time_bucket,"
-            " assist1=excluded.assist1,"
-            " assist2=excluded.assist2,"
-            " scrub=excluded.scrub,"
-            " cir=excluded.cir,"
-            " status=excluded.status,"
-            " reason=excluded.reason,"
-            " repeat_24h=excluded.repeat_24h,"
-            " saved_at=excluded.saved_at,"
-            " updated_at=datetime('now')",
-            payload,
+        placeholders = ",".join(["?"] * len(values))
+        sql = (
+            f"INSERT INTO surgery_cases ({columns}) VALUES ({placeholders}) "
+            "ON CONFLICT(uuid) DO UPDATE SET "
+            "or_room=excluded.or_room, "
+            "hn=excluded.hn, "
+            "patient_name=excluded.patient_name, "
+            "age=excluded.age, "
+            "diagnosis=excluded.diagnosis, "
+            "operation=excluded.operation, "
+            "surgeon=excluded.surgeon, "
+            "ward=excluded.ward, "
+            "case_size=excluded.case_size, "
+            "department=excluded.department, "
+            "start_time=excluded.start_time, "
+            "end_time=excluded.end_time, "
+            "urgency=excluded.urgency, "
+            "service_window=excluded.service_window, "
+            "assist1=excluded.assist1, "
+            "assist2=excluded.assist2, "
+            "scrub=excluded.scrub, "
+            "cir=excluded.cir, "
+            "status=excluded.status, "
+            "reason=excluded.reason, "
+            "repeat_24h=excluded.repeat_24h, "
+            "saved_at=excluded.saved_at, "
+            "updated_at=datetime('now')"
         )
+        con.execute(sql, values)
         con.commit()
-        cur = con.execute("SELECT uuid FROM surgery_cases WHERE uuid=?", (case_uid,))
-        if not cur.fetchone():
+
+        row = con.execute(
+            "SELECT id, repeat_24h, service_window FROM surgery_cases WHERE uuid=?",
+            (payload["uuid"],),
+        ).fetchone()
+        if not row:
             raise RuntimeError("ไม่พบข้อมูลที่เพิ่งบันทึก")
+
+        entry.service_window = row["service_window"]
+        entry.repeat_24h = row["repeat_24h"]
+        entry.patient_name = patient_name
+        entry.department = department
+        entry.cir = cir_value
+        entry.postop_completed = True
+        return row["id"], row["repeat_24h"]
     finally:
         con.close()
 
 
+def _blank(x) -> bool:
+    return str(x or "").strip() == ""
+
+
 def missing_required_fields(entry) -> list[str]:
-    missing: list[str] = []
-
-    def _blank(val) -> bool:
-        if val is None:
-            return True
-        text = str(val).strip()
-        return text == "" or text.startswith("—")
-
-    if _blank(getattr(entry, "assist1", "")):
-        missing.append("Assist 1")
-    if _blank(getattr(entry, "scrub", "")):
-        missing.append("Scrub")
-    if _blank(getattr(entry, "circulate", "")):
-        missing.append("Circulate")
-    ops_list = getattr(entry, "ops", None)
-    if not (ops_list and len(ops_list) > 0):
-        missing.append("Operation (อย่างน้อย 1)")
-    diags_list = getattr(entry, "diags", None)
-    if not (diags_list and len(diags_list) > 0):
-        missing.append("Diagnosis (อย่างน้อย 1)")
-    if _blank(getattr(entry, "dept", "")):
-        missing.append("แผนก")
-    if _blank(getattr(entry, "case_size", "")):
-        missing.append("ขนาดเคส (Major/Minor)")
-    if _blank(getattr(entry, "time_start", "")):
-        missing.append("เวลาเริ่มผ่าตัด")
-    if _blank(getattr(entry, "time_end", "")):
-        missing.append("เวลาจบผ่าตัด")
-    try:
-        ts = getattr(entry, "time_start", "")
-        te = getattr(entry, "time_end", "")
-        if ts and te:
-            hs, ms = map(int, str(ts).split(":")[:2])
-            he, me = map(int, str(te).split(":")[:2])
-            # อนุญาตเคสข้ามเที่ยงคืน: end สามารถน้อยกว่า start ได้
-            # แต่ถ้า "เท่ากันเป๊ะ" ให้ถือว่าไม่สมเหตุผล
-            if (he, me) == (hs, ms):
-                missing.append("เวลาเริ่ม/จบ ไม่สมเหตุผล (เริ่ม=จบ)")
-            # else: ข้ามวันได้ ไม่ต้อง append error
-    except Exception:
-        missing.append("รูปแบบเวลาไม่ถูกต้อง")
-    return missing
+    required = {
+        "hn": "HN",
+        "patient_name": "ชื่อ-สกุล",
+        "surgeon": "แพทย์",
+        "department": "แผนก",
+        "ward": "Ward",
+        "time_start": "เริ่ม",
+        "time_end": "จบ",
+        "urgency": "ความเร่งด่วน",
+        "service_window": "ประเภทเวลา",
+        "scrub": "Scrub",
+        "cir": "Cir",
+    }
+    return [label for attr, label in required.items() if _blank(getattr(entry, attr, ""))]
 DEFAULT_OR_ROOMS = ["OR1", "OR2", "OR3", "OR4", "OR5", "OR6", "OR8"]
 
 # --- สถานะจาก monitor ที่ใช้จับเวลา / auto-complete ---
@@ -1246,8 +1033,10 @@ class ScheduleEntry(QtCore.QObject):
         self.time = time_str
         self.hn = (hn or "").strip()
         self.name = (name or "").strip()
+        self.patient_name = self.name
         self.age = int(age) if str(age).isdigit() else 0
         self.dept = dept
+        self.department = self.dept
         self.doctor = doctor
         self.diags = diags or []
         self.ops = ops or []
@@ -1262,6 +1051,7 @@ class ScheduleEntry(QtCore.QObject):
         self.assist2 = assist2
         self.scrub = scrub
         self.circulate = circulate
+        self.cir = circulate
         self.time_start = time_start
         self.time_end = time_end
         self.case_uid = case_uid or self._gen_case_uid()
@@ -2602,6 +2392,7 @@ class Main(QtWidgets.QWidget):
         self.CASE_UID_ROLE = QtCore.Qt.UserRole + 10
         self.HN_ROLE = QtCore.Qt.UserRole + 11
         self.OR_ROLE = QtCore.Qt.UserRole + 12
+        self.DB_ID_ROLE = QtCore.Qt.UserRole + 13
 
         self.api_base_url = getattr(self, "api_base_url", "http://127.0.0.1:8000")
 
@@ -2946,11 +2737,11 @@ class Main(QtWidgets.QWidget):
         self.card_result.title_lbl.hide()
         gr2 = self.card_result.grid
         self.tree2 = QtWidgets.QTreeWidget()
-        self.tree2.setColumnCount(19)
+        self.tree2.setColumnCount(20)
         self.tree2.setHeaderLabels([
             "OR/เวลา", "HN", "ชื่อ-สกุล", "อายุ", "Diagnosis", "Operation",
             "แพทย์", "Ward", "ขนาดเคส", "แผนก", "เริ่ม", "จบ", "ความเร่งด่วน",
-            "ประเภทเวลา", "Assist 1", "Assist 2", "Scrub", "Cir", "สถานะ"
+            "ประเภทเวลา", "Assist 1", "Assist 2", "Scrub", "Cir", "สถานะ", "บันทึก"
         ])
         self.tree2.setUniformRowHeights(False)
         self.tree2.setAlternatingRowColors(True)
@@ -2985,7 +2776,7 @@ class Main(QtWidgets.QWidget):
         hdr.setStretchLastSection(False)
         hdr.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         hdr.setFixedHeight(42)
-        for i in range(19):
+        for i in range(20):
             hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
         for i in (2, 4, 5):
             hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.Interactive)
@@ -4601,8 +4392,9 @@ class Main(QtWidgets.QWidget):
                             entry.assist1 or '-',
                             entry.assist2 or '-',
                             entry.scrub or '-',
-                            getattr(entry, 'circulate', '') or '-',
+                            getattr(entry, 'cir', getattr(entry, 'circulate', '')) or '-',
                             status_text,
+                            '',
                         ])
                         row.setData(0, QtCore.Qt.UserRole, entry.uid())
                         row.setData(0, QtCore.Qt.UserRole + 1, idx)
@@ -4613,6 +4405,11 @@ class Main(QtWidgets.QWidget):
 
                         badge = _service_window_badge(getattr(entry, 'service_window', None) or ('InHours' if (entry.period or 'in') == 'in' else 'OutOfHours'))
                         self.tree2.setItemWidget(row, 13, badge)
+
+                        if getattr(entry, 'postop_completed', False):
+                            self._swap_action_cell_to_saved(entry, row, 0, int(getattr(entry, 'repeat_24h', 0) or 0))
+                        else:
+                            self.tree2.setItemWidget(row, ACTION_COLUMN, self._build_action_cell(entry, row))
 
                         monitor_status = self._last_status_by_hn.get(str(entry.hn).strip(), '')
 
@@ -4704,6 +4501,145 @@ class Main(QtWidgets.QWidget):
 
             QtCore.QTimer.singleShot(0, _restore_scroll)
 
+    def _build_action_menu(self, entry: ScheduleEntry, item: QtWidgets.QTreeWidgetItem) -> QtWidgets.QMenu:
+        menu = QtWidgets.QMenu(self.tree2)
+        postpone_menu = menu.addMenu("เลื่อนผ่าตัด")
+        for reason in REASONS:
+            act = postpone_menu.addAction(reason)
+            act.triggered.connect(lambda _=False, r=reason: self._handle_status_action(entry, item, "postponed", r))
+        off_menu = menu.addMenu("OFF Case")
+        for reason in REASONS:
+            act = off_menu.addAction(reason)
+            act.triggered.connect(lambda _=False, r=reason: self._handle_status_action(entry, item, "offcase", r))
+        return menu
+
+    def _build_action_cell(
+        self, entry: ScheduleEntry, item: QtWidgets.QTreeWidgetItem
+    ) -> QtWidgets.QWidget:
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        save_btn = QtWidgets.QPushButton("บันทึก")
+        save_btn.setProperty("variant", "primary")
+        save_btn.setEnabled(len(missing_required_fields(entry)) == 0)
+        save_btn.clicked.connect(lambda _=False: self._confirm_and_save(entry, item))
+
+        menu_btn = QtWidgets.QToolButton()
+        menu_btn.setText("⋯")
+        menu_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        menu_btn.setMenu(self._build_action_menu(entry, item))
+
+        layout.addWidget(save_btn, 0)
+        layout.addWidget(menu_btn, 0)
+        layout.addStretch(1)
+        return container
+
+    def _swap_action_cell_to_saved(
+        self,
+        entry: ScheduleEntry,
+        item: QtWidgets.QTreeWidgetItem,
+        case_id: int,
+        repeat_flag: int,
+    ) -> None:
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        label = QtWidgets.QLabel("✓ บันทึกแล้ว")
+        label.setStyleSheet("QLabel{color:#059669;font-weight:700;}")
+
+        menu_btn = QtWidgets.QToolButton()
+        menu_btn.setText("⋯")
+        menu_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        menu_btn.setMenu(self._build_action_menu(entry, item))
+
+        layout.addWidget(label, 0)
+        layout.addWidget(menu_btn, 0)
+        layout.addStretch(1)
+
+        self.tree2.setItemWidget(item, ACTION_COLUMN, container)
+        item.setData(0, self.DB_ID_ROLE, int(case_id or 0))
+
+        if repeat_flag:
+            name_txt = item.text(2)
+            note = " (ผ่าตัดซ้ำใน 24 ชม.)"
+            if note not in name_txt:
+                item.setText(2, name_txt + note)
+        entry.repeat_24h = repeat_flag
+        entry.postop_completed = True
+
+    def _handle_status_action(
+        self,
+        entry: ScheduleEntry,
+        item: QtWidgets.QTreeWidgetItem,
+        status: str,
+        reason: str,
+    ) -> None:
+        case_id = item.data(0, self.DB_ID_ROLE)
+        if not case_id:
+            result = self._confirm_and_save(entry, item, silent=True)
+            if not result:
+                return
+            case_id, repeat_flag = result
+        else:
+            case_id = int(case_id)
+            repeat_flag = getattr(entry, "repeat_24h", 0)
+
+        _update_case_status(case_id, status, reason)
+        entry.state = status
+        entry.reason = reason
+        item.setText(18, status)
+        self._swap_action_cell_to_saved(entry, item, case_id, repeat_flag)
+        QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), f"{status} : {reason}")
+
+    def _confirm_and_save(
+        self,
+        entry: ScheduleEntry,
+        item: QtWidgets.QTreeWidgetItem,
+        silent: bool = False,
+    ) -> Optional[Tuple[int, int]]:
+        missing = missing_required_fields(entry)
+        if missing and not silent:
+            msg = "จำเป็นต้องกรอกให้ครบก่อนบันทึกจริง\n\n- " + "\n- ".join(missing)
+            try:
+                SweetAlert.warning(self, "ข้อมูลยังไม่ครบ", msg)
+            except Exception:
+                QtWidgets.QMessageBox.warning(self, "ข้อมูลยังไม่ครบ", msg)
+            return None
+        try:
+            result = save_postop_entry(entry)
+        except Exception as exc:
+            if not silent:
+                try:
+                    SweetAlert.error(self, "บันทึกไม่สำเร็จ", str(exc))
+                except Exception:
+                    QtWidgets.QMessageBox.critical(self, "บันทึกไม่สำเร็จ", str(exc))
+            return None
+
+        case_id, repeat_flag = result
+        try:
+            self.sched._save()
+        except Exception:
+            pass
+
+        key = f"{getattr(entry, 'hn', '')}|{getattr(entry, 'case_uid', '')}"
+        self._reminded_keys.discard(key)
+        self._swap_action_cell_to_saved(entry, item, case_id, repeat_flag)
+
+        if not silent:
+            try:
+                self.result_banner.set_icon("✅")
+                self.result_banner.set_title("บันทึกลงฐานข้อมูลสำเร็จ")
+                self.result_banner.set_subtitle(
+                    f"HN {entry.hn} | OR {entry.or_room} | เวลา {entry.time_start or '-'}–{entry.time_end or '-'}"
+                )
+            except Exception:
+                pass
+        return result
+
     def _current_entry_in_result(self):
         item = self.tree2.currentItem()
         if not item:
@@ -4721,73 +4657,33 @@ class Main(QtWidgets.QWidget):
 
     def _on_commit_clicked(self):
         entry = self._current_entry_in_result()
-        if not entry:
+        item = self.tree2.currentItem()
+        if not entry or not item:
             try:
                 SweetAlert.info(self, "ยังไม่ได้เลือกผู้ป่วย", "กรุณาเลือกแถวในตารางก่อน")
             except Exception:
                 QtWidgets.QMessageBox.information(self, "ยังไม่ได้เลือกผู้ป่วย", "กรุณาเลือกแถวในตารางก่อน")
             return
 
-        missing = missing_required_fields(entry)
-        if missing:
-            msg = "จำเป็นต้องกรอกให้ครบก่อนบันทึกจริง (ยกเว้น Assist 2)\n\n- " + "\n- ".join(missing)
-            try:
-                SweetAlert.warning(self, "ข้อมูลยังไม่ครบ", msg)
-            except Exception:
-                QtWidgets.QMessageBox.warning(self, "ข้อมูลยังไม่ครบ", msg)
+        result = self._confirm_and_save(entry, item)
+        if result is None:
             try:
                 self._load_form_from_entry(entry)
                 self.tabs.setCurrentIndex(0)
             except Exception:
                 pass
-            return
-
-        if SHOW_DEADLINE_NOTE and not ALLOW_SAVE_ANYTIME:
-            now = datetime.now()
-            dl = next_deadline(now)
-            remain_txt = _fmt_td(dl - now)
-            note = (
-                f"โปรดตรวจทานให้เรียบร้อย — เดดไลน์บันทึกวันนี้ 16:30 (เหลือ {remain_txt})"
-                if in_working_hours(now)
-                else f"นอกเวลาทำการ — ควรบันทึกก่อน {dl.strftime('%d/%m %H:%M')} (เหลือ {remain_txt})"
-            )
-            try:
-                SweetAlert.info(self, "ยืนยันการบันทึก", note)
-            except Exception:
-                QtWidgets.QMessageBox.information(self, "ยืนยันการบันทึก", note)
-
-        # อนุญาตให้บันทึกได้ทุกเวลา (ไม่ต้องเตือน/เดดไลน์)
-        try:
-            save_postop_entry(entry)
-            entry.postop_completed = True
-            try:
-                self.sched._save()
-            except Exception:
-                pass
-            key = f"{getattr(entry, 'hn', '')}|{getattr(entry, 'case_uid', '')}"
-            self._reminded_keys.discard(key)
-            try:
-                self.result_banner.set_icon("✅")
-                self.result_banner.set_title("บันทึกลงฐานข้อมูลสำเร็จ")
-                self.result_banner.set_subtitle(
-                    f"HN {entry.hn} | OR {entry.or_room} | เวลา {entry.time_start or '-'}–{entry.time_end or '-'}"
-                )
-            except Exception:
-                pass
-            self._render_tree2()
-        except Exception as exc:
-            try:
-                SweetAlert.error(self, "บันทึกไม่สำเร็จ", str(exc))
-            except Exception:
-                QtWidgets.QMessageBox.critical(self, "บันทึกไม่สำเร็จ", str(exc))
 
     def _start_unsaved_reminder(self):
+        if not SHOW_DEADLINE_NOTE or ALLOW_SAVE_ANYTIME:
+            return
         self._unsaved_timer = QtCore.QTimer(self)
         self._unsaved_timer.setInterval(7 * 60 * 1000)
         self._unsaved_timer.timeout.connect(self._remind_unsaved_cases)
         self._unsaved_timer.start()
 
     def _remind_unsaved_cases(self):
+        if not SHOW_DEADLINE_NOTE or ALLOW_SAVE_ANYTIME:
+            return
         now = datetime.now()
         dl = next_deadline(now)
         remain = dl - now

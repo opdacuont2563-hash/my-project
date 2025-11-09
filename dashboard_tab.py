@@ -2,7 +2,7 @@
 """
 Dashboard Tab สำหรับ OR — ใช้กับ PySide6 + SQLite (single registry)
 กราฟ: Matplotlib (ฝังใน QWidget)
-แหล่งข้อมูล: ornbh.db
+แหล่งข้อมูล: or_registry.sqlite3
 ตารางที่ใช้: surgery_cases
 """
 
@@ -23,64 +23,14 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.ticker as mticker
 
+from migration import DB_PATH as REGISTRY_DB_PATH, ensure_schema
+
 # ----------------------------- Config -----------------------------
 APP_DIR = Path(__file__).resolve().parent
-DB_PATH = Path.cwd() / "ornbh.db"
+DB_PATH = REGISTRY_DB_PATH
 
 DEFAULT_BLOCK_START = "08:30"  # ใช้กับ Emergency ตามที่คุย
 DEFAULT_BLOCK_END = "16:30"
-
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS surgery_cases (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    uuid TEXT NOT NULL UNIQUE,
-    or_room TEXT,
-    hn TEXT NOT NULL,
-    patient_name TEXT NOT NULL,
-    age INTEGER,
-    diagnosis TEXT,
-    operation TEXT,
-    surgeon TEXT,
-    ward TEXT,
-    case_size TEXT,
-    department TEXT,
-    start_time TEXT,
-    end_time TEXT,
-    urgency TEXT NOT NULL CHECK (urgency IN ('Elective','Emergency')),
-    service_window TEXT NOT NULL CHECK (service_window IN ('InHours','OutOfHours')),
-    time_bucket TEXT NOT NULL DEFAULT 'ในเวลา'
-        CHECK (time_bucket IN ('ในเวลา','นอกเวลา')),
-    assist1 TEXT,
-    assist2 TEXT,
-    scrub TEXT,
-    cir TEXT,
-    status TEXT NOT NULL DEFAULT 'saved'
-        CHECK (
-            status IN (
-                'saved','postponed','offcase',
-                'scheduled','in-progress','done','cancelled'
-            )
-        ),
-    reason TEXT,
-    repeat_24h INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    saved_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_cases_hn ON surgery_cases (hn);
-CREATE INDEX IF NOT EXISTS idx_cases_start ON surgery_cases (start_time);
-CREATE INDEX IF NOT EXISTS idx_cases_hn_start ON surgery_cases (hn, start_time);
-CREATE INDEX IF NOT EXISTS idx_cases_urgency ON surgery_cases (urgency);
-CREATE INDEX IF NOT EXISTS idx_cases_service_window ON surgery_cases (service_window);
-CREATE INDEX IF NOT EXISTS idx_cases_time_bucket ON surgery_cases (time_bucket);
-CREATE INDEX IF NOT EXISTS idx_cases_status ON surgery_cases (status);
-
-CREATE VIEW IF NOT EXISTS v_cases_today AS
-SELECT * FROM surgery_cases
-WHERE date(start_time) = date('now','localtime')
-ORDER BY urgency DESC, time_bucket DESC, start_time, or_room;
-"""
 
 # ----------------------------- Utils ------------------------------
 def hhmm_to_minutes(hhmm: str) -> int:
@@ -104,7 +54,7 @@ def sec_to_hhmm(sec: float) -> str:
 def safe_read_sqlite(db_path: Path, sql: str, parse_dates: Tuple[str, ...] = ()) -> pd.DataFrame:
     con = sqlite3.connect(str(db_path))
     try:
-        con.executescript(SCHEMA_SQL)
+        ensure_schema(con)
         try:
             df = pd.read_sql_query(sql, con)
         except (sqlite3.Error, PandasDatabaseError):
@@ -138,15 +88,15 @@ def load_bundle(kind: str) -> DataBundle:
         params = (kind.title(),)
     sql = f"""
         SELECT uuid, hn, patient_name, department, surgeon, or_room,
-               case_size, urgency, service_window, time_bucket, status,
-               repeat_24h, reason, start_time, end_time, diagnosis,
-               operation, ward, assist1, assist2, scrub, cir, saved_at
+               case_size, urgency, service_window, status, repeat_24h,
+               reason, start_time, end_time, diagnosis, operation, ward,
+               assist1, assist2, scrub, cir, saved_at
         FROM surgery_cases
         {where}
     """
     con = sqlite3.connect(str(DB_PATH))
     try:
-        con.executescript(SCHEMA_SQL)
+        ensure_schema(con)
         postop = pd.read_sql_query(sql, con, params=params or None)
     finally:
         con.close()
