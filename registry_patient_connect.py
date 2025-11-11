@@ -30,6 +30,9 @@ from dashboard_tab import DashboardTab
 from utils_time_windows import decide_service_window
 
 DB_PATH = Path.cwd() / "ornbh.db"
+_MODULE_DB_PATH = Path(__file__).resolve().parent / "ornbh.db"
+if not DB_PATH.exists():
+    DB_PATH = _MODULE_DB_PATH
 
 try:
     from migration import ensure_schema  # type: ignore

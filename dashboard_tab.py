@@ -24,6 +24,9 @@ from matplotlib.figure import Figure
 import matplotlib.ticker as mticker
 
 DB_PATH = Path.cwd() / "ornbh.db"
+_MODULE_DB_PATH = Path(__file__).resolve().parent / "ornbh.db"
+if not DB_PATH.exists():
+    DB_PATH = _MODULE_DB_PATH
 
 
 def _ensure_minimal_schema(con: sqlite3.Connection) -> None:
