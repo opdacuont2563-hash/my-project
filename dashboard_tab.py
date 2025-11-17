@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Dashboard Tab สำหรับ OR — ใช้กับ PySide6 + SQLite (elective/emergency)
+Dashboard Tab สำหรับ OR — ใช้กับ PySide6 + SQLite (single registry)
 กราฟ: Matplotlib (ฝังใน QWidget)
-แหล่งข้อมูล: schedule_elective.db, schedule_emergency.db
-ตารางที่ใช้: postop_records, schedule, surgery_events
+แหล่งข้อมูล: ornbh.db
+ตารางที่ใช้: surgery_cases
 """
 
 from __future__ import annotations
-import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,10 +23,51 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.ticker as mticker
 
+DB_PATH = Path.cwd() / "ornbh.db"
+_MODULE_DB_PATH = Path(__file__).resolve().parent / "ornbh.db"
+if not DB_PATH.exists():
+    DB_PATH = _MODULE_DB_PATH
+
+
+def _ensure_minimal_schema(con: sqlite3.Connection) -> None:
+    # Ensure the main table exists (no-op if already there)
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS surgery_cases (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          uuid TEXT UNIQUE,
+          hn TEXT,
+          patient_name TEXT,
+          department TEXT,
+          surgeon TEXT,
+          or_room TEXT,
+          case_size TEXT,
+          urgency TEXT,
+          service_window TEXT,
+          status TEXT,
+          reason TEXT,
+          start_time TEXT,
+          end_time TEXT,
+          diagnosis TEXT,
+          operation TEXT,
+          ward TEXT,
+          assist1 TEXT,
+          assist2 TEXT,
+          scrub TEXT,
+          cir TEXT,
+          saved_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+    cols = {r[1] for r in con.execute("PRAGMA table_info(surgery_cases)").fetchall()}
+    if "repeat_24h" not in cols:
+        con.execute("ALTER TABLE surgery_cases ADD COLUMN repeat_24h INTEGER NOT NULL DEFAULT 0")
+    if "saved_at" not in cols:
+        con.execute("ALTER TABLE surgery_cases ADD COLUMN saved_at TEXT NOT NULL DEFAULT (datetime('now'))")
+    con.commit()
+
 # ----------------------------- Config -----------------------------
 APP_DIR = Path(__file__).resolve().parent
-DB_ELECTIVE = APP_DIR / "schedule_elective.db"
-DB_EMERGENCY = APP_DIR / "schedule_emergency.db"
 
 DEFAULT_BLOCK_START = "08:30"  # ใช้กับ Emergency ตามที่คุย
 DEFAULT_BLOCK_END = "16:30"
@@ -52,10 +92,9 @@ def sec_to_hhmm(sec: float) -> str:
 
 
 def safe_read_sqlite(db_path: Path, sql: str, parse_dates: Tuple[str, ...] = ()) -> pd.DataFrame:
-    if not db_path.exists():
-        return pd.DataFrame()
     con = sqlite3.connect(str(db_path))
     try:
+        _ensure_minimal_schema(con)
         try:
             df = pd.read_sql_query(sql, con)
         except (sqlite3.Error, PandasDatabaseError):
@@ -81,53 +120,37 @@ def load_bundle(kind: str) -> DataBundle:
     if kind not in {"elective", "emergency", "all"}:
         raise ValueError("kind must be elective/emergency/all")
 
-    bundles = []
-    targets = []
-    if kind in {"elective", "all"}:
-        targets.append(("elective", DB_ELECTIVE))
-    if kind in {"emergency", "all"}:
-        targets.append(("emergency", DB_EMERGENCY))
-
-    for label, db in targets:
-        postop = safe_read_sqlite(
-            db,
-            """
-            SELECT case_uid, hn, name, dept, doctor, or_room,
-                   case_size, urgency, status,
-                   time_start_dt, time_end_dt,
-                   ops_json, diags_json
-            FROM postop_records
-            """,
-            parse_dates=("time_start_dt", "time_end_dt"),
-        )
-        schedule = safe_read_sqlite(
-            db,
-            """
-            SELECT
-              timestamp, urgency, period, or_room, date, time,
-              hn, name, dept, doctor, diagnosis, operation, ward, queue,
-              time_start, time_end, case_size
-            FROM schedule
-            """,
-            parse_dates=("date",),
-        )
-        events = safe_read_sqlite(
-            db,
-            "SELECT case_uid, event, at, details FROM surgery_events",
-            parse_dates=("at",),
-        )
-        postop["source"] = label
-        schedule["source"] = label
-        events["source"] = label
-        bundles.append(DataBundle(postop=postop, schedule=schedule, events=events, source_label=label))
-
-    if len(bundles) == 1:
-        return bundles[0]
-
-    postop = pd.concat([b.postop for b in bundles], ignore_index=True)
-    schedule = pd.concat([b.schedule for b in bundles], ignore_index=True)
-    events = pd.concat([b.events for b in bundles], ignore_index=True)
-    return DataBundle(postop=postop, schedule=schedule, events=events, source_label="all")
+    where = ""
+    params: Tuple[str, ...] = ()
+    label = kind
+    if kind != "all":
+        where = "WHERE urgency = ?"
+        params = (kind.title(),)
+    sql = f"""
+        SELECT uuid, hn, patient_name, department, surgeon, or_room,
+               case_size, urgency, service_window, status, repeat_24h,
+               reason, start_time, end_time, diagnosis, operation, ward,
+               assist1, assist2, scrub, cir, saved_at
+        FROM surgery_cases
+        {where}
+    """
+    con = sqlite3.connect(str(DB_PATH))
+    try:
+        _ensure_minimal_schema(con)
+        postop = pd.read_sql_query(sql, con, params=params or None)
+    finally:
+        con.close()
+    for col in ("start_time", "end_time"):
+        if col in postop.columns:
+            postop[col] = pd.to_datetime(postop[col], errors="coerce")
+    postop = postop.rename(columns={"uuid": "case_uid", "patient_name": "name", "surgeon": "doctor", "department": "dept"})
+    if "start_time" in postop.columns:
+        postop["time_start_dt"] = pd.to_datetime(postop["start_time"], errors="coerce")
+    if "end_time" in postop.columns:
+        postop["time_end_dt"] = pd.to_datetime(postop["end_time"], errors="coerce")
+    postop["source"] = label
+    empty = pd.DataFrame()
+    return DataBundle(postop=postop, schedule=empty, events=empty, source_label=label)
 
 
 # ------------------------ Analytics Core -------------------------
@@ -142,6 +165,13 @@ def clip_overlap_minutes(starts: pd.Series, ends: pd.Series, block_start_hhmm: s
 
 def enrich_cases(df_postop: pd.DataFrame, df_sched: pd.DataFrame) -> pd.DataFrame:
     df = df_postop.copy()
+    if "time_start_dt" not in df.columns and "start_time" in df.columns:
+        df["time_start_dt"] = pd.to_datetime(df["start_time"], errors="coerce")
+    if "time_end_dt" not in df.columns and "end_time" in df.columns:
+        df["time_end_dt"] = pd.to_datetime(df["end_time"], errors="coerce")
+    for col in ("time_start_dt", "time_end_dt"):
+        if col not in df.columns:
+            df[col] = pd.NaT
     df = df.dropna(subset=["time_start_dt", "time_end_dt"])
     if df.empty:
         return df
@@ -149,31 +179,10 @@ def enrich_cases(df_postop: pd.DataFrame, df_sched: pd.DataFrame) -> pd.DataFram
     df["dow"] = df["time_start_dt"].dt.dayofweek
     df["hour"] = df["time_start_dt"].dt.hour
 
-    if not df_sched.empty and {"date", "or_room", "doctor", "hn"}.issubset(df_sched.columns):
-        m = df.merge(
-            df_sched[["date", "or_room", "doctor", "hn", "operation", "diagnosis"]],
-            on=["date", "or_room", "doctor", "hn"],
-            how="left",
-            suffixes=("", "_sch"),
-        )
-        df["operation"] = m["operation"]
-        df["diagnosis"] = m["diagnosis"]
-    else:
-        def parse_ops(x):
-            try:
-                obj = (json.loads(x) if isinstance(x, str) and (x.startswith("[") or x.startswith("{")) else x)
-                if isinstance(obj, list) and obj:
-                    first = obj[0]
-                    if isinstance(first, str):
-                        return first
-                    return json.dumps(first, ensure_ascii=False)
-                if isinstance(obj, dict):
-                    return obj.get("operation") or obj.get("op") or json.dumps(obj, ensure_ascii=False)
-                return str(obj) if obj else None
-            except Exception:
-                return None
-        df["operation"] = df_postop.get("ops_json", pd.Series([None] * len(df_postop))).map(parse_ops)
-        df["diagnosis"] = df_postop.get("diags_json", pd.Series([None] * len(df_postop)))
+    if "operation" not in df.columns:
+        df["operation"] = None
+    if "diagnosis" not in df.columns:
+        df["diagnosis"] = None
     return df
 
 
@@ -550,13 +559,25 @@ class DashboardTab(QtWidgets.QWidget):
 
     def _plot_heatmap(self, hm: pd.DataFrame):
         chart = self.heatmapChart; chart.clear(); ax = chart.ax
-        if hm.empty: chart.canvas.draw(); return
-        pivot = hm.pivot_table(index="dow", columns="hour", values="cases", aggfunc="sum", fill_value=0)
+        if hm.empty:
+            chart.canvas.draw()
+            return
+
+        pivot = hm.pivot_table(
+            index="dow",
+            columns="hour",
+            values="cases",
+            aggfunc="sum",
+            fill_value=0,
+        )
+        pivot = pivot.reindex(index=range(7), columns=range(24), fill_value=0)
+
         im = ax.imshow(pivot.values, aspect="auto", cmap="Blues")
-        ax.set_yticks(range(len(pivot.index)))
+
+        ax.set_yticks(range(7))
         ax.set_yticklabels(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
         ax.set_xticks(range(0, 24, 2))
-        ax.set_xticklabels([str(h) for h in range(0, 24, 2)])
+        ax.set_xticklabels([f"{h:02d}" for h in range(0, 24, 2)])
         ax.set_xlabel("Hour"); ax.set_ylabel("Day"); ax.set_title("Heatmap (Cases)")
         chart._colorbar = chart.fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         chart.canvas.draw()

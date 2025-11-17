@@ -4,7 +4,7 @@
 """
 import os, sys, json, argparse, csv, base64, secrets, hashlib, unicodedata, re, sqlite3
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Set, Union, Callable
+from typing import List, Optional, Tuple, Dict, Set, Union, Callable, Sequence
 from datetime import datetime, timedelta, time as dtime, date
 from concurrent.futures import ThreadPoolExecutor
 
@@ -27,6 +27,81 @@ from icd10_catalog import (
 )
 
 from dashboard_tab import DashboardTab
+from utils_time_windows import decide_service_window
+
+DB_PATH = Path.cwd() / "ornbh.db"
+_MODULE_DB_PATH = Path(__file__).resolve().parent / "ornbh.db"
+if not DB_PATH.exists():
+    DB_PATH = _MODULE_DB_PATH
+
+try:
+    from migration import ensure_schema  # type: ignore
+except Exception:  # pragma: no cover - fallback if migration import fails
+    ensure_schema = None  # type: ignore[assignment]
+
+
+def _ensure_minimal_schema(con: sqlite3.Connection) -> None:
+    """Ensure the minimally required columns exist for runtime compatibility."""
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS surgery_cases (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          uuid TEXT UNIQUE,
+          hn TEXT,
+          patient_name TEXT,
+          department TEXT,
+          surgeon TEXT,
+          or_room TEXT,
+          case_size TEXT,
+          urgency TEXT,
+          service_window TEXT,
+          status TEXT,
+          reason TEXT,
+          start_time TEXT,
+          end_time TEXT,
+          diagnosis TEXT,
+          operation TEXT,
+          ward TEXT,
+          assist1 TEXT,
+          assist2 TEXT,
+          scrub TEXT,
+          cir TEXT,
+          saved_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+    cols = {row[1] for row in con.execute("PRAGMA table_info(surgery_cases)").fetchall()}
+    if "repeat_24h" not in cols:
+        con.execute("ALTER TABLE surgery_cases ADD COLUMN repeat_24h INTEGER NOT NULL DEFAULT 0")
+    if "saved_at" not in cols:
+        con.execute("ALTER TABLE surgery_cases ADD COLUMN saved_at TEXT NOT NULL DEFAULT (datetime('now'))")
+    con.commit()
+
+
+_DB_INITED = False
+
+
+def _init_db_once() -> None:
+    """Ensure the registry database exists exactly once per process."""
+    global _DB_INITED
+    if _DB_INITED:
+        return
+    try:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    con = sqlite3.connect(str(DB_PATH))
+    try:
+        _ensure_minimal_schema(con)
+        if ensure_schema is not None:
+            try:
+                ensure_schema(con)
+            except TypeError:
+                ensure_schema()
+        con.commit()
+    finally:
+        con.close()
+    _DB_INITED = True
 
 try:
     from rapidfuzz import fuzz, process  # type: ignore
@@ -323,9 +398,105 @@ API_LIST = "/api/list";
 API_LIST_FULL = "/api/list_full";
 API_WS = "/api/ws"
 
+ALLOW_SAVE_ANYTIME = True
+SHOW_DEADLINE_NOTE = False
+
+# --------- Excel/CSV schema (หัวตารางที่คาดหวัง) ---------
+EXPECTED_COLUMNS = [
+    "OR/เวลา",
+    "HN",
+    "ชื่อ-สกุล",
+    "อายุ",
+    "Diagnosis",
+    "Operation",
+    "แพทย์",
+    "Ward",
+    "ขนาดเคส",
+    "แผนก",
+    "เริ่ม",
+    "จบ",
+    "ความเร่งด่วน",
+    "ประเภทเวลา",
+    "Assist 1",
+    "Assist 2",
+    "Scrub",
+    "Cir",
+    "สถานะ",
+]
+
+
+def _normalize_header_label(label: str) -> str:
+    cleaned = unicodedata.normalize("NFKC", str(label or "").strip()).lower()
+    return "".join(ch for ch in cleaned if ch.isalnum())
+
+
+HEADER_ALIAS_MAP = {
+    _normalize_header_label("or เวลา"): "OR/เวลา",
+    _normalize_header_label("or time"): "OR/เวลา",
+    _normalize_header_label("or room"): "OR/เวลา",
+    _normalize_header_label("or"): "OR/เวลา",
+    _normalize_header_label("ชื่อสกุล"): "ชื่อ-สกุล",
+    _normalize_header_label("patient name"): "ชื่อ-สกุล",
+    _normalize_header_label("age (yr)"): "อายุ",
+    _normalize_header_label("doctor"): "แพทย์",
+    _normalize_header_label("surgeon"): "แพทย์",
+    _normalize_header_label("ward name"): "Ward",
+    _normalize_header_label("ward/icu"): "Ward",
+    _normalize_header_label("size"): "ขนาดเคส",
+    _normalize_header_label("case size"): "ขนาดเคส",
+    _normalize_header_label("dept"): "แผนก",
+    _normalize_header_label("department"): "แผนก",
+    _normalize_header_label("start"): "เริ่ม",
+    _normalize_header_label("start time"): "เริ่ม",
+    _normalize_header_label("end"): "จบ",
+    _normalize_header_label("end time"): "จบ",
+    _normalize_header_label("urgency"): "ความเร่งด่วน",
+    _normalize_header_label("service window"): "ประเภทเวลา",
+    _normalize_header_label("assist1"): "Assist 1",
+    _normalize_header_label("assist2"): "Assist 2",
+    _normalize_header_label("scrub nurse"): "Scrub",
+    _normalize_header_label("scrubnurse"): "Scrub",
+    _normalize_header_label("circulate"): "Cir",
+    _normalize_header_label("circulator"): "Cir",
+    _normalize_header_label("circulation"): "Cir",
+    _normalize_header_label("status"): "สถานะ",
+}
+
+
+def validate_excel_columns(columns: Sequence[str]) -> Dict[str, str]:
+    """ตรวจสอบและคืน mapping คอลัมน์ตาม schema ที่กำหนด"""
+
+    normalized_expected = {_normalize_header_label(col): col for col in EXPECTED_COLUMNS}
+    resolved: Dict[str, str] = {}
+    for raw in columns:
+        clean = str(raw or "").strip()
+        if not clean:
+            continue
+        norm = _normalize_header_label(clean)
+        canonical = HEADER_ALIAS_MAP.get(norm) or normalized_expected.get(norm)
+        if canonical and canonical not in resolved:
+            resolved[canonical] = clean
+
+    missing = [c for c in EXPECTED_COLUMNS if c not in resolved]
+    if missing:
+        raise ValueError("คอลัมน์ในไฟล์ขาด: " + ", ".join(missing))
+
+    return {canonical: resolved[canonical] for canonical in EXPECTED_COLUMNS}
+
 STATUS_OP_START = "กำลังผ่าตัด"
 STATUS_RECOVERY = "กำลังพักฟื้น"
 STATUS_RETURNING = "กำลังส่งกลับตึก"
+
+ACTION_COLUMN = 19
+
+ALLOWED_STATUSES = (
+    "saved",
+    "postponed",
+    "offcase",
+)
+
+REASONS = ["ผู้ป่วยปฏิเสธผ่าตัด", "แพทย์ไม่พร้อม", "Lab ไม่พร้อม"]
+
 
 STATUS_COLORS = {
     STATUS_OP_START: "#f97316",
@@ -356,90 +527,66 @@ def next_deadline(dt: datetime | None = None) -> datetime:
     return datetime.combine(now.date(), WORKING_START)
 
 
-DB_PATH = Path.cwd() / "ornbh_postop.sqlite3"
-
-SCHEMA_SQL = """
-PRAGMA foreign_keys = ON;
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-
-CREATE TABLE IF NOT EXISTS postop_records (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  case_uid      TEXT UNIQUE,
-  hn            TEXT NOT NULL,
-  name          TEXT,
-  age           INTEGER,
-  or_room       TEXT,
-  ward          TEXT,
-  dept          TEXT,
-  doctor        TEXT,
-  case_size     TEXT CHECK (case_size IN ('Major','Minor')),
-  assist1       TEXT NOT NULL,
-  assist2       TEXT,
-  scrub         TEXT NOT NULL,
-  circulate     TEXT NOT NULL,
-  ops_json      TEXT NOT NULL,
-  diags_json    TEXT NOT NULL,
-  status        TEXT,
-  urgency       TEXT,
-  time_start_dt TEXT,
-  time_end_dt   TEXT,
-  created_at    TEXT DEFAULT (datetime('now')),
-  updated_at    TEXT DEFAULT (datetime('now')),
-
-  in_hours INTEGER GENERATED ALWAYS AS (
-    CASE
-      WHEN time(time_start_dt) >= '08:30' AND time(time_start_dt) < '16:30' THEN 1
-      ELSE 0
-    END
-  ) STORED,
-
-  bucket TEXT GENERATED ALWAYS AS (
-    CASE
-      WHEN lower(urgency) = 'emergency' AND in_hours = 1 THEN 'emergency_in_hours'
-      WHEN lower(urgency) = 'emergency' AND in_hours = 0 THEN 'emergency_off_hours'
-      ELSE 'elective'
-    END
-  ) STORED
-);
-
-CREATE INDEX IF NOT EXISTS idx_postop_date    ON postop_records (date(time_start_dt));
-CREATE INDEX IF NOT EXISTS idx_postop_bucket  ON postop_records (bucket);
-CREATE INDEX IF NOT EXISTS idx_postop_hn      ON postop_records (hn);
-CREATE INDEX IF NOT EXISTS idx_postop_status  ON postop_records (status);
-
-CREATE VIEW IF NOT EXISTS view_elective AS
-  SELECT * FROM postop_records WHERE bucket = 'elective';
-CREATE VIEW IF NOT EXISTS view_emergency_in_hours AS
-  SELECT * FROM postop_records WHERE bucket = 'emergency_in_hours';
-CREATE VIEW IF NOT EXISTS view_emergency_off_hours AS
-  SELECT * FROM postop_records WHERE bucket = 'emergency_off_hours';
-"""
-
-
 def _db_conn():
     con = sqlite3.connect(str(DB_PATH))
-    con.execute("PRAGMA foreign_keys=ON")
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA synchronous=NORMAL")
+    _ensure_minimal_schema(con)
+    if ensure_schema is not None:
+        try:
+            ensure_schema(con)
+        except TypeError:
+            ensure_schema()
+    con.commit()
+    con.row_factory = sqlite3.Row
     return con
 
 
-def _init_db_once():
-    con = _db_conn()
-    try:
-        con.executescript(SCHEMA_SQL)
+def _normalize_status(value: str | None) -> str:
+    if not value:
+        return "saved"
+    text = str(value).strip().lower()
+    mapping = {
+        "off case": "offcase",
+        "off-case": "offcase",
+        "offcase": "offcase",
+        "postponed": "postponed",
+        "เลื่อน": "postponed",
+        "เลื่อนผ่าตัด": "postponed",
+        "saved": "saved",
+    }
+    if text in mapping:
+        return mapping[text]
+    if text in ALLOWED_STATUSES:
+        return text
+    return "saved"
+
+
+def _is_repeat_24h(con: sqlite3.Connection, hn: str, start_iso: str) -> int:
+    if not hn or not start_iso:
+        return 0
+    sql = """
+    SELECT 1 FROM surgery_cases
+    WHERE hn=? AND ABS(strftime('%s', start_time) - strftime('%s', ?)) <= 86400
+    LIMIT 1
+    """
+    cur = con.execute(sql, (hn, start_iso))
+    return 1 if cur.fetchone() else 0
+
+
+def _update_case_status(case_id: int, status: str, reason: str | None) -> None:
+    if not case_id:
+        return
+    status_norm = _normalize_status(status)
+    with _db_conn() as con:
+        con.execute(
+            "UPDATE surgery_cases SET status=?, reason=?, updated_at=datetime('now') WHERE id=?",
+            (status_norm, reason, case_id),
+        )
         con.commit()
-    finally:
-        con.close()
 
 
 def save_postop_entry(entry):
     con = _db_conn()
     try:
-        ops_json = json.dumps(getattr(entry, "ops", []) or [], ensure_ascii=False)
-        diags_json = json.dumps(getattr(entry, "diags", []) or [], ensure_ascii=False)
-
         def _normalize_date(obj) -> date:
             if isinstance(obj, datetime):
                 return obj.date()
@@ -459,115 +606,180 @@ def save_postop_entry(entry):
 
         base_date = _normalize_date(getattr(entry, "date", datetime.now().date()))
 
-        def _to_iso(hm: str):
+        def _to_dt(hm: str | None) -> datetime | None:
             if not hm or ":" not in str(hm):
                 return None
             try:
-                h, m = map(int, str(hm).split(":")[:2])
-                dt = datetime.combine(base_date, dtime(h, m))
-                return dt.isoformat(timespec="seconds")
+                hour, minute = map(int, str(hm).split(":")[:2])
+                return datetime.combine(base_date, dtime(hour, minute))
             except Exception:
                 return None
 
-        time_start_iso = _to_iso(getattr(entry, "time_start", ""))
-        time_end_iso = _to_iso(getattr(entry, "time_end", ""))
+        start_dt = _to_dt(getattr(entry, "time_start", ""))
+        end_dt = _to_dt(getattr(entry, "time_end", ""))
+        if not (start_dt and end_dt):
+            raise ValueError("จำเป็นต้องระบุเวลาเริ่มและจบผ่าตัด")
+
+        if end_dt <= start_dt:
+            end_dt = end_dt + timedelta(days=1)
 
         try:
             age_val = int(str(getattr(entry, "age", 0) or 0))
         except Exception:
             age_val = 0
 
-        case_uid = getattr(entry, "case_uid", "")
-        if not case_uid:
-            case_uid = f"{getattr(entry, 'hn', '')}-{getattr(entry, 'or_room', '')}-{getattr(entry, 'time', '')}"
+        def _flatten(values) -> str:
+            if isinstance(values, (list, tuple)):
+                items = [str(v).strip() for v in values if str(v).strip()]
+                return ", ".join(items)
+            return str(values or "")
 
-        con.execute(
-            """
-      INSERT INTO postop_records (
-        case_uid, hn, name, age, or_room, ward, dept, doctor, case_size,
-        assist1, assist2, scrub, circulate, ops_json, diags_json,
-        status, urgency, time_start_dt, time_end_dt, updated_at
-      )
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-      ON CONFLICT(case_uid) DO UPDATE SET
-        hn=excluded.hn, name=excluded.name, age=excluded.age,
-        or_room=excluded.or_room, ward=excluded.ward, dept=excluded.dept,
-        doctor=excluded.doctor, case_size=excluded.case_size,
-        assist1=excluded.assist1, assist2=excluded.assist2,
-        scrub=excluded.scrub, circulate=excluded.circulate,
-        ops_json=excluded.ops_json, diags_json=excluded.diags_json,
-        status=excluded.status, urgency=excluded.urgency,
-        time_start_dt=excluded.time_start_dt, time_end_dt=excluded.time_end_dt,
-        updated_at=excluded.updated_at
-    """,
-            (
-                case_uid,
-                getattr(entry, "hn", ""),
-                getattr(entry, "name", ""),
-                age_val,
-                getattr(entry, "or_room", ""),
-                getattr(entry, "ward", ""),
-                getattr(entry, "dept", ""),
-                getattr(entry, "doctor", ""),
-                getattr(entry, "case_size", ""),
-                getattr(entry, "assist1", ""),
-                getattr(entry, "assist2", ""),
-                getattr(entry, "scrub", ""),
-                getattr(entry, "circulate", ""),
-                ops_json,
-                diags_json,
-                getattr(entry, "status", ""),
-                getattr(entry, "urgency", ""),
-                time_start_iso,
-                time_end_iso,
-                datetime.now().isoformat(timespec="seconds"),
-            ),
+        urgency = (getattr(entry, "urgency", "Elective") or "Elective").title()
+        service_window = decide_service_window(urgency, start_dt, end_dt)
+        now_txt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        start_iso = start_dt.strftime("%Y-%m-%d %H:%M")
+        end_iso = end_dt.strftime("%Y-%m-%d %H:%M")
+
+        case_uid = getattr(entry, "case_uid", "") or f"{getattr(entry, 'hn', '')}-{getattr(entry, 'or_room', '')}-{getattr(entry, 'time', '')}"
+        hn = str(getattr(entry, "hn", "")).strip()
+        patient_name = getattr(entry, "patient_name", getattr(entry, "name", "")) or ""
+        department = getattr(entry, "department", getattr(entry, "dept", "")) or ""
+        cir_value = getattr(entry, "cir", getattr(entry, "circulate", "")) or ""
+
+        status_value = _normalize_status(getattr(entry, "state", None))
+        reason_value_raw = (
+            getattr(entry, "status_reason", None)
+            or getattr(entry, "postpone_reason", None)
+            or getattr(entry, "offcase_reason", None)
+            or getattr(entry, "reason", None)
         )
+        reason_value = str(reason_value_raw).strip() if reason_value_raw else None
+
+        payload = {
+            "uuid": case_uid,
+            "or_room": getattr(entry, "or_room", ""),
+            "hn": hn,
+            "patient_name": patient_name,
+            "age": age_val,
+            "diagnosis": _flatten(getattr(entry, "diags", [])),
+            "operation": _flatten(getattr(entry, "ops", [])),
+            "surgeon": getattr(entry, "doctor", ""),
+            "ward": getattr(entry, "ward", ""),
+            "case_size": getattr(entry, "case_size", ""),
+            "department": department,
+            "start_time": start_iso,
+            "end_time": end_iso,
+            "urgency": urgency,
+            "service_window": service_window,
+            "assist1": getattr(entry, "assist1", ""),
+            "assist2": getattr(entry, "assist2", ""),
+            "scrub": getattr(entry, "scrub", ""),
+            "cir": cir_value,
+            "status": status_value,
+            "reason": reason_value,
+            "saved_at": now_txt,
+        }
+
+        payload["repeat_24h"] = _is_repeat_24h(con, payload["hn"], payload["start_time"])
+
+        columns = (
+            "uuid, or_room, hn, patient_name, age, diagnosis, operation, surgeon, ward, case_size, "
+            "department, start_time, end_time, urgency, service_window, assist1, assist2, scrub, cir, status, reason, repeat_24h, saved_at"
+        )
+        values = [
+            payload["uuid"],
+            payload["or_room"],
+            payload["hn"],
+            payload["patient_name"],
+            payload["age"],
+            payload["diagnosis"],
+            payload["operation"],
+            payload["surgeon"],
+            payload["ward"],
+            payload["case_size"],
+            payload["department"],
+            payload["start_time"],
+            payload["end_time"],
+            payload["urgency"],
+            payload["service_window"],
+            payload["assist1"],
+            payload["assist2"],
+            payload["scrub"],
+            payload["cir"],
+            payload["status"],
+            payload["reason"],
+            payload["repeat_24h"],
+            payload["saved_at"],
+        ]
+
+        placeholders = ",".join(["?"] * len(values))
+        sql = (
+            f"INSERT INTO surgery_cases ({columns}) VALUES ({placeholders}) "
+            "ON CONFLICT(uuid) DO UPDATE SET "
+            "or_room=excluded.or_room, "
+            "hn=excluded.hn, "
+            "patient_name=excluded.patient_name, "
+            "age=excluded.age, "
+            "diagnosis=excluded.diagnosis, "
+            "operation=excluded.operation, "
+            "surgeon=excluded.surgeon, "
+            "ward=excluded.ward, "
+            "case_size=excluded.case_size, "
+            "department=excluded.department, "
+            "start_time=excluded.start_time, "
+            "end_time=excluded.end_time, "
+            "urgency=excluded.urgency, "
+            "service_window=excluded.service_window, "
+            "assist1=excluded.assist1, "
+            "assist2=excluded.assist2, "
+            "scrub=excluded.scrub, "
+            "cir=excluded.cir, "
+            "status=excluded.status, "
+            "reason=excluded.reason, "
+            "repeat_24h=excluded.repeat_24h, "
+            "saved_at=excluded.saved_at, "
+            "updated_at=datetime('now')"
+        )
+        con.execute(sql, values)
         con.commit()
+
+        row = con.execute(
+            "SELECT id, repeat_24h, service_window FROM surgery_cases WHERE uuid=?",
+            (payload["uuid"],),
+        ).fetchone()
+        if not row:
+            raise RuntimeError("ไม่พบข้อมูลที่เพิ่งบันทึก")
+
+        entry.service_window = row["service_window"]
+        entry.repeat_24h = row["repeat_24h"]
+        entry.patient_name = patient_name
+        entry.department = department
+        entry.cir = cir_value
+        entry.postop_completed = True
+        return row["id"], row["repeat_24h"]
     finally:
         con.close()
 
 
+def _blank(x) -> bool:
+    return str(x or "").strip() == ""
+
+
 def missing_required_fields(entry) -> list[str]:
-    missing: list[str] = []
-
-    def _blank(val) -> bool:
-        if val is None:
-            return True
-        text = str(val).strip()
-        return text == "" or text.startswith("—")
-
-    if _blank(getattr(entry, "assist1", "")):
-        missing.append("Assist 1")
-    if _blank(getattr(entry, "scrub", "")):
-        missing.append("Scrub")
-    if _blank(getattr(entry, "circulate", "")):
-        missing.append("Circulate")
-    ops_list = getattr(entry, "ops", None)
-    if not (ops_list and len(ops_list) > 0):
-        missing.append("Operation (อย่างน้อย 1)")
-    diags_list = getattr(entry, "diags", None)
-    if not (diags_list and len(diags_list) > 0):
-        missing.append("Diagnosis (อย่างน้อย 1)")
-    if _blank(getattr(entry, "dept", "")):
-        missing.append("แผนก")
-    if _blank(getattr(entry, "case_size", "")):
-        missing.append("ขนาดเคส (Major/Minor)")
-    if _blank(getattr(entry, "time_start", "")):
-        missing.append("เวลาเริ่มผ่าตัด")
-    if _blank(getattr(entry, "time_end", "")):
-        missing.append("เวลาจบผ่าตัด")
-    try:
-        ts = getattr(entry, "time_start", "")
-        te = getattr(entry, "time_end", "")
-        if ts and te:
-            hs, ms = map(int, str(ts).split(":")[:2])
-            he, me = map(int, str(te).split(":")[:2])
-            if (he, me) <= (hs, ms):
-                missing.append("เวลาเริ่ม/จบ ไม่สมเหตุผล")
-    except Exception:
-        missing.append("รูปแบบเวลาไม่ถูกต้อง")
-    return missing
+    required = {
+        "hn": "HN",
+        "patient_name": "ชื่อ-สกุล",
+        "surgeon": "แพทย์",
+        "department": "แผนก",
+        "ward": "Ward",
+        "time_start": "เริ่ม",
+        "time_end": "จบ",
+        "urgency": "ความเร่งด่วน",
+        "service_window": "ประเภทเวลา",
+        "scrub": "Scrub",
+        "cir": "Cir",
+    }
+    return [label for attr, label in required.items() if _blank(getattr(entry, attr, ""))]
 DEFAULT_OR_ROOMS = ["OR1", "OR2", "OR3", "OR4", "OR5", "OR6", "OR8"]
 
 # --- สถานะจาก monitor ที่ใช้จับเวลา / auto-complete ---
@@ -691,10 +903,10 @@ def _dept_to_specialty_key(label: str) -> str:
 class Toast(QtWidgets.QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet("""
-            QFrame{background:#111827; color:#fff; border-radius:12px; padding:10px 14px;}
-            QLabel{color:#fff;}
-        """)
+        self.setStyleSheet(
+            "QFrame{background:#111827; color:#fff; border-radius:12px; padding:10px 14px;}"
+            "QLabel{color:#fff;}"
+        )
         add_shadow(self, blur=30, x=0, y=8, color="#40000000")
         self.lab = QtWidgets.QLabel("", self)
         lay = QtWidgets.QHBoxLayout(self)
@@ -928,6 +1140,7 @@ class ScheduleEntry(QtCore.QObject):
             case_size="",
             queue=0,
             period="in",
+            service_window="InHours",
             urgency="Elective",
             assist1="",
             assist2="",
@@ -948,20 +1161,25 @@ class ScheduleEntry(QtCore.QObject):
         self.time = time_str
         self.hn = (hn or "").strip()
         self.name = (name or "").strip()
+        self.patient_name = self.name
         self.age = int(age) if str(age).isdigit() else 0
         self.dept = dept
+        self.department = self.dept
         self.doctor = doctor
         self.diags = diags or []
         self.ops = ops or []
         self.ward = (ward or "").strip()
         self.case_size = (case_size or "").strip()  # Minor/Major
         self.queue = int(queue) if str(queue).isdigit() else 0
-        self.period = period  # "in" | "off"
+        period_code = (period or "in").lower()
+        self.service_window = service_window or ("InHours" if period_code == "in" else "OutOfHours")
+        self.period = "in" if self.service_window == "InHours" else "off"
         self.urgency = (urgency or "Elective")
         self.assist1 = assist1
         self.assist2 = assist2
         self.scrub = scrub
         self.circulate = circulate
+        self.cir = circulate
         self.time_start = time_start
         self.time_end = time_end
         self.case_uid = case_uid or self._gen_case_uid()
@@ -991,6 +1209,7 @@ class ScheduleEntry(QtCore.QObject):
             "case_size": self.case_size,
             "queue": self.queue,
             "period": self.period,
+            "service_window": self.service_window,
             "urgency": self.urgency,
             "assist1": self.assist1,
             "assist2": self.assist2,
@@ -1027,6 +1246,7 @@ class ScheduleEntry(QtCore.QObject):
             d.get("case_size", ""),
             d.get("queue", 0),
             d.get("period", "in"),
+            d.get("service_window", "InHours"),
             d.get("urgency", "Elective"),
             d.get("assist1", ""),
             d.get("assist2", ""),
@@ -1118,7 +1338,7 @@ class SharedScheduleModel:
 
 
 class LocalDBLogger:
-    def __init__(self, elective_path="schedule_elective.db", emergency_path="schedule_emergency.db"):
+    def __init__(self, elective_path=str(DB_PATH), emergency_path=str(DB_PATH)):
         import sqlite3
         self.sqlite3 = sqlite3
         self.conn_e = sqlite3.connect(elective_path)
@@ -1129,40 +1349,36 @@ class LocalDBLogger:
     def _init(self, conn):
         cur = conn.cursor()
         cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS schedule(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                urgency TEXT,
-                period TEXT,
-                or_room TEXT,
-                date TEXT,
-                time TEXT,
-                hn TEXT,
-                name TEXT,
-                age INTEGER,
-                dept TEXT,
-                doctor TEXT,
-                diagnosis TEXT,
-                operation TEXT,
-                ward TEXT,
-                queue INTEGER,
-                time_start TEXT,
-                time_end TEXT,
-                case_size TEXT
-            )
-            """
+            "CREATE TABLE IF NOT EXISTS schedule("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " timestamp TEXT,"
+            " urgency TEXT,"
+            " service_window TEXT,"
+            " or_room TEXT,"
+            " date TEXT,"
+            " time TEXT,"
+            " hn TEXT,"
+            " name TEXT,"
+            " age INTEGER,"
+            " dept TEXT,"
+            " doctor TEXT,"
+            " diagnosis TEXT,"
+            " operation TEXT,"
+            " ward TEXT,"
+            " queue INTEGER,"
+            " time_start TEXT,"
+            " time_end TEXT,"
+            " case_size TEXT"
+            " )"
         )
         cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS surgery_events(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                case_uid TEXT,
-                event TEXT,
-                at TEXT,
-                details TEXT
-            )
-            """
+            "CREATE TABLE IF NOT EXISTS surgery_events("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " case_uid TEXT,"
+            " event TEXT,"
+            " at TEXT,"
+            " details TEXT"
+            " )"
         )
         conn.commit()
 
@@ -1171,7 +1387,7 @@ class LocalDBLogger:
         row = (
             ts,
             e.urgency,
-            e.period,
+            e.service_window,
             e.or_room,
             str(e.date),
             e.time,
@@ -1192,15 +1408,12 @@ class LocalDBLogger:
         conn = self.conn_x if str(e.urgency).lower() == "emergency" else self.conn_e
         cur = conn.cursor()
         cur.execute(
-            """
-            INSERT INTO schedule(
-                timestamp, urgency, period, or_room, date, time,
-                hn, name, age, dept, doctor,
-                diagnosis, operation, ward, queue,
-                time_start, time_end, case_size
-            )
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
+            "INSERT INTO schedule(" \
+            " timestamp, urgency, service_window, or_room, date, time," \
+            " hn, name, age, dept, doctor," \
+            " diagnosis, operation, ward, queue," \
+            " time_start, time_end, case_size" \
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             row,
         )
         conn.commit()
@@ -1259,7 +1472,7 @@ class PDPANoticeDialog(QDialog):
         text.setReadOnly(True)
         text.setMinimumHeight(220)
         text.setStyleSheet("QTextEdit{background:#fff;border:1px solid #e6eaf2;border-radius:12px;padding:10px;}")
-        text.setText(
+        text.setPlainText(
             "วัตถุประสงค์การใช้ข้อมูล:\n"
             "- ใช้เพื่อการลงทะเบียน/บริหารจัดการคิวผ่าตัด และสื่อสารการทำงานในห้องผ่าตัด\n"
             "- ใช้สถิติภาพรวมแบบไม่ระบุตัวตน (de-identified) เพื่อปรับปรุงคุณภาพบริการ (QI)\n\n"
@@ -1357,18 +1570,21 @@ def _load_app_icon() -> QIcon:
     return _app_icon()
 
 
-def _now_period(dt_val: datetime) -> str:
-    start = dtime(8, 30);
+def _auto_service_window(dt_val: datetime) -> str:
+    if dt_val.weekday() >= 5:
+        return "OutOfHours"
+    start = dtime(8, 30)
     end = dtime(16, 30)
-    return "in" if (start <= dt_val.time() < end) else "off"
+    return "InHours" if (start <= dt_val.time() <= end) else "OutOfHours"
 
 
-def _period_label(code: str) -> str: return "ในเวลาราชการ" if code == "in" else "นอกเวลาราชการ"
+def _service_window_label(code: str) -> str:
+    return "ในเวลา" if (code or "").strip() == "InHours" else "นอกเวลา"
 
 
-def _period_badge(period_code: str) -> PeriodBadge:
-    label = "ในเวลาราชการ" if (period_code or "").lower() == "in" else "นอกเวลาราชการ"
-    color = "#2563eb" if (period_code or "").lower() == "in" else "#64748b"
+def _service_window_badge(service_window: str) -> PeriodBadge:
+    label = _service_window_label(service_window)
+    color = "#2563eb" if (service_window or "") == "InHours" else "#64748b"
     return PeriodBadge(label, color)
 
 
@@ -2304,6 +2520,7 @@ class Main(QtWidgets.QWidget):
         self.CASE_UID_ROLE = QtCore.Qt.UserRole + 10
         self.HN_ROLE = QtCore.Qt.UserRole + 11
         self.OR_ROLE = QtCore.Qt.UserRole + 12
+        self.DB_ID_ROLE = QtCore.Qt.UserRole + 13
 
         self.api_base_url = getattr(self, "api_base_url", "http://127.0.0.1:8000")
 
@@ -2458,9 +2675,14 @@ class Main(QtWidgets.QWidget):
         self.cb_urgency.addItems(["Elective", "Emergency"])
         self.cb_urgency.setMinimumWidth(180)
         g.addWidget(self.cb_urgency, r, 1)
+        self.cb_urgency.currentTextChanged.connect(lambda *_: self._update_service_window_info())
+        g.addWidget(QtWidgets.QLabel("ประเภทเวลา"), r, 2)
+        self.lbl_service_window_value = QtWidgets.QLabel("—")
+        self.lbl_service_window_value.setProperty("role", "h")
+        g.addWidget(self.lbl_service_window_value, r, 3)
         self.lbl_period_info = QtWidgets.QLabel("")
         self.lbl_period_info.setProperty("hint", "1")
-        g.addWidget(self.lbl_period_info, r, 2, 1, 4)
+        g.addWidget(self.lbl_period_info, r, 4, 1, 2)
         r += 1
         g.addWidget(QtWidgets.QLabel("วันที่"), r, 0)
         self.date = QtWidgets.QDateEdit(QtCore.QDate.currentDate());
@@ -2474,8 +2696,15 @@ class Main(QtWidgets.QWidget):
         self.time.setLocale(QLocale("en_US"))
         g.addWidget(self.time, r, 3)
         g.addWidget(QtWidgets.QLabel("แผนก"), r, 4)
-        self.cb_dept = QtWidgets.QComboBox();
-        self.cb_dept.addItems(["— เลือกแผนก —"] + list(DEPT_DOCTORS.keys()))
+        dept_choices = sorted(DEPT_DOCTORS.keys(), key=str.casefold)
+        self.cb_dept = NoWheelComboBox()
+        self.cb_dept.setEditable(True)
+        self.cb_dept.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.cb_dept.addItems(["— เลือกแผนก —"] + dept_choices)
+        dept_completer = QtWidgets.QCompleter(sorted(DEPT_KEY_MAP.keys(), key=str.casefold))
+        dept_completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        dept_completer.setFilterMode(QtCore.Qt.MatchContains)
+        self.cb_dept.setCompleter(dept_completer)
         g.addWidget(self.cb_dept, r, 5)
         r += 1
         self.lbl_warn = QtWidgets.QLabel("");
@@ -2571,13 +2800,33 @@ class Main(QtWidgets.QWidget):
         self.time_end.setEnabled(False)
         self.time_end.setProperty("role", "time-end")
 
-        self.ck_time_start.toggled.connect(lambda ch: self.time_start.setEnabled(ch))
-        self.ck_time_end.toggled.connect(lambda ch: self.time_end.setEnabled(ch))
+        self.cross_midnight_badge = QtWidgets.QLabel("ข้ามวัน +1")
+        self.cross_midnight_badge.setObjectName("crossMidnightBadge")
+        self.cross_midnight_badge.setStyleSheet(
+            "QLabel#crossMidnightBadge{background:#fb923c;color:#fff;font-weight:700;padding:4px 10px;border-radius:12px;}"
+        )
+        self.cross_midnight_badge.setToolTip("ระบบจะบันทึกเวลาจบเป็นวันถัดไปอัตโนมัติ")
+        self.cross_midnight_badge.hide()
+
+        def _toggle_start(ch: bool):
+            self.time_start.setEnabled(ch)
+            self._update_service_window_info()
+
+        def _toggle_end(ch: bool):
+            self.time_end.setEnabled(ch)
+            self._update_service_window_info()
+
+        self.ck_time_start.toggled.connect(_toggle_start)
+        self.ck_time_end.toggled.connect(_toggle_end)
+        self.time_start.timeChanged.connect(lambda *_: self._update_service_window_info())
+        self.time_end.timeChanged.connect(lambda *_: self._update_service_window_info())
 
         row_t.addWidget(self.ck_time_start)
         row_t.addWidget(self.time_start)
         row_t.addWidget(self.ck_time_end)
         row_t.addWidget(self.time_end)
+        row_t.addWidget(self.cross_midnight_badge)
+        row_t.addStretch(1)
         g.addWidget(time_box, r, 0, 1, 6)
         r += 1
 
@@ -2616,11 +2865,11 @@ class Main(QtWidgets.QWidget):
         self.card_result.title_lbl.hide()
         gr2 = self.card_result.grid
         self.tree2 = QtWidgets.QTreeWidget()
-        self.tree2.setColumnCount(18)
+        self.tree2.setColumnCount(20)
         self.tree2.setHeaderLabels([
             "OR/เวลา", "HN", "ชื่อ-สกุล", "อายุ", "Diagnosis", "Operation",
-            "แพทย์", "Ward", "ขนาดเคส", "แผนก", "เริ่ม", "จบ", "ช่วงเวลา",
-            "Assist 1", "Assist 2", "Scrub", "Cir", "สถานะ"
+            "แพทย์", "Ward", "ขนาดเคส", "แผนก", "เริ่ม", "จบ", "ความเร่งด่วน",
+            "ประเภทเวลา", "Assist 1", "Assist 2", "Scrub", "Cir", "สถานะ", "บันทึก"
         ])
         self.tree2.setUniformRowHeights(False)
         self.tree2.setAlternatingRowColors(True)
@@ -2655,7 +2904,7 @@ class Main(QtWidgets.QWidget):
         hdr.setStretchLastSection(False)
         hdr.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         hdr.setFixedHeight(42)
-        for i in range(18):
+        for i in range(20):
             hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
         for i in (2, 4, 5):
             hdr.setSectionResizeMode(i, QtWidgets.QHeaderView.Interactive)
@@ -2779,10 +3028,10 @@ class Main(QtWidgets.QWidget):
         self.table.itemDoubleClicked.connect(self._on_monitor_double_click)
         self.tree2.itemDoubleClicked.connect(self._on_result_double_click)
 
-        # default period info (auto-calculated)
-        self._update_period_info()
-        self.date.dateChanged.connect(lambda *_: self._update_period_info())
-        self.time.timeChanged.connect(lambda *_: self._update_period_info())
+        # default service window info (auto-calculated)
+        self._update_service_window_info()
+        self.date.dateChanged.connect(lambda *_: self._update_service_window_info())
+        self.time.timeChanged.connect(lambda *_: self._update_service_window_info())
 
         self._set_doctor_visibility(False)
         self._on_dept_changed(self.cb_dept.currentText())
@@ -3190,6 +3439,7 @@ class Main(QtWidgets.QWidget):
                 return []
 
             headers = [str(col).strip() if col is not None else "" for col in header]
+            header_map = validate_excel_columns(headers)
             results: List[dict] = []
             for row in rows_iter:
                 row_dict: Dict[str, object] = {}
@@ -3201,7 +3451,11 @@ class Main(QtWidgets.QWidget):
                     if not has_value and str(value or "").strip():
                         has_value = True
                 if row_dict and has_value:
-                    results.append(row_dict)
+                    normalized = {
+                        canonical: row_dict.get(actual, "")
+                        for canonical, actual in header_map.items()
+                    }
+                    results.append(normalized)
             return results
 
         if suffix == ".csv":
@@ -3210,6 +3464,7 @@ class Main(QtWidgets.QWidget):
                 reader = csv.DictReader(fh)
                 if reader.fieldnames is None:
                     return []
+                header_map = validate_excel_columns([str(h).strip() for h in reader.fieldnames])
                 for row in reader:
                     row_dict: Dict[str, object] = {}
                     has_value = False
@@ -3221,7 +3476,11 @@ class Main(QtWidgets.QWidget):
                         if not has_value and str(value or "").strip():
                             has_value = True
                     if row_dict and has_value:
-                        results.append(row_dict)
+                        normalized = {
+                            canonical: row_dict.get(actual, "")
+                            for canonical, actual in header_map.items()
+                        }
+                        results.append(normalized)
             return results
 
         raise ValueError("รองรับเฉพาะไฟล์ Excel (.xlsx/.xlsm) หรือ CSV")
@@ -3245,7 +3504,7 @@ class Main(QtWidgets.QWidget):
         else:  # pragma: no cover - fallback for older Qt bindings
             base_date = datetime(qdate.year(), qdate.month(), qdate.day()).date()
 
-        default_period = self._update_period_info()
+        default_service_window = self._update_service_window_info()
 
         for raw in rows:
             if not isinstance(raw, dict):
@@ -3281,11 +3540,12 @@ class Main(QtWidgets.QWidget):
             if time_str != "TF":
                 try:
                     hh, mm = [int(x) for x in time_str.split(":", 1)]
-                    period_code = _now_period(datetime(base_date.year, base_date.month, base_date.day, hh, mm))
+                    sw = _auto_service_window(datetime(base_date.year, base_date.month, base_date.day, hh, mm))
                 except Exception:
-                    period_code = default_period
+                    sw = default_service_window
             else:
-                period_code = default_period
+                sw = default_service_window
+            period_code = "in" if sw == "InHours" else "off"
 
             diag_txt = get("diags")
             op_txt = get("ops")
@@ -3306,6 +3566,7 @@ class Main(QtWidgets.QWidget):
                 ward=map_to_known_ward(get("ward"), known_wards),
                 case_size="",
                 period=period_code,
+                service_window=sw,
                 urgency="Elective",
                 assist1="",
                 assist2="",
@@ -3413,15 +3674,34 @@ class Main(QtWidgets.QWidget):
     def _on_undo_clear_clicked(self) -> None:
         self._restore_snapshot()
 
-    def _update_period_info(self):
+    def _update_service_window_info(self):
         qd = self.date.date()
         qtime = self.time.time()
         dt = datetime(qd.year(), qd.month(), qd.day(), qtime.hour(), qtime.minute())
-        auto = _now_period(dt)
+        auto = _auto_service_window(dt)
+        if hasattr(self, "lbl_service_window_value"):
+            self.lbl_service_window_value.setText(_service_window_label(auto))
         if hasattr(self, "lbl_period_info"):
             self.lbl_period_info.setText(
-                f"ระบบกำหนดช่วงเวลาอัตโนมัติ: {_period_label(auto)} (อ้างอิง {dt:%d/%m/%Y %H:%M})"
+                f"ระบบกำหนดประเภทเวลาอัตโนมัติ: {_service_window_label(auto)} (อ้างอิง {dt:%d/%m/%Y %H:%M})"
             )
+        if hasattr(self, "cross_midnight_badge"):
+            show_badge = False
+            try:
+                if (
+                    hasattr(self, "ck_time_start")
+                    and hasattr(self, "ck_time_end")
+                    and self.ck_time_start.isChecked()
+                    and self.ck_time_end.isChecked()
+                ):
+                    start_qt = self.time_start.time()
+                    end_qt = self.time_end.time()
+                    start_pair = (start_qt.hour(), start_qt.minute())
+                    end_pair = (end_qt.hour(), end_qt.minute())
+                    show_badge = end_pair < start_pair
+            except Exception:
+                show_badge = False
+            self.cross_midnight_badge.setVisible(show_badge)
         return auto
 
     def _on_dept_changed(self, dept_label: str):
@@ -3663,11 +3943,24 @@ class Main(QtWidgets.QWidget):
     def _collect(self):
         qd = self.date.date()
         dt = datetime(qd.year(), qd.month(), qd.day(), self.time.time().hour(), self.time.time().minute())
-        auto_period = _now_period(dt)
+        urgency_val = self.cb_urgency.currentText().strip() or "Elective"
+        start_txt = self.time_start.time().toString("HH:mm") if self.ck_time_start.isChecked() else ""
+        end_txt = self.time_end.time().toString("HH:mm") if self.ck_time_end.isChecked() else ""
+        cross_midnight = False
+        if start_txt and end_txt:
+            start_dt = datetime(qd.year(), qd.month(), qd.day(), int(start_txt[:2]), int(start_txt[3:]))
+            end_dt = datetime(qd.year(), qd.month(), qd.day(), int(end_txt[:2]), int(end_txt[3:]))
+            if end_dt <= start_dt:
+                end_dt = end_dt + timedelta(days=1)
+                cross_midnight = end_dt.date() != start_dt.date()
+            service_window = decide_service_window(urgency_val, start_dt, end_dt)
+        else:
+            service_window = _auto_service_window(dt)
+        auto_period = "in" if service_window == "InHours" else "off"
         ward_text = self.cb_ward.currentText().strip()
         if ward_text == WARD_PLACEHOLDER:
             ward_text = ""
-        return ScheduleEntry(
+        entry = ScheduleEntry(
             or_room=self.cb_or.currentText().strip(), dt=dt.date(), time_str=self.time.time().toString("HH:mm"),
             hn=self.ent_hn.text().strip(), name=self.ent_name.text().strip(), age=self.ent_age.text().strip() or "0",
             dept=(self.cb_dept.currentText().strip() if not self.cb_dept.currentText().startswith("—") else ""),
@@ -3677,14 +3970,17 @@ class Main(QtWidgets.QWidget):
             case_size=self.cb_case.currentText().strip(),
             queue=0,
             period=auto_period,
-            urgency=self.cb_urgency.currentText().strip() or "Elective",
+            service_window=service_window,
+            urgency=urgency_val,
             assist1=self.cb_assist1.currentText().strip(),
             assist2=self.cb_assist2.currentText().strip(),
             scrub=self.cb_scrub.currentText().strip(),
             circulate=self.cb_circulate.currentText().strip(),
-            time_start=(self.time_start.time().toString("HH:mm") if self.ck_time_start.isChecked() else ""),
-            time_end=(self.time_end.time().toString("HH:mm") if self.ck_time_end.isChecked() else ""),
+            time_start=start_txt,
+            time_end=end_txt,
         )
+        setattr(entry, "cross_midnight", cross_midnight)
+        return entry
 
     def _clear_form(self):
         self.cb_or.setCurrentIndex(0)
@@ -3714,7 +4010,7 @@ class Main(QtWidgets.QWidget):
         self.time_end.setTime(QtCore.QTime.currentTime())
         self.date.setDate(QtCore.QDate.currentDate())
         self.time.setTime(QtCore.QTime.currentTime())
-        self._update_period_info()
+        self._update_service_window_info()
         self._on_dept_changed(self.cb_dept.currentText())
         self._set_add_mode()
 
@@ -3743,6 +4039,8 @@ class Main(QtWidgets.QWidget):
         if hasattr(self, "cb_urgency"):
             idx_u = self.cb_urgency.findText(e.urgency or "Elective")
             self.cb_urgency.setCurrentIndex(idx_u if idx_u >= 0 else 0)
+        if hasattr(self, "lbl_service_window_value"):
+            self.lbl_service_window_value.setText(_service_window_label(e.service_window or ("InHours" if (e.period or 'in') == 'in' else 'OutOfHours')))
         try:
             d = QtCore.QDate(e.date.year, e.date.month, e.date.day)
             self.date.setDate(d)
@@ -3753,7 +4051,7 @@ class Main(QtWidgets.QWidget):
             self.time.setTime(QtCore.QTime(int(hh), int(mm)))
         except Exception:
             pass
-        self._update_period_info()
+        self._update_service_window_info()
         if e.dept:
             for i in range(self.cb_dept.count()):
                 if self.cb_dept.itemText(i).startswith(e.dept) or self.cb_dept.itemText(i) == e.dept:
@@ -3824,6 +4122,8 @@ class Main(QtWidgets.QWidget):
             self.ck_time_end.setChecked(False)
             self.time_end.setEnabled(False)
             self.time_end.setTime(QtCore.QTime.currentTime())
+
+        self._update_service_window_info()
 
     def _on_add_or_update(self):
         e = self._collect()
@@ -4221,12 +4521,14 @@ class Main(QtWidgets.QWidget):
                             dept_txt,
                             entry.time_start or '-',
                             entry.time_end or '-',
+                            entry.urgency or 'Elective',
                             '',
                             entry.assist1 or '-',
                             entry.assist2 or '-',
                             entry.scrub or '-',
-                            getattr(entry, 'circulate', '') or '-',
+                            getattr(entry, 'cir', getattr(entry, 'circulate', '')) or '-',
                             status_text,
+                            '',
                         ])
                         row.setData(0, QtCore.Qt.UserRole, entry.uid())
                         row.setData(0, QtCore.Qt.UserRole + 1, idx)
@@ -4235,8 +4537,13 @@ class Main(QtWidgets.QWidget):
                         row.setData(0, self.OR_ROLE, actual_or)
                         header_item.addChild(row)
 
-                        badge = _period_badge(entry.period or 'in')
-                        self.tree2.setItemWidget(row, 12, badge)
+                        badge = _service_window_badge(getattr(entry, 'service_window', None) or ('InHours' if (entry.period or 'in') == 'in' else 'OutOfHours'))
+                        self.tree2.setItemWidget(row, 13, badge)
+
+                        if getattr(entry, 'postop_completed', False):
+                            self._swap_action_cell_to_saved(entry, row, 0, int(getattr(entry, 'repeat_24h', 0) or 0))
+                        else:
+                            self.tree2.setItemWidget(row, ACTION_COLUMN, self._build_action_cell(entry, row))
 
                         monitor_status = self._last_status_by_hn.get(str(entry.hn).strip(), '')
 
@@ -4328,6 +4635,145 @@ class Main(QtWidgets.QWidget):
 
             QtCore.QTimer.singleShot(0, _restore_scroll)
 
+    def _build_action_menu(self, entry: ScheduleEntry, item: QtWidgets.QTreeWidgetItem) -> QtWidgets.QMenu:
+        menu = QtWidgets.QMenu(self.tree2)
+        postpone_menu = menu.addMenu("เลื่อนผ่าตัด")
+        for reason in REASONS:
+            act = postpone_menu.addAction(reason)
+            act.triggered.connect(lambda _=False, r=reason: self._handle_status_action(entry, item, "postponed", r))
+        off_menu = menu.addMenu("OFF Case")
+        for reason in REASONS:
+            act = off_menu.addAction(reason)
+            act.triggered.connect(lambda _=False, r=reason: self._handle_status_action(entry, item, "offcase", r))
+        return menu
+
+    def _build_action_cell(
+        self, entry: ScheduleEntry, item: QtWidgets.QTreeWidgetItem
+    ) -> QtWidgets.QWidget:
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        save_btn = QtWidgets.QPushButton("บันทึก")
+        save_btn.setProperty("variant", "primary")
+        save_btn.setEnabled(len(missing_required_fields(entry)) == 0)
+        save_btn.clicked.connect(lambda _=False: self._confirm_and_save(entry, item))
+
+        menu_btn = QtWidgets.QToolButton()
+        menu_btn.setText("⋯")
+        menu_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        menu_btn.setMenu(self._build_action_menu(entry, item))
+
+        layout.addWidget(save_btn, 0)
+        layout.addWidget(menu_btn, 0)
+        layout.addStretch(1)
+        return container
+
+    def _swap_action_cell_to_saved(
+        self,
+        entry: ScheduleEntry,
+        item: QtWidgets.QTreeWidgetItem,
+        case_id: int,
+        repeat_flag: int,
+    ) -> None:
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        label = QtWidgets.QLabel("✓ บันทึกแล้ว")
+        label.setStyleSheet("QLabel{color:#059669;font-weight:700;}")
+
+        menu_btn = QtWidgets.QToolButton()
+        menu_btn.setText("⋯")
+        menu_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        menu_btn.setMenu(self._build_action_menu(entry, item))
+
+        layout.addWidget(label, 0)
+        layout.addWidget(menu_btn, 0)
+        layout.addStretch(1)
+
+        self.tree2.setItemWidget(item, ACTION_COLUMN, container)
+        item.setData(0, self.DB_ID_ROLE, int(case_id or 0))
+
+        if repeat_flag:
+            name_txt = item.text(2)
+            note = " (ผ่าตัดซ้ำใน 24 ชม.)"
+            if note not in name_txt:
+                item.setText(2, name_txt + note)
+        entry.repeat_24h = repeat_flag
+        entry.postop_completed = True
+
+    def _handle_status_action(
+        self,
+        entry: ScheduleEntry,
+        item: QtWidgets.QTreeWidgetItem,
+        status: str,
+        reason: str,
+    ) -> None:
+        case_id = item.data(0, self.DB_ID_ROLE)
+        if not case_id:
+            result = self._confirm_and_save(entry, item, silent=True)
+            if not result:
+                return
+            case_id, repeat_flag = result
+        else:
+            case_id = int(case_id)
+            repeat_flag = getattr(entry, "repeat_24h", 0)
+
+        _update_case_status(case_id, status, reason)
+        entry.state = status
+        entry.reason = reason
+        item.setText(18, status)
+        self._swap_action_cell_to_saved(entry, item, case_id, repeat_flag)
+        QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), f"{status} : {reason}")
+
+    def _confirm_and_save(
+        self,
+        entry: ScheduleEntry,
+        item: QtWidgets.QTreeWidgetItem,
+        silent: bool = False,
+    ) -> Optional[Tuple[int, int]]:
+        missing = missing_required_fields(entry)
+        if missing and not silent:
+            msg = "จำเป็นต้องกรอกให้ครบก่อนบันทึกจริง\n\n- " + "\n- ".join(missing)
+            try:
+                SweetAlert.warning(self, "ข้อมูลยังไม่ครบ", msg)
+            except Exception:
+                QtWidgets.QMessageBox.warning(self, "ข้อมูลยังไม่ครบ", msg)
+            return None
+        try:
+            result = save_postop_entry(entry)
+        except Exception as exc:
+            if not silent:
+                try:
+                    SweetAlert.error(self, "บันทึกไม่สำเร็จ", str(exc))
+                except Exception:
+                    QtWidgets.QMessageBox.critical(self, "บันทึกไม่สำเร็จ", str(exc))
+            return None
+
+        case_id, repeat_flag = result
+        try:
+            self.sched._save()
+        except Exception:
+            pass
+
+        key = f"{getattr(entry, 'hn', '')}|{getattr(entry, 'case_uid', '')}"
+        self._reminded_keys.discard(key)
+        self._swap_action_cell_to_saved(entry, item, case_id, repeat_flag)
+
+        if not silent:
+            try:
+                self.result_banner.set_icon("✅")
+                self.result_banner.set_title("บันทึกลงฐานข้อมูลสำเร็จ")
+                self.result_banner.set_subtitle(
+                    f"HN {entry.hn} | OR {entry.or_room} | เวลา {entry.time_start or '-'}–{entry.time_end or '-'}"
+                )
+            except Exception:
+                pass
+        return result
+
     def _current_entry_in_result(self):
         item = self.tree2.currentItem()
         if not item:
@@ -4345,70 +4791,33 @@ class Main(QtWidgets.QWidget):
 
     def _on_commit_clicked(self):
         entry = self._current_entry_in_result()
-        if not entry:
+        item = self.tree2.currentItem()
+        if not entry or not item:
             try:
                 SweetAlert.info(self, "ยังไม่ได้เลือกผู้ป่วย", "กรุณาเลือกแถวในตารางก่อน")
             except Exception:
                 QtWidgets.QMessageBox.information(self, "ยังไม่ได้เลือกผู้ป่วย", "กรุณาเลือกแถวในตารางก่อน")
             return
 
-        missing = missing_required_fields(entry)
-        if missing:
-            msg = "จำเป็นต้องกรอกให้ครบก่อนบันทึกจริง (ยกเว้น Assist 2)\n\n- " + "\n- ".join(missing)
-            try:
-                SweetAlert.warning(self, "ข้อมูลยังไม่ครบ", msg)
-            except Exception:
-                QtWidgets.QMessageBox.warning(self, "ข้อมูลยังไม่ครบ", msg)
+        result = self._confirm_and_save(entry, item)
+        if result is None:
             try:
                 self._load_form_from_entry(entry)
                 self.tabs.setCurrentIndex(0)
             except Exception:
                 pass
-            return
-
-        now = datetime.now()
-        dl = next_deadline(now)
-        remain_txt = _fmt_td(dl - now)
-        if in_working_hours(now):
-            note = f"โปรดตรวจทานให้เรียบร้อย — เดดไลน์บันทึกวันนี้ 16:30 (เหลือ {remain_txt})"
-        else:
-            note = f"นอกเวลาทำการ — ควรบันทึกก่อน {dl.strftime('%d/%m %H:%M')} (เหลือ {remain_txt})"
-        try:
-            SweetAlert.info(self, "ยืนยันการบันทึก", note)
-        except Exception:
-            QtWidgets.QMessageBox.information(self, "ยืนยันการบันทึก", note)
-
-        try:
-            save_postop_entry(entry)
-            entry.postop_completed = True
-            try:
-                self.sched._save()
-            except Exception:
-                pass
-            key = f"{getattr(entry, 'hn', '')}|{getattr(entry, 'case_uid', '')}"
-            self._reminded_keys.discard(key)
-            try:
-                self.result_banner.set_icon("✅")
-                self.result_banner.set_title("บันทึกลงฐานข้อมูลสำเร็จ")
-                self.result_banner.set_subtitle(
-                    f"HN {entry.hn} | OR {entry.or_room} | เวลา {entry.time_start or '-'}–{entry.time_end or '-'}"
-                )
-            except Exception:
-                pass
-            self._render_tree2()
-        except Exception as exc:
-            try:
-                SweetAlert.error(self, "บันทึกไม่สำเร็จ", str(exc))
-            except Exception:
-                QtWidgets.QMessageBox.critical(self, "บันทึกไม่สำเร็จ", str(exc))
 
     def _start_unsaved_reminder(self):
+        if not SHOW_DEADLINE_NOTE or ALLOW_SAVE_ANYTIME:
+            return
         self._unsaved_timer = QtCore.QTimer(self)
         self._unsaved_timer.setInterval(7 * 60 * 1000)
         self._unsaved_timer.timeout.connect(self._remind_unsaved_cases)
         self._unsaved_timer.start()
 
     def _remind_unsaved_cases(self):
+        if not SHOW_DEADLINE_NOTE or ALLOW_SAVE_ANYTIME:
+            return
         now = datetime.now()
         dl = next_deadline(now)
         remain = dl - now
@@ -4808,7 +5217,7 @@ class Main(QtWidgets.QWidget):
         """
         ส่งออกข้อมูลสำหรับวิเคราะห์แบบไม่ระบุตัวตน (de-identified)
         แหล่งข้อมูล: self.sched.entries (ตาราง Result Schedule ภายในเครื่อง)
-        ฟิลด์สำคัญ: hn_hash, dept, or, queue, period, scheduled date/time, time_start, time_end, diags, ops, ward
+        ฟิลด์สำคัญ: hn_hash, dept, or, queue, service_window, scheduled date/time, time_start, time_end, diags, ops, ward
         """
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export De-Identified CSV", "cases_deid.csv",
                                                         "CSV (*.csv)")
@@ -4821,7 +5230,7 @@ class Main(QtWidgets.QWidget):
                     "dept": e.dept or "",
                     "or": e.or_room or "",
                     "queue": int(e.queue or 0),
-                    "period": e.period or "",
+                    "service_window": e.service_window or "",
                     "scheduled_date": str(e.date or ""),
                     "scheduled_time": e.time or "",
                     "time_start": e.time_start or "",
@@ -4835,7 +5244,7 @@ class Main(QtWidgets.QWidget):
                     # หมายเหตุ: ไม่ส่งออก HN/ชื่อ
                 })
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
-                cols = ["hn_hash", "dept", "or", "queue", "period", "scheduled_date", "scheduled_time", "time_start",
+                cols = ["hn_hash", "dept", "or", "queue", "service_window", "scheduled_date", "scheduled_time", "time_start",
                         "time_end", "diag", "op", "ward", "case_size", "urgency", "doctor"]
                 w = csv.DictWriter(f, fieldnames=cols)
                 w.writeheader();
@@ -4910,11 +5319,11 @@ class WrapItemDelegate(QtWidgets.QStyledItemDelegate):
 
 
 class SearchSelectAdder(QtWidgets.QWidget):
-    """Searchable selector with a multi-select list.
+    '''Searchable selector with a multi-select list.
 
     - Enter / ปุ่ม "➕ เพิ่ม"  : เพิ่มลงรายการของเคส (ไม่แตะคลังหลัก)
     - ปุ่ม "💾 บันทึกเป็นรายการใหม่" : ส่งสัญญาณให้ภายนอกบันทึกเข้าคลังหลัก
-    """
+    '''
 
     itemsChanged = QtCore.Signal(list)
     requestPersist = QtCore.Signal(str)
