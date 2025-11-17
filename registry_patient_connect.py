@@ -11,12 +11,18 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
-from PySide6 import QtCore, QtGui, QtWidgets
-from PySide6.QtCore import QSettings, QUrl, QLocale
-from PySide6.QtGui import QIcon, QPixmap, QPainter, QLinearGradient
-from PySide6.QtWebSockets import QWebSocket
-from PySide6.QtNetwork import QAbstractSocket
-from PySide6.QtWidgets import QDialog
+try:  # Qt modules are mandatory for the UI components in this file
+    from PySide6 import QtCore, QtGui, QtWidgets
+    from PySide6.QtCore import QSettings, QUrl, QLocale
+    from PySide6.QtGui import QIcon, QPixmap, QPainter, QLinearGradient
+    from PySide6.QtWebSockets import QWebSocket
+    from PySide6.QtNetwork import QAbstractSocket
+    from PySide6.QtWidgets import QDialog
+except ImportError as exc:  # pragma: no cover - environment specific
+    raise RuntimeError(
+        "PySide6 is required for the Registry Patient Connect application. "
+        "Please install PySide6 to continue."
+    ) from exc
 
 from icd10_catalog import (
     add_custom_entry,
