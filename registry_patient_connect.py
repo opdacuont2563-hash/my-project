@@ -775,7 +775,7 @@ def missing_required_fields(entry) -> list[str]:
     required = {
         "hn": "HN",
         "patient_name": "ชื่อ-สกุล",
-        "surgeon": "แพทย์",
+        "doctor": "แพทย์",
         "department": "แผนก",
         "ward": "Ward",
         "time_start": "เริ่ม",
