@@ -425,14 +425,63 @@ EXPECTED_COLUMNS = [
 ]
 
 
-def validate_excel_columns(columns: Sequence[str]) -> List[str]:
-    """ยืนยันว่าหัวคอลัมน์จากไฟล์นำเข้ามีครบตาม schema ที่กำหนด"""
+def _normalize_header_label(label: str) -> str:
+    cleaned = unicodedata.normalize("NFKC", str(label or "").strip()).lower()
+    return "".join(ch for ch in cleaned if ch.isalnum())
 
-    missing = [c for c in EXPECTED_COLUMNS if c not in columns]
+
+HEADER_ALIAS_MAP = {
+    _normalize_header_label("or เวลา"): "OR/เวลา",
+    _normalize_header_label("or time"): "OR/เวลา",
+    _normalize_header_label("or room"): "OR/เวลา",
+    _normalize_header_label("or"): "OR/เวลา",
+    _normalize_header_label("ชื่อสกุล"): "ชื่อ-สกุล",
+    _normalize_header_label("patient name"): "ชื่อ-สกุล",
+    _normalize_header_label("age (yr)"): "อายุ",
+    _normalize_header_label("doctor"): "แพทย์",
+    _normalize_header_label("surgeon"): "แพทย์",
+    _normalize_header_label("ward name"): "Ward",
+    _normalize_header_label("ward/icu"): "Ward",
+    _normalize_header_label("size"): "ขนาดเคส",
+    _normalize_header_label("case size"): "ขนาดเคส",
+    _normalize_header_label("dept"): "แผนก",
+    _normalize_header_label("department"): "แผนก",
+    _normalize_header_label("start"): "เริ่ม",
+    _normalize_header_label("start time"): "เริ่ม",
+    _normalize_header_label("end"): "จบ",
+    _normalize_header_label("end time"): "จบ",
+    _normalize_header_label("urgency"): "ความเร่งด่วน",
+    _normalize_header_label("service window"): "ประเภทเวลา",
+    _normalize_header_label("assist1"): "Assist 1",
+    _normalize_header_label("assist2"): "Assist 2",
+    _normalize_header_label("scrub nurse"): "Scrub",
+    _normalize_header_label("scrubnurse"): "Scrub",
+    _normalize_header_label("circulate"): "Cir",
+    _normalize_header_label("circulator"): "Cir",
+    _normalize_header_label("circulation"): "Cir",
+    _normalize_header_label("status"): "สถานะ",
+}
+
+
+def validate_excel_columns(columns: Sequence[str]) -> Dict[str, str]:
+    """ตรวจสอบและคืน mapping คอลัมน์ตาม schema ที่กำหนด"""
+
+    normalized_expected = {_normalize_header_label(col): col for col in EXPECTED_COLUMNS}
+    resolved: Dict[str, str] = {}
+    for raw in columns:
+        clean = str(raw or "").strip()
+        if not clean:
+            continue
+        norm = _normalize_header_label(clean)
+        canonical = HEADER_ALIAS_MAP.get(norm) or normalized_expected.get(norm)
+        if canonical and canonical not in resolved:
+            resolved[canonical] = clean
+
+    missing = [c for c in EXPECTED_COLUMNS if c not in resolved]
     if missing:
         raise ValueError("คอลัมน์ในไฟล์ขาด: " + ", ".join(missing))
-    # คืนลิสต์คอลัมน์ตามลำดับมาตรฐาน (ตัดคอลัมน์ที่ระบบไม่รู้จักออก)
-    return [c for c in EXPECTED_COLUMNS if c in columns]
+
+    return {canonical: resolved[canonical] for canonical in EXPECTED_COLUMNS}
 
 STATUS_OP_START = "กำลังผ่าตัด"
 STATUS_RECOVERY = "กำลังพักฟื้น"
@@ -3390,7 +3439,7 @@ class Main(QtWidgets.QWidget):
                 return []
 
             headers = [str(col).strip() if col is not None else "" for col in header]
-            ordered_headers = validate_excel_columns(headers)
+            header_map = validate_excel_columns(headers)
             results: List[dict] = []
             for row in rows_iter:
                 row_dict: Dict[str, object] = {}
@@ -3402,7 +3451,10 @@ class Main(QtWidgets.QWidget):
                     if not has_value and str(value or "").strip():
                         has_value = True
                 if row_dict and has_value:
-                    normalized = {key: row_dict.get(key, "") for key in ordered_headers}
+                    normalized = {
+                        canonical: row_dict.get(actual, "")
+                        for canonical, actual in header_map.items()
+                    }
                     results.append(normalized)
             return results
 
@@ -3412,7 +3464,7 @@ class Main(QtWidgets.QWidget):
                 reader = csv.DictReader(fh)
                 if reader.fieldnames is None:
                     return []
-                ordered_headers = validate_excel_columns([str(h).strip() for h in reader.fieldnames])
+                header_map = validate_excel_columns([str(h).strip() for h in reader.fieldnames])
                 for row in reader:
                     row_dict: Dict[str, object] = {}
                     has_value = False
@@ -3424,7 +3476,10 @@ class Main(QtWidgets.QWidget):
                         if not has_value and str(value or "").strip():
                             has_value = True
                     if row_dict and has_value:
-                        normalized = {key: row_dict.get(key, "") for key in ordered_headers}
+                        normalized = {
+                            canonical: row_dict.get(actual, "")
+                            for canonical, actual in header_map.items()
+                        }
                         results.append(normalized)
             return results
 
