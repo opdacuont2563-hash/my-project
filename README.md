@@ -413,3 +413,58 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 **Made with ❤️ for better healthcare**
+
+---
+
+## 🎉 Phase 2 Completed: Display Window
+
+### New in Phase 2
+
+**✅ Server Display Module (Tkinter)**
+- Full-screen display for large monitors
+- Real-time WebSocket updates
+- Color-coded status display
+- Auto-refresh timers
+- Connection status indicator
+
+**✅ Launcher Scripts**
+- `run_server.py` - Start API Server
+- `run_display.py` - Start Display Window
+
+**✅ Quick Start Guide**
+- See [QUICKSTART.md](QUICKSTART.md) for step-by-step instructions
+
+### How to Run Phase 2
+
+#### Terminal 1: API Server
+```bash
+python run_server.py
+```
+
+#### Terminal 2: Display Window
+```bash
+python run_display.py
+```
+
+**That's it!** The display will auto-connect and show real-time updates.
+
+---
+
+## 📸 Phase 2 Features
+
+### Display Window
+- ✅ Fullscreen mode (ESC to exit)
+- ✅ Real-time WebSocket connection
+- ✅ Color-coded status (Yellow, Orange, Blue, Green, Purple, Gray)
+- ✅ Countdown timers for recovery
+- ✅ ETA calculations
+- ✅ Connection status indicator
+- ✅ Auto-reconnect on disconnect
+
+### What's Next (Phase 3)
+- Client UI for staff (PySide6)
+- Registry UI for patient management (PySide6)
+- Advanced reporting
+- Mobile app support
+
+---
