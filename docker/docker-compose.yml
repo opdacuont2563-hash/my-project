@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  surgibot-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    container_name: surgibot-server
+    ports:
+      - "8088:8088"
+    environment:
+      - SURGIBOT_API_HOST=0.0.0.0
+      - SURGIBOT_API_PORT=8088
+      - SURGIBOT_SECRET=${SURGIBOT_SECRET:-uTCoBelMyNfSSNmUulT_Kz6zrrCVkvD578MxEuLKZoaaXX0pVlpAD8toYHBxsFxI}
+      - DATABASE_URL=${DATABASE_URL:-sqlite:///./surgibot.db}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - surgibot-data:/app/data
+      - surgibot-logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - surgibot-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # PostgreSQL database (optional, uncomment if needed)
+  # surgibot-db:
+  #   image: postgres:15-alpine
+  #   container_name: surgibot-db
+  #   environment:
+  #     - POSTGRES_USER=surgibot
+  #     - POSTGRES_PASSWORD=surgibot
+  #     - POSTGRES_DB=surgibot
+  #   volumes:
+  #     - postgres-data:/var/lib/postgresql/data
+  #   restart: unless-stopped
+  #   networks:
+  #     - surgibot-network
+
+  # Redis cache (optional, for future enhancement)
+  # surgibot-redis:
+  #   image: redis:7-alpine
+  #   container_name: surgibot-redis
+  #   restart: unless-stopped
+  #   networks:
+  #     - surgibot-network
+
+volumes:
+  surgibot-data:
+  surgibot-logs:
+  # postgres-data:
+
+networks:
+  surgibot-network:
+    driver: bridge
