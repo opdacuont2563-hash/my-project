@@ -37,3 +37,11 @@ qt.conf
 .env
 *.env
 data OR/
+
+# SurgiBot specific
+surgibot.db
+*.mp3
+speak_*.mp3
+postponed_*.mp3
+credentials.json
+service_account.json

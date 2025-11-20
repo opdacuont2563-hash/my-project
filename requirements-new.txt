@@ -1,0 +1,88 @@
+# =====================================================
+# SurgiBot System Requirements
+# Version 2.0.0 - Modernized Architecture
+# =====================================================
+
+# Core Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# Database
+sqlalchemy==2.0.25
+alembic==1.13.1
+
+# API & WebSocket
+websockets==12.0
+python-multipart==0.0.6
+requests==2.31.0
+
+# GUI - Desktop Applications
+PySide6==6.6.1
+PySide6-Essentials==6.6.1
+
+# Text-to-Speech
+gTTS==2.5.0
+pygame==2.5.2
+pyttsx3==2.90
+
+# Google Sheets Integration
+gspread==5.12.3
+google-auth==2.27.0
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0
+
+# Utilities
+python-dotenv==1.0.0
+python-dateutil==2.8.2
+pytz==2023.3
+
+# Fuzzy Search (Optional but recommended)
+rapidfuzz==3.6.1
+
+# HTTP Client
+httpx==0.26.0
+
+# ICD-10 Catalog Support (if available)
+# Note: May need custom implementation
+
+# Development & Testing
+pytest==7.4.4
+pytest-asyncio==0.23.3
+pytest-cov==4.1.0
+black==24.1.1
+flake8==7.0.0
+mypy==1.8.0
+isort==5.13.2
+
+# Production Server
+gunicorn==21.2.0
+
+# Windows-specific (for winsound)
+# Already included in Python standard library on Windows
+
+# Logging
+colorlog==6.8.0
+
+# CORS Support
+# Already included in FastAPI
+
+# Type Hints
+types-requests==2.31.0.20240125
+types-python-dateutil==2.8.19.20240106
+
+# =====================================================
+# Installation Notes:
+# =====================================================
+#
+# Basic installation:
+#   pip install -r requirements-new.txt
+#
+# Development installation:
+#   pip install -r requirements-new.txt -r requirements-dev.txt
+#
+# For production:
+#   pip install -r requirements-new.txt --no-dev
+#
+# =====================================================
